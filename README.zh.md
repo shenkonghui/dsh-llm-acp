@@ -18,14 +18,7 @@ dsh plugin --profile my-acp add github:shenkonghui/dsh-llm-acp
 dsh plugin --profile my-acp add ./dsh-llm-acp
 ```
 
-pnpm ≥10 对 git 安装需要显式构建权限。在 profile 的 `pnpm-workspace.yaml` 中添加：
-
-```yaml
-allowBuilds:
-  @deepseek-ai/dsh-llm-acp: true
-```
-
-然后重新执行 `dsh plugin --profile my-acp add github:shenkonghui/dsh-llm-acp`。
+构建产物（`lib/`）已提交到仓库，安装时无需运行任何构建脚本。
 
 ## 配置
 
@@ -105,7 +98,7 @@ pnpm install
 pnpm build    # tsc -b && tsdown
 ```
 
-`prepare` 脚本在 git 安装时自动运行，生成 `lib/index.js`、`lib/invariant.js` 和 `lib/client.js`。
+构建产物已提交到仓库，用户安装时只需 `pnpm install` 即可。
 
 ## 已知限制与待办事项
 

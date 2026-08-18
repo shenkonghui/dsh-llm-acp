@@ -51,7 +51,6 @@
     }
   },
   "scripts": {
-    "prepare": "tsc -b && tsdown",
     "build": "tsc -b && tsdown",
     "bundle": "tsdown"
   },

@@ -18,14 +18,7 @@ Or from a local checkout:
 dsh plugin --profile my-acp add ./dsh-llm-acp
 ```
 
-pnpm ≥10 requires explicit build permission for git installs. Add to the profile's `pnpm-workspace.yaml`:
-
-```yaml
-allowBuilds:
-  @deepseek-ai/dsh-llm-acp: true
-```
-
-Then re-run `dsh plugin --profile my-acp add github:shenkonghui/dsh-llm-acp`.
+Built artifacts (`lib/`) are committed to the repository, so no build scripts run during install.
 
 ## Configure
 
@@ -105,7 +98,7 @@ pnpm install
 pnpm build    # tsc -b && tsdown
 ```
 
-The `prepare` script runs automatically on git install, producing `lib/index.js`, `lib/invariant.js`, and `lib/client.js`.
+Built artifacts are committed to the repository, so `pnpm install` alone is sufficient for consumers.
 
 ## Known Limitations and Deferred Work
 
