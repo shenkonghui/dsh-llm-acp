@@ -20,6 +20,14 @@ dsh plugin --profile my-acp add ./dsh-llm-acp
 
 Built artifacts (`lib/`) are committed to the repository, so no build scripts run during install.
 
+## Uninstall
+
+```sh
+dsh plugin --profile my-acp remove @deepseek-ai/dsh-llm-acp
+```
+
+This removes the dependency and the bundle layer from the profile.
+
 ## Configure
 
 After installation, open **Settings → ACP Servers** in the web UI. Browse the ACP registry, click **添加** on any agent (e.g. Devin, Codex, Claude Agent), and it becomes a configured ACP server. Each configured server creates an independent provider route `acp-<server-id>`.

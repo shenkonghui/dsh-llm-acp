@@ -20,6 +20,14 @@ dsh plugin --profile my-acp add ./dsh-llm-acp
 
 构建产物（`lib/`）已提交到仓库，安装时无需运行任何构建脚本。
 
+## 卸载
+
+```sh
+dsh plugin --profile my-acp remove @deepseek-ai/dsh-llm-acp
+```
+
+这会从 profile 中移除依赖和 bundle 层。
+
 ## 配置
 
 安装后，在 Web UI 中打开 **设置 → ACP 服务**。浏览 ACP 注册表，在任意 agent（如 Devin、Codex、Claude Agent）上点击 **添加**，即可将其配置为 ACP 服务器。每个已配置的服务器会创建一个独立的 provider 路由 `acp-<server-id>`。
