@@ -1,0 +1,105 @@
+{
+  "name": "@deepseek-ai/dsh-llm-acp",
+  "description": "ACP LLM adapter + ACP Servers settings UI: drives external Agent Client Protocol servers as model providers on the DeepSeek Harness LLM seam, with a web settings page for browsing the ACP registry and managing configured servers",
+  "version": "0.1.0-rc.5",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shenkonghui/dsh-llm-acp.git"
+  },
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/types/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./invariant": {
+      "types": "./lib/types/invariant.d.ts",
+      "default": "./lib/invariant.js"
+    },
+    "./client": {
+      "types": "./lib/types/client/index.d.ts",
+      "default": "./lib/client.js"
+    },
+    "./src/*": "./src/*",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/index.js",
+    "lib/invariant.js",
+    "lib/client.js",
+    "lib/types/**/*.d.ts",
+    "cordis.patch.yml"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-api-remotes"
+      ],
+      "platform": "web"
+    }
+  },
+  "scripts": {
+    "prepare": "tsc -b && tsdown",
+    "build": "tsc -b && tsdown",
+    "bundle": "tsdown"
+  },
+  "license": "MIT",
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^0.1.0",
+    "@deepseek-ai/dsh-api-remotes": "^0.1.0",
+    "@deepseek-ai/dsh-client-connection": "^0.1.0",
+    "@deepseek-ai/dsh-client-locale": "^0.1.0",
+    "@deepseek-ai/dsh-client-runtime": "^0.1.0",
+    "@deepseek-ai/dsh-client-ui-primitives": "^0.1.0",
+    "@deepseek-ai/dsh-client-ui-settings": "^0.1.0",
+    "@deepseek-ai/dsh-client-ui-slots": "^0.1.0",
+    "@deepseek-ai/dsh-client-web-react": "^0.1.0",
+    "@deepseek-ai/dsh-invariants": "^0.1.0",
+    "@deepseek-ai/dsh-llm": "^0.1.0",
+    "@deepseek-ai/dsh-settings": "^0.1.0",
+    "@deepseek-ai/dsh-subprocess": "^0.1.0",
+    "@deepseek-ai/dsh-timeout": "^0.1.0",
+    "react": "^18.2.0"
+  },
+  "dependencies": {
+    "@agentclientprotocol/sdk": "0.25.1",
+    "@deepseek-ai/schemastery": "^0.1.0"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^0.1.0",
+    "@deepseek-ai/cordis-plugin-loader": "^0.1.0",
+    "@deepseek-ai/dsh-api-remotes": "^0.1.0",
+    "@deepseek-ai/dsh-client-connection": "^0.1.0",
+    "@deepseek-ai/dsh-client-locale": "^0.1.0",
+    "@deepseek-ai/dsh-client-runtime": "^0.1.0",
+    "@deepseek-ai/dsh-client-ui-primitives": "^0.1.0",
+    "@deepseek-ai/dsh-client-ui-settings": "^0.1.0",
+    "@deepseek-ai/dsh-client-ui-slots": "^0.1.0",
+    "@deepseek-ai/dsh-client-web-react": "^0.1.0",
+    "@deepseek-ai/dsh-invariants": "^0.1.0",
+    "@deepseek-ai/dsh-llm": "^0.1.0",
+    "@deepseek-ai/dsh-loader-smoke": "^0.1.0",
+    "@deepseek-ai/dsh-settings": "^0.1.0",
+    "@deepseek-ai/dsh-subprocess": "^0.1.0",
+    "@deepseek-ai/dsh-subprocess-local": "^0.1.0",
+    "@deepseek-ai/dsh-timeout": "^0.1.0",
+    "@types/react": "~18.3.1",
+    "@types/node": "^22.0.0",
+    "lightningcss": "^1.0.0",
+    "react": "^18.2.0",
+    "tsdown": "^0.22.0",
+    "typescript": "^5.6.0"
+  }
+}

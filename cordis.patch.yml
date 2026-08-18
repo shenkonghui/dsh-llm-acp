@@ -1,0 +1,16 @@
+# Bundle patch for @deepseek-ai/dsh-llm-acp.
+# Inserts the host-side ACP LLM adapter. The client-modules plugin discovers
+# this package's dsh.client declaration and automatically serves the ACP
+# Servers settings UI (lib/client.js) in the browser — no separate client row
+# is needed. ACP servers are configured in the `llm-acp` settings namespace
+# and managed through the Settings → ACP Servers page.
+- insert:
+    - id: llm-acp
+      name: '@deepseek-ai/dsh-llm-acp'
+      config:
+        permission: reject
+        emitReasoning: false
+        defaultModelId: glm-5-2
+        defaultModelName: GLM-5.2 High
+        disposeEofGraceMs: 6000
+        disposeGraceMs: 3000
