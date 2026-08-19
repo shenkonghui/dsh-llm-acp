@@ -27,6 +27,9 @@ type QueuedUpdate = {
     kind: 'reasoning';
     text: string;
 } | {
+    kind: 'progress';
+    text: string;
+} | {
     kind: 'done';
     reason: StopReason;
 } | {
@@ -82,6 +85,18 @@ export declare class AcpConnection {
     private initialize;
     /** Push an inbound session/update into the owning session's queue. */
     private enqueueUpdate;
+    /**
+     * Handle extension notifications from ACP servers that use non-standard
+     * protocols (e.g. Devin's `_cognition.ai/*` notifications). These are
+     * silently consumed to prevent SDK error logs, with progress notifications
+     * surfaced to keep the user informed during long operations.
+     */
+    private handleExtNotification;
+    /**
+     * Handle extension requests from ACP servers. Currently no extension
+     * requests are expected; return an empty object to satisfy the protocol.
+     */
+    private handleExtMethod;
     /** Wake a consumer waiting on an empty queue. */
     private signal;
     /** Drain the queue for one session, awaiting new updates when it is empty. */
@@ -126,6 +141,12 @@ export declare class AcpConnection {
      * @param signal - cancellation; abort triggers a best-effort ACP cancel.
      */
     promptStream(sessionId: string, prompt: AcpContentBlock[], signal: AbortSignal): AsyncGenerator<QueuedUpdate>;
+    /**
+     * Close one ACP session after a prompt completes. Best-effort: errors are
+     * swallowed because the session may already be gone.
+     * @param sessionId - the remote session id to close.
+     */
+    closeSession(sessionId: string): void;
     /** Best-effort cancel of one in-flight session; unknown ids are no-ops. */
     cancel(sessionId: string): void;
     /** Idempotent disposal: runs the teardown ladder once and resolves at quiescence. */

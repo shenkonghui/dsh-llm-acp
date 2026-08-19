@@ -40,6 +40,7 @@ export const DEFAULT_DISPOSE_GRACE_MS = 3_000
 type QueuedUpdate =
   | { kind: 'text'; text: string }
   | { kind: 'reasoning'; text: string }
+  | { kind: 'progress'; text: string }
   | { kind: 'done'; reason: StopReason }
   | { kind: 'error'; error: Error }
 
@@ -146,6 +147,13 @@ export class AcpConnection {
         }
         return Promise.resolve({ outcome: { outcome: 'cancelled' } })
       },
+      extNotification: (method: string, params: Record<string, unknown>): Promise<void> => {
+        this.handleExtNotification(method, params)
+        return Promise.resolve()
+      },
+      extMethod: (method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> => {
+        return this.handleExtMethod(method, params)
+      },
     })
     this.conn = new ClientSideConnection(
       makeClient,
@@ -183,9 +191,63 @@ export class AcpConnection {
       entry.queue.push({ kind: 'text', text: acpContentText(update.content) })
     } else if (update.sessionUpdate === 'agent_thought_chunk') {
       entry.queue.push({ kind: 'reasoning', text: acpContentText(update.content) })
+    } else if (update.sessionUpdate === 'tool_call') {
+      // Tool calls are consumed but not surfaced as text; the ACP server
+      // executes its own tools internally. Surface a progress note so the
+      // user sees activity rather than a silent hang.
+      const title = update.title ?? 'tool'
+      entry.queue.push({ kind: 'progress', text: `[tool: ${title}]` })
+    } else if (update.sessionUpdate === 'tool_call_update') {
+      // Intermediate tool-call updates are consumed silently.
+    } else if (update.sessionUpdate === 'plan') {
+      // Plan updates are consumed but not surfaced.
+    } else if (update.sessionUpdate === 'user_message_chunk') {
+      // Echo of user input; consumed silently.
     }
-    // Other update variants (tool calls, plans, user_message) are consumed but not surfaced.
+    // Other update variants are consumed but not surfaced.
     this.signal(entry)
+  }
+
+  /**
+   * Handle extension notifications from ACP servers that use non-standard
+   * protocols (e.g. Devin's `_cognition.ai/*` notifications). These are
+   * silently consumed to prevent SDK error logs, with progress notifications
+   * surfaced to keep the user informed during long operations.
+   */
+  private handleExtNotification(method: string, params: Record<string, unknown>): void {
+    // Devin sends `_cognition.ai/output` with a `message` field for logging.
+    if (method === '_cognition.ai/output') {
+      const message = typeof params.message === 'string' ? params.message : ''
+      const sessionId = typeof params.sessionId === 'string' ? params.sessionId : ''
+      if (message.length > 0 && sessionId.length > 0) {
+        const entry = this.queues.get(sessionId)
+        if (entry !== undefined) {
+          entry.queue.push({ kind: 'progress', text: message })
+          this.signal(entry)
+        }
+      }
+      return
+    }
+    // `_cognition.ai/thinking_complete` indicates the agent finished a
+    // thinking block; no text payload to surface.
+    if (method === '_cognition.ai/thinking_complete') return
+    // `_cognition.ai/agent_stopped` indicates the agent finished its turn;
+    // the terminal stopReason arrives via the `session/prompt` response.
+    if (method === '_cognition.ai/agent_stopped') return
+    // `_cognition.ai/mcp/serversChanged` indicates MCP server topology change.
+    if (method === '_cognition.ai/mcp/serversChanged') return
+    // `_cognition.ai/connection_retry` indicates a backend retry.
+    if (method === '_cognition.ai/connection_retry') return
+    // Unknown extension notifications are silently consumed.
+  }
+
+  /**
+   * Handle extension requests from ACP servers. Currently no extension
+   * requests are expected; return an empty object to satisfy the protocol.
+   */
+  private handleExtMethod(method: string, _params: Record<string, unknown>): Promise<Record<string, unknown>> {
+    this.spec.onWarn?.(`llm-acp: unhandled extension request: ${method}`)
+    return Promise.resolve({})
   }
 
   /** Wake a consumer waiting on an empty queue. */
@@ -311,6 +373,15 @@ export class AcpConnection {
       signal.removeEventListener('abort', onAbort)
       this.queues.delete(sessionId)
     }
+  }
+
+  /**
+   * Close one ACP session after a prompt completes. Best-effort: errors are
+   * swallowed because the session may already be gone.
+   * @param sessionId - the remote session id to close.
+   */
+  closeSession(sessionId: string): void {
+    void this.conn.closeSession({ sessionId }).catch(() => { /* best-effort close */ })
   }
 
   /** Best-effort cancel of one in-flight session; unknown ids are no-ops. */

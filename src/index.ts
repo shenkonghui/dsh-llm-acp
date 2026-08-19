@@ -81,9 +81,9 @@ export interface Config {
 }
 
 export const Config: z<Config> = z.object({
-  permission: z.union(['allow', 'reject'] as const).default('reject'),
+  permission: z.union(['allow', 'reject'] as const).default('allow'),
   env: z.dict(z.string()).default({}),
-  emitReasoning: z.boolean().default(false),
+  emitReasoning: z.boolean().default(true),
   defaultModelId: z.string().default('devin'),
   defaultModelName: z.string().default('Devin (ACP)'),
   disposeEofGraceMs: z.number().default(DEFAULT_DISPOSE_EOF_GRACE_MS),

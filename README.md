@@ -70,8 +70,8 @@ Binary entries use the executable basename so a PATH-installed binary is found d
 
 | Config | Default | Meaning |
 |---|---|---|
-| `permission` | `reject` | Auto-answer `session/request_permission`: `reject` declines every prompt, `allow` selects the first `allow_once`/`allow_always` option. |
-| `emitReasoning` | `false` | Whether `agent_thought_chunk` updates become `reasoning-delta` chunks. |
+| `permission` | `allow` | Auto-answer `session/request_permission`: `reject` declines every prompt, `allow` selects the first `allow_once`/`allow_always` option. |
+| `emitReasoning` | `true` | Whether `agent_thought_chunk` and extension progress notifications become `reasoning-delta` chunks. |
 | `defaultModelId` | `glm-5-2` | Fallback model id when ACP discovery returns no models. |
 | `defaultModelName` | `GLM-5.2 High` | Fallback model display name. |
 | `disposeEofGraceMs` | `6000` | Positive grace after stdin EOF before platform termination. |
@@ -116,6 +116,7 @@ Built artifacts are committed to the repository, so `pnpm install` alone is suff
 - **System prompt is in-band** — ACP `session/new` has no system slot, so the harness system prompt is prepended to the user message text.
 - **Full-history re-send** — the adapter renders the entire `messages` array into one user message.
 - **ACP v1 (SDK 0.25.1)** — the adapter uses `@agentclientprotocol/sdk` 0.25.1, whose `session/prompt` response carries the terminal `stopReason` (v1 contract).
+- **Extension protocol handling** — Devin's `_cognition.ai/*` notifications are consumed silently (progress text surfaced as reasoning when `emitReasoning` is on); other non-standard ACP extensions are swallowed to prevent SDK error logs.
 
 ## License
 

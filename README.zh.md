@@ -70,8 +70,8 @@ binary 类型使用可执行文件的 basename，这样已安装到 PATH 的二�
 
 | 配置 | 默认值 | 说明 |
 |---|---|---|
-| `permission` | `reject` | 自动应答 `session/request_permission`：`reject` 拒绝所有请求，`allow` 选择第一个 `allow_once`/`allow_always` 选项。 |
-| `emitReasoning` | `false` | 是否将 `agent_thought_chunk` 更新转换为 `reasoning-delta` chunk。 |
+| `permission` | `allow` | 自动应答 `session/request_permission`：`reject` 拒绝所有请求，`allow` 选择第一个 `allow_once`/`allow_always` 选项。 |
+| `emitReasoning` | `true` | 是否将 `agent_thought_chunk` 和扩展进度通知转换为 `reasoning-delta` chunk。 |
 | `defaultModelId` | `glm-5-2` | ACP 发现未返回模型时的回退模型 ID。 |
 | `defaultModelName` | `GLM-5.2 High` | 回退模型显示名称。 |
 | `disposeEofGraceMs` | `6000` | stdin EOF 后等待平台终止的宽限时间（毫秒）。 |
@@ -116,6 +116,7 @@ pnpm build    # tsc -b && tsdown
 - **系统提示在消息体内** — ACP `session/new` 没有 system 槽位，harness 的 system prompt 被拼接到用户消息文本前。
 - **全量历史重发** — 适配器将整个 `messages` 数组渲染为一条用户消息。
 - **ACP v1（SDK 0.25.1）** — 适配器使用 `@agentclientprotocol/sdk` 0.25.1，其 `session/prompt` 响应携带终态 `stopReason`（v1 契约）。
+- **扩展协议处理** — Devin 的 `_cognition.ai/*` 通知被静默消费（进度文本在 `emitReasoning` 开启时作为 reasoning 输出）；其他非标准 ACP 扩展被吞掉以避免 SDK 错误日志。
 
 ## 许可证
 

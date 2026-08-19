@@ -55,6 +55,9 @@ export declare class AcpAdapter extends LlmAdapter {
      * conversation as one user message. Yields `text-delta` (and optionally
      * `reasoning-delta`) chunks as the ACP server streams assistant output, then
      * a terminal `finish` chunk. Tool-call deltas are never emitted.
+     *
+     * After the stream completes, the ACP session is closed best-effort to
+     * avoid resource leaks on the server side.
      */
     stream(options: GenerateOptions): AsyncIterable<StreamChunk>;
 }
