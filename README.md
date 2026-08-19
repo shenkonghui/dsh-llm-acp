@@ -1,42 +1,55 @@
 # @deepseek-ai/dsh-llm-acp
 
-English | [中文](README.zh.md)
+中文 | [English](README.en.md)
 
-ACP-client LLM adapter + ACP Servers settings UI for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness). Drives an external [Agent Client Protocol](https://agentclientprotocol.com) server as a model provider on the harness LLM seam, with a web settings page for browsing the ACP registry and managing configured servers.
+[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 的 ACP 客户端 LLM 适配器 + ACP 服务设置界面。通过外部 [Agent Client Protocol](https://agentclientprotocol.com) 服务器作为模型提供方接入 harness 的 LLM 层，并提供一个 Web 设置页面用于浏览 ACP 注册表和管理已配置的服务器。
 
-This package is a **dual-face dsh plugin**: the host half (`lib/index.js`) is a transport adapter that registers provider routes on `ctx.llm`; the client half (`lib/client.js`) is a browser settings section that lets users browse the ACP registry and add/remove ACP agent servers from the web UI.
+本包是一个**双面 dsh 插件**：宿主端（`lib/index.js`）是传输适配器，在 `ctx.llm` 上注册 provider 路由；客户端（`lib/client.js`）是浏览器设置页面，让用户从 Web UI 浏览 ACP 注册表并添加/删除 ACP agent 服务器。
 
-## Install
+## 界面
+### ACP注册表添加acp-server
+支持acp registry上的所有acp-server[https://agentclientprotocol.com/get-started/registry]
+
+如claude,codex,opencode等
+![alt text](image.png)
+
+### ACP服务管理
+![alt text](image-1.png)
+
+### 使用acp-server进行交互
+![alt text](image-2.png)
+
+## 安装
 
 ```sh
 dsh plugin --profile my-acp add github:shenkonghui/dsh-llm-acp
 ```
 
-Or from a local checkout:
+或从本地目录安装：
 
 ```sh
 dsh plugin --profile my-acp add ./dsh-llm-acp
 ```
 
-Built artifacts (`lib/`) are committed to the repository, so no build scripts run during install.
+构建产物（`lib/`）已提交到仓库，安装时无需运行任何构建脚本。
 
-## Uninstall
+## 卸载
 
 ```sh
 dsh plugin --profile my-acp remove @deepseek-ai/dsh-llm-acp
 ```
 
-This removes the dependency and the bundle layer from the profile.
+这会从 profile 中移除依赖和 bundle 层。
 
-## Configure
+## 配置
 
-After installation, open **Settings → ACP Servers** in the web UI. Browse the ACP registry, click **添加** on any agent (e.g. Devin, Codex, Claude Agent), and it becomes a configured ACP server. Each configured server creates an independent provider route `acp-<server-id>`.
+安装后，在 Web UI 中打开 **设置 → ACP 服务**。浏览 ACP 注册表，在任意 agent（如 Devin、Codex、Claude Agent）上点击 **添加**，即可将其配置为 ACP 服务器。每个已配置的服务器会创建一个独立的 provider 路由 `acp-<server-id>`。
 
-In the **My Servers** tab, click **Edit** on any configured server to:
-- Set **environment variables** for authentication (e.g. `DEEPSEEK_API_KEY`, `OPENAI_API_KEY`). Per-server env is merged on top of the plugin-level `env`.
-- Select which **models** to expose from the server's discovered catalog. Leave empty to expose all discovered models.
+在 **我的服务** 标签页中，点击任意已配置服务器上的 **编辑** 按钮，可以：
+- 设置**环境变量**用于认证（如 `DEEPSEEK_API_KEY`、`OPENAI_API_KEY`）。每个服务器的环境变量会与插件级 `env` 合并，服务级优先。
+- 选择要**启用的模型**。从服务器发现的模型目录中多选要暴露的模型，不选则启用全部已发现的模型。
 
-Alternatively, configure servers directly in `settings.yaml`:
+也可以直接在 `settings.yaml` 中配置：
 
 ```yaml
 llm-acp:
@@ -53,80 +66,80 @@ llm-acp:
         - deepseek-reasoner
 ```
 
-## How it works
+## 工作原理
 
-### Host half — LLM adapter
+### 宿主端 — LLM 适配器
 
-`apply(ctx, config)` reads the `llm-acp` settings namespace for configured servers. For each server, it spawns a long-lived child process, opens an ACP `ClientSideConnection` over stdin/stdout, and registers an `AcpAdapter` on `ctx.llm` under route `acp-<server-id>`. Each model call opens a fresh ACP session, sends the full conversation as one user message, and translates streamed `agent_message_chunk` updates into harness `StreamChunk`s.
+`apply(ctx, config)` 从 `llm-acp` 设置命名空间读取已配置的服务器列表。对每个服务器，启动一个长生命周期的子进程，通过 stdin/stdout 建立 ACP `ClientSideConnection`，并在 `ctx.llm` 上注册路由为 `acp-<server-id>` 的 `AcpAdapter`。每次模型调用会创建新的 ACP session，将完整对话作为一条用户消息发送，并将流式 `agent_message_chunk` 更新转换为 harness 的 `StreamChunk`。
 
-### Client half — Settings UI
+### 客户端 — 设置界面
 
-The browser half registers a `settings.section` slot that renders the ACP registry browser and a "My Servers" list. Adding a server persists it to the `llm-acp` settings namespace; the host half observes the change and reconciles its provider directory.
+浏览器端注册一个 `settings.section` slot，渲染 ACP 注册表浏览器和"我的服务"列表。添加服务器时会将其持久化到 `llm-acp` 设置命名空间；宿主端监听变更并同步更新 provider 目录。
 
-### Registry command derivation
+### 注册表命令推导
 
-The ACP registry specifies distribution types:
+ACP 注册表指定了不同的分发类型：
 
-| Type | Command |
+| 类型 | 命令 |
 |---|---|
 | `npx` | `npx -y <package> ...args` |
 | `uvx` | `uvx <package> ...args` |
-| `binary` | basename of the registry's `cmd` (e.g. `./bin/devin` → `devin`) |
+| `binary` | 取注册表 `cmd` 的 basename（如 `./bin/devin` → `devin`） |
 
-Binary entries use the executable basename so a PATH-installed binary is found directly, avoiding `spawn ./bin/devin ENOENT`.
+binary 类型使用可执行文件的 basename，这样已安装到 PATH 的二进制文件可以直接找到，避免 `spawn ./bin/devin ENOENT` 错误。
 
-## Config
+## 配置项
 
-| Config | Default | Meaning |
+| 配置 | 默认值 | 说明 |
 |---|---|---|
-| `permission` | `allow` | Auto-answer `session/request_permission`: `reject` declines every prompt, `allow` selects the first `allow_once`/`allow_always` option. |
-| `emitReasoning` | `true` | Whether `agent_thought_chunk` and extension progress notifications become `reasoning-delta` chunks. |
-| `defaultModelId` | `glm-5-2` | Fallback model id when ACP discovery returns no models. |
-| `defaultModelName` | `GLM-5.2 High` | Fallback model display name. |
-| `disposeEofGraceMs` | `6000` | Positive grace after stdin EOF before platform termination. |
-| `disposeGraceMs` | `3000` | Positive POSIX grace after SIGTERM before SIGKILL. |
+| `permission` | `allow` | 自动应答 `session/request_permission`：`reject` 拒绝所有请求，`allow` 选择第一个 `allow_once`/`allow_always` 选项。 |
+| `emitReasoning` | `true` | 是否将 `agent_thought_chunk` 和扩展进度通知转换为 `reasoning-delta` chunk。 |
+| `defaultModelId` | `glm-5-2` | ACP 发现未返回模型时的回退模型 ID。 |
+| `defaultModelName` | `GLM-5.2 High` | 回退模型显示名称。 |
+| `disposeEofGraceMs` | `6000` | stdin EOF 后等待平台终止的宽限时间（毫秒）。 |
+| `disposeGraceMs` | `3000` | SIGTERM 后等待 SIGKILL 的 POSIX 宽限时间（毫秒）。 |
 
-## Protocol contract
+## 协议契约
 
-Each `stream()` call:
+每次 `stream()` 调用：
 
-1. Creates a fresh ACP `session/new` with the configured `cwd`.
-2. Renders the harness `messages` plus `system` prompt into one ACP text block.
-3. Sends `session/prompt` and streams `agent_message_chunk` updates as `text-delta` chunks.
-4. When `emitReasoning` is on, `agent_thought_chunk` updates become `reasoning-delta` chunks.
-5. The terminal `session/prompt` response `stopReason` becomes the `finish` chunk.
+1. 创建新的 ACP `session/new`，使用配置的 `cwd`。
+2. 将 harness 的 `messages` 和 `system` prompt 渲染为一条 ACP 文本块。
+3. 发送 `session/prompt`，将流式 `agent_message_chunk` 更新作为 `text-delta` chunk 传输。
+4. 当 `emitReasoning` 开启时，`agent_thought_chunk` 更新转换为 `reasoning-delta` chunk。
+5. `session/prompt` 响应的终态 `stopReason` 转换为 `finish` chunk。
 
-Tool-call deltas are never emitted. The ACP server executes its own tools internally.
+工具调用增量不会被输出。ACP 服务器内部执行自己的工具。
 
-### Stop-reason mapping
+### 停止原因映射
 
 | ACP | Harness finish |
 |---|---|
 | `end_turn` | `stop` |
 | `max_tokens` | `max-tokens` |
-| `refusal` | `error` (code `REFUSAL`) |
+| `refusal` | `error`（code `REFUSAL`） |
 | `cancelled` | `aborted` |
-| `max_turn_requests` / unknown | `error` |
+| `max_turn_requests` / 未知 | `error` |
 
-## Build
+## 构建
 
 ```sh
 pnpm install
 pnpm build    # tsc -b && tsdown
 ```
 
-Built artifacts are committed to the repository, so `pnpm install` alone is sufficient for consumers.
+构建产物已提交到仓库，用户安装时只需 `pnpm install` 即可。
 
-## Known Limitations and Deferred Work
+## 已知限制与待办事项
 
-- **No harness tool ecosystem** — the ACP server executes its own tools; harness `GenerateOptions.tools` is ignored.
-- **No session reuse** — every `stream()` call creates a fresh ACP session and re-sends the full conversation.
-- **No token usage** — ACP v1 does not deliver token accounting; the adapter emits no `usage` chunk.
-- **System prompt is in-band** — ACP `session/new` has no system slot, so the harness system prompt is prepended to the user message text.
-- **Full-history re-send** — the adapter renders the entire `messages` array into one user message.
-- **ACP v1 (SDK 0.25.1)** — the adapter uses `@agentclientprotocol/sdk` 0.25.1, whose `session/prompt` response carries the terminal `stopReason` (v1 contract).
-- **Extension protocol handling** — Devin's `_cognition.ai/*` notifications are consumed silently (progress text surfaced as reasoning when `emitReasoning` is on); other non-standard ACP extensions are swallowed to prevent SDK error logs.
+- **不支持 harness 工具生态** — ACP 服务器执行自己的工具；harness 的 `GenerateOptions.tools` 被忽略。
+- **无 session 复用** — 每次 `stream()` 调用创建新的 ACP session 并重新发送完整对话。
+- **无 token 用量** — ACP v1 不提供 token 计数；适配器不输出 `usage` chunk。
+- **系统提示在消息体内** — ACP `session/new` 没有 system 槽位，harness 的 system prompt 被拼接到用户消息文本前。
+- **全量历史重发** — 适配器将整个 `messages` 数组渲染为一条用户消息。
+- **ACP v1（SDK 0.25.1）** — 适配器使用 `@agentclientprotocol/sdk` 0.25.1，其 `session/prompt` 响应携带终态 `stopReason`（v1 契约）。
+- **扩展协议处理** — Devin 的 `_cognition.ai/*` 通知被静默消费（进度文本在 `emitReasoning` 开启时作为 reasoning 输出）；其他非标准 ACP 扩展被吞掉以避免 SDK 错误日志。
 
-## License
+## 许可证
 
 MIT
