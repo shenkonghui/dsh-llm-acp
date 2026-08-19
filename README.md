@@ -32,6 +32,10 @@ This removes the dependency and the bundle layer from the profile.
 
 After installation, open **Settings → ACP Servers** in the web UI. Browse the ACP registry, click **添加** on any agent (e.g. Devin, Codex, Claude Agent), and it becomes a configured ACP server. Each configured server creates an independent provider route `acp-<server-id>`.
 
+In the **My Servers** tab, click **Edit** on any configured server to:
+- Set **environment variables** for authentication (e.g. `DEEPSEEK_API_KEY`, `OPENAI_API_KEY`). Per-server env is merged on top of the plugin-level `env`.
+- Select which **models** to expose from the server's discovered catalog. Leave empty to expose all discovered models.
+
 Alternatively, configure servers directly in `settings.yaml`:
 
 ```yaml
@@ -42,6 +46,11 @@ llm-acp:
       args:
         - acp
       name: Devin
+      env:
+        DEEPSEEK_API_KEY: sk-xxx
+      models:
+        - deepseek-chat
+        - deepseek-reasoner
 ```
 
 ## How it works

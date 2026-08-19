@@ -4,7 +4,7 @@ import { useEffect, useMemo, useState } from 'react'
 import type {
   InjectFace, PropsLocale, PropsRuntime,
 } from '@deepseek-ai/dsh-client-ui-slots'
-import type { IApiClient } from '@deepseek-ai/dsh-api-remotes/client'
+import type { IApiClient, ModelProviderGroup } from '@deepseek-ai/dsh-api-remotes/client'
 import type { AcpSettingsLocaleKey } from './locales.ts'
 import css from './AcpSettingsSection.module.css'
 
@@ -30,14 +30,16 @@ export interface AcpServerEntry {
   command: string
   args: string[]
   name: string
+  env?: Record<string, string>
+  models?: string[]
 }
 
 /** Injected dependencies from the apply closure. */
 export interface AcpSettingsSectionInjected {
   /** The ACP registry data (bundled at build time). */
   registry: { version: string; agents: AcpRegistryAgent[] }
-  /** Wire face for settings reads/writes. */
-  api: Pick<IApiClient, 'settings'>
+  /** Wire face for settings reads/writes and model catalog discovery. */
+  api: Pick<IApiClient, 'settings' | 'llm'>
   /** Settings namespace for ACP servers. */
   settingsNs: string
 }
@@ -95,6 +97,51 @@ function distributionType(agent: AcpRegistryAgent): string {
   return 'unknown'
 }
 
+/** One discovered model from the host model catalog. */
+interface DiscoveredModel {
+  id: string
+  name: string
+}
+
+/** Draft environment variable row for the editor. */
+interface EnvDraftRow {
+  key: string
+  value: string
+}
+
+/** Load discovered models for one ACP provider route from the host catalog. */
+async function loadProviderModels(
+  api: AcpSettingsSectionInjected['api'],
+  providerRoute: string,
+): Promise<DiscoveredModel[]> {
+  try {
+    const response = await api.llm.models({})
+    if (!response.result.ok) return []
+    const groups: readonly ModelProviderGroup[] = response.result.value.groups
+    const group = groups.find(g => g.id === providerRoute)
+    if (group === undefined) return []
+    return group.models.map(m => ({ id: m.id, name: m.name }))
+  } catch {
+    return []
+  }
+}
+
+/** Convert an env record to editable draft rows. */
+function envToDrafts(env: Record<string, string> | undefined): EnvDraftRow[] {
+  if (env === undefined) return []
+  return Object.entries(env).map(([key, value]) => ({ key, value }))
+}
+
+/** Convert editable draft rows back to an env record, skipping empty keys. */
+function draftsToEnv(rows: EnvDraftRow[]): Record<string, string> {
+  const env: Record<string, string> = {}
+  for (const row of rows) {
+    const key = row.key.trim()
+    if (key.length > 0) env[key] = row.value
+  }
+  return env
+}
+
 /** Render the ACP Servers settings section. */
 export function AcpSettingsSection(props: AcpSettingsSectionProps) {
   const { t, registry, api, settingsNs } = props
@@ -105,6 +152,12 @@ export function AcpSettingsSection(props: AcpSettingsSectionProps) {
   const [addingId, setAddingId] = useState<string | undefined>()
   const [removingId, setRemovingId] = useState<string | undefined>()
   const [error, setError] = useState<string | undefined>()
+  const [expandedId, setExpandedId] = useState<string | undefined>()
+  const [envDrafts, setEnvDrafts] = useState<Record<string, EnvDraftRow[]>>({})
+  const [modelDrafts, setModelDrafts] = useState<Record<string, string[]>>({})
+  const [discoveredModels, setDiscoveredModels] = useState<Record<string, DiscoveredModel[]>>({})
+  const [modelsLoading, setModelsLoading] = useState<Set<string>>(new Set())
+  const [savingId, setSavingId] = useState<string | undefined>()
 
   /** Load current servers from settings. */
   const loadServers = async (): Promise<void> => {
@@ -134,7 +187,7 @@ export function AcpSettingsSection(props: AcpSettingsSectionProps) {
     setAddingId(agent.id)
     setError(undefined)
     try {
-      const serverEntry = { command: cmd.command, args: cmd.args, name: agent.name }
+      const serverEntry = { command: cmd.command, args: cmd.args, name: agent.name, env: {}, models: [] }
       const response = await api.settings.mutate({
         ns: settingsNs,
         ops: [{ op: 'set', path: ['servers', agent.id], value: serverEntry }],
@@ -168,6 +221,95 @@ export function AcpSettingsSection(props: AcpSettingsSectionProps) {
       setError(err instanceof Error ? err.message : String(err))
     }
     setRemovingId(undefined)
+  }
+
+  /** Expand a server card, loading drafts and discovered models. */
+  const expandServer = async (id: string): Promise<void> => {
+    if (expandedId === id) {
+      setExpandedId(undefined)
+      return
+    }
+    const server = servers[id]
+    setExpandedId(id)
+    if (server !== undefined) {
+      setEnvDrafts(prev => ({ ...prev, [id]: envToDrafts(server.env) }))
+      setModelDrafts(prev => ({ ...prev, [id]: server.models ?? [] }))
+    }
+    // Fetch discovered models for this provider route.
+    setModelsLoading(prev => new Set(prev).add(id))
+    const models = await loadProviderModels(api, `acp-${id}`)
+    setDiscoveredModels(prev => ({ ...prev, [id]: models }))
+    setModelsLoading(prev => {
+      const next = new Set(prev)
+      next.delete(id)
+      return next
+    })
+  }
+
+  /** Save env and models drafts for one server to settings. */
+  const saveServerConfig = async (id: string): Promise<void> => {
+    setSavingId(id)
+    setError(undefined)
+    try {
+      const env = draftsToEnv(envDrafts[id] ?? [])
+      const models = modelDrafts[id] ?? []
+      const response = await api.settings.mutate({
+        ns: settingsNs,
+        ops: [
+          { op: 'set', path: ['servers', id, 'env'], value: env },
+          { op: 'set', path: ['servers', id, 'models'], value: models },
+        ],
+      })
+      if (!response.result.ok) {
+        setError(response.result.error.message)
+      } else {
+        await loadServers()
+      }
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : String(err))
+    }
+    setSavingId(undefined)
+  }
+
+  /** Update one env draft row. */
+  const updateEnvRow = (serverId: string, index: number, patch: Partial<EnvDraftRow>): void => {
+    setEnvDrafts(prev => {
+      const rows = [...(prev[serverId] ?? [])]
+      const row = rows[index]
+      if (row === undefined) return prev
+      rows[index] = { ...row, ...patch }
+      return { ...prev, [serverId]: rows }
+    })
+  }
+
+  /** Add an empty env draft row. */
+  const addEnvRow = (serverId: string): void => {
+    setEnvDrafts(prev => ({
+      ...prev,
+      [serverId]: [...(prev[serverId] ?? []), { key: '', value: '' }],
+    }))
+  }
+
+  /** Remove one env draft row. */
+  const removeEnvRow = (serverId: string, index: number): void => {
+    setEnvDrafts(prev => {
+      const rows = [...(prev[serverId] ?? [])]
+      rows.splice(index, 1)
+      return { ...prev, [serverId]: rows }
+    })
+  }
+
+  /** Toggle one model in the model draft selection. */
+  const toggleModel = (serverId: string, modelId: string): void => {
+    setModelDrafts(prev => {
+      const current = new Set(prev[serverId] ?? [])
+      if (current.has(modelId)) {
+        current.delete(modelId)
+      } else {
+        current.add(modelId)
+      }
+      return { ...prev, [serverId]: [...current] }
+    })
   }
 
   const filteredAgents = useMemo(() => {
@@ -263,31 +405,149 @@ export function AcpSettingsSection(props: AcpSettingsSectionProps) {
             <p className={css.empty}>{t('noServers')}</p>
           ) : (
             <div className={css.list}>
-              {serverList.map(([id, server]) => (
-                <div key={id} className={css.serverCard}>
-                  <div className={css.agentInfo}>
-                    <p className={css.agentName}>{server.name}</p>
-                    <p className={css.serverCommand}>
-                      {t('serverCommand')}: {server.command} {server.args.join(' ')}
-                    </p>
-                    <div className={css.agentMeta}>
-                      <span>acp-{id}</span>
+              {serverList.map(([id, server]) => {
+                const isExpanded = expandedId === id
+                const rows = envDrafts[id] ?? []
+                const selectedModels = modelDrafts[id] ?? []
+                const models = discoveredModels[id] ?? []
+                const isLoadingModels = modelsLoading.has(id)
+                return (
+                  <div key={id} className={css.serverCardBlock}>
+                    <div className={css.serverCard}>
+                      <div className={css.agentInfo}>
+                        <p className={css.agentName}>{server.name}</p>
+                        <p className={css.serverCommand}>
+                          {t('serverCommand')}: {server.command} {server.args.join(' ')}
+                        </p>
+                        <div className={css.agentMeta}>
+                          <span>acp-{id}</span>
+                        </div>
+                      </div>
+                      <div className={css.cardActions}>
+                        <button
+                          type="button"
+                          className={css.editButton}
+                          onClick={() => { void expandServer(id) }}
+                        >
+                          {isExpanded ? t('collapse') : t('edit')}
+                        </button>
+                        <button
+                          type="button"
+                          className={css.removeButton}
+                          disabled={removingId === id}
+                          onClick={() => {
+                            if (window.confirm(t('removeConfirm'))) {
+                              void removeServer(id)
+                            }
+                          }}
+                        >
+                          {removingId === id ? '…' : t('remove')}
+                        </button>
+                      </div>
                     </div>
+                    {isExpanded && (
+                      <div className={css.serverDetail}>
+                        <div className={css.detailSection}>
+                          <p className={css.detailHeading}>{t('envVars')}</p>
+                          <p className={css.detailHint}>{t('envVarsHint')}</p>
+                          {rows.length === 0 ? (
+                            <p className={css.emptyInline}>{t('noEnvVars')}</p>
+                          ) : (
+                            <div className={css.envList}>
+                              {rows.map((row, index) => (
+                                <div key={index} className={css.envRow}>
+                                  <input
+                                    type="text"
+                                    className={css.envKey}
+                                    placeholder={t('envKey')}
+                                    value={row.key}
+                                    onChange={e => { updateEnvRow(id, index, { key: e.target.value }) }}
+                                  />
+                                  <input
+                                    type="text"
+                                    className={css.envValue}
+                                    placeholder={t('envValue')}
+                                    value={row.value}
+                                    onChange={e => { updateEnvRow(id, index, { value: e.target.value }) }}
+                                  />
+                                  <button
+                                    type="button"
+                                    className={css.envRemove}
+                                    onClick={() => { removeEnvRow(id, index) }}
+                                  >
+                                    ×
+                                  </button>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                          <button
+                            type="button"
+                            className={css.addEnvButton}
+                            onClick={() => { addEnvRow(id) }}
+                          >
+                            + {t('addEnvVar')}
+                          </button>
+                        </div>
+
+                        <div className={css.detailSection}>
+                          <p className={css.detailHeading}>{t('modelSelect')}</p>
+                          <p className={css.detailHint}>{t('modelSelectHint')}</p>
+                          {isLoadingModels ? (
+                            <p className={css.emptyInline}>{t('modelsLoading')}</p>
+                          ) : models.length === 0 ? (
+                            <p className={css.emptyInline}>{t('noModels')}</p>
+                          ) : (
+                            <div className={css.modelList}>
+                              {models.map(model => {
+                                const checked = selectedModels.includes(model.id)
+                                return (
+                                  <label key={model.id} className={css.modelRow}>
+                                    <input
+                                      type="checkbox"
+                                      checked={checked}
+                                      onChange={() => { toggleModel(id, model.id) }}
+                                    />
+                                    <span className={css.modelName}>{model.name}</span>
+                                    <span className={css.modelId}>{model.id}</span>
+                                  </label>
+                                )
+                              })}
+                            </div>
+                          )}
+                          {models.length > 0 && (
+                            <div className={css.modelActions}>
+                              <button
+                                type="button"
+                                className={css.linkButton}
+                                onClick={() => { setModelDrafts(prev => ({ ...prev, [id]: models.map(m => m.id) })) }}
+                              >
+                                {t('selectAll')}
+                              </button>
+                              <button
+                                type="button"
+                                className={css.linkButton}
+                                onClick={() => { setModelDrafts(prev => ({ ...prev, [id]: [] })) }}
+                              >
+                                {t('selectNone')}
+                              </button>
+                            </div>
+                          )}
+                        </div>
+
+                        <button
+                          type="button"
+                          className={css.saveButton}
+                          disabled={savingId === id}
+                          onClick={() => { void saveServerConfig(id) }}
+                        >
+                          {savingId === id ? t('saving') : t('save')}
+                        </button>
+                      </div>
+                    )}
                   </div>
-                  <button
-                    type="button"
-                    className={css.removeButton}
-                    disabled={removingId === id}
-                    onClick={() => {
-                      if (window.confirm(t('removeConfirm'))) {
-                        void removeServer(id)
-                      }
-                    }}
-                  >
-                    {removingId === id ? '…' : t('remove')}
-                  </button>
-                </div>
-              ))}
+                )
+              })}
             </div>
           )}
         </div>

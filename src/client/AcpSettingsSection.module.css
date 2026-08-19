@@ -57,8 +57,6 @@
   display: flex;
   flex-direction: column;
   gap: 8px;
-  max-height: 480px;
-  overflow-y: auto;
 }
 
 .agentCard {
@@ -176,4 +174,209 @@
   font-family: var(--dsw-font-mono, monospace);
   font-size: 12px;
   color: var(--dsw-text-secondary, #666);
+}
+
+.serverCardBlock {
+  border: 1px solid var(--dsw-border, #e0e0e0);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.cardActions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.editButton {
+  padding: 6px 12px;
+  border: 1px solid var(--dsw-border, #e0e0e0);
+  background: none;
+  color: var(--dsw-text-primary, #333);
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.editButton:hover {
+  border-color: var(--dsw-accent, #1677ff);
+  color: var(--dsw-accent, #1677ff);
+}
+
+.serverDetail {
+  padding: 12px 16px;
+  border-top: 1px solid var(--dsw-border, #e0e0e0);
+  background: var(--dsw-bg-secondary, #fafafa);
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.detailSection {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.detailHeading {
+  font-size: 14px;
+  font-weight: 600;
+  margin: 0;
+}
+
+.detailHint {
+  font-size: 12px;
+  color: var(--dsw-text-tertiary, #999);
+  margin: 0 0 4px;
+  line-height: 1.4;
+}
+
+.emptyInline {
+  font-size: 13px;
+  color: var(--dsw-text-tertiary, #999);
+  margin: 0;
+  padding: 4px 0;
+}
+
+.envList {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.envRow {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.envKey {
+  flex: 2;
+  padding: 6px 8px;
+  border: 1px solid var(--dsw-border, #e0e0e0);
+  border-radius: 4px;
+  font-size: 13px;
+  font-family: var(--dsw-font-mono, monospace);
+  box-sizing: border-box;
+}
+
+.envValue {
+  flex: 3;
+  padding: 6px 8px;
+  border: 1px solid var(--dsw-border, #e0e0e0);
+  border-radius: 4px;
+  font-size: 13px;
+  font-family: var(--dsw-font-mono, monospace);
+  box-sizing: border-box;
+}
+
+.envRemove {
+  flex-shrink: 0;
+  width: 28px;
+  height: 28px;
+  border: 1px solid var(--dsw-border, #e0e0e0);
+  background: none;
+  color: var(--dsw-danger, #ff4d4f);
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  padding: 0;
+}
+
+.envRemove:hover {
+  border-color: var(--dsw-danger, #ff4d4f);
+}
+
+.addEnvButton {
+  align-self: flex-start;
+  padding: 4px 12px;
+  border: 1px dashed var(--dsw-border, #e0e0e0);
+  background: none;
+  color: var(--dsw-text-secondary, #666);
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 13px;
+  margin-top: 4px;
+}
+
+.addEnvButton:hover {
+  border-color: var(--dsw-accent, #1677ff);
+  color: var(--dsw-accent, #1677ff);
+}
+
+.modelList {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 240px;
+  overflow-y: auto;
+  border: 1px solid var(--dsw-border, #e0e0e0);
+  border-radius: 4px;
+  padding: 4px;
+}
+
+.modelRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.modelRow:hover {
+  background: var(--dsw-bg-secondary, #f0f0f0);
+}
+
+.modelRow input[type='checkbox'] {
+  margin: 0;
+  flex-shrink: 0;
+}
+
+.modelName {
+  font-weight: 500;
+}
+
+.modelId {
+  font-family: var(--dsw-font-mono, monospace);
+  font-size: 11px;
+  color: var(--dsw-text-tertiary, #999);
+}
+
+.modelActions {
+  display: flex;
+  gap: 12px;
+  margin-top: 4px;
+}
+
+.linkButton {
+  border: none;
+  background: none;
+  color: var(--dsw-accent, #1677ff);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 0;
+}
+
+.linkButton:hover {
+  text-decoration: underline;
+}
+
+.saveButton {
+  align-self: flex-start;
+  padding: 6px 20px;
+  border: 1px solid var(--dsw-accent, #1677ff);
+  background: var(--dsw-accent, #1677ff);
+  color: #fff;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.saveButton:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
 }

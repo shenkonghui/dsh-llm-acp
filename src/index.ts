@@ -51,6 +51,18 @@ export interface AcpServerConfig {
   args: string[]
   /** Human-readable display name for the provider. */
   name: string
+  /**
+   * Per-server environment variables merged on top of the plugin-level `env`.
+   * Use this for credentials the ACP server needs (e.g. `DEEPSEEK_API_KEY`,
+   * `OPENAI_API_KEY`). Per-server values override plugin-level ones.
+   */
+  env?: Record<string, string>
+  /**
+   * Model ids to expose from this server's discovered catalog. When omitted or
+   * empty, every discovered model is exposed. When non-empty, only the listed
+   * models (intersected with the discovered set) appear in `listModels`.
+   */
+  models?: string[]
 }
 
 /** Plugin config: defaults applied to every spawned ACP server. */
@@ -93,6 +105,8 @@ export const Config: z<Config> = z.object({
     command: z.string().required(),
     args: z.array(z.string()).default([]),
     name: z.string().required(),
+    env: z.dict(z.string()).default({}),
+    models: z.array(z.string()).default([]),
   })).default({}),
 })
 
@@ -102,6 +116,8 @@ const SettingsSchema = z.object({
     command: z.string().required(),
     args: z.array(z.string()).default([]),
     name: z.string().required(),
+    env: z.dict(z.string()).default({}),
+    models: z.array(z.string()).default([]),
   })).default({}),
 })
 
@@ -141,11 +157,24 @@ type ResolvedConfig = Required<Omit<Config, 'cwd' | 'servers'>> & Pick<Config, '
 interface ActiveServer {
   connection: AcpConnection
   registration: AdapterRegistrationHandle
+  /** JSON fingerprint of the config this server was created from, for change detection. */
+  fingerprint: string
 }
 
 /** Provider route name for one server id. */
 function routeName(serverId: string): string {
   return `acp-${serverId}`
+}
+
+/** Stable JSON fingerprint of a server config, for reconcile change detection. */
+function serverFingerprint(server: AcpServerConfig): string {
+  return JSON.stringify({
+    command: server.command,
+    args: server.args,
+    name: server.name,
+    env: server.env ?? {},
+    models: server.models ?? [],
+  })
 }
 
 /** Directory entries for the configurable-provider directory.
@@ -215,7 +244,7 @@ export function apply(ctx: Context, config: Config): void {
       args: server.args,
       cwd,
       permission: resolved.permission,
-      env: resolved.env,
+      env: { ...resolved.env, ...(server.env ?? {}) },
       disposeEofGraceMs: resolved.disposeEofGraceMs,
       disposeGraceMs: resolved.disposeGraceMs,
       spawn: spec => ctx.subprocess.spawn(spec),
@@ -226,9 +255,10 @@ export function apply(ctx: Context, config: Config): void {
       provider: routeName(serverId),
       emitReasoning: resolved.emitReasoning,
       defaultModel: { id: resolved.defaultModelId, name: resolved.defaultModelName },
+      enabledModels: server.models,
     })
     const registration = ctx.llm.registerAdapter([routeName(serverId)], adapter)
-    return { connection, registration }
+    return { connection, registration, fingerprint: serverFingerprint(server) }
   }
 
   /** Reconcile active connections with the current server set. */
@@ -247,13 +277,28 @@ export function apply(ctx: Context, config: Config): void {
       }
     }
 
-    // Add new servers.
+    // Add new servers or rebuild when an existing server's config changed.
     for (const [id, server] of desired) {
-      if (!active.has(id)) {
+      const existing = active.get(id)
+      if (existing === undefined) {
         try {
           active.set(id, createServer(id, server))
         } catch (error: unknown) {
           ctx.logger.error(`llm-acp: failed to create server "${id}": ${error instanceof Error ? error.message : String(error)}`)
+        }
+      } else if (existing.fingerprint !== serverFingerprint(server)) {
+        // Config changed (env, models, command, …): tear down and rebuild so
+        // the adapter picks up the new enabledModels and the connection gets
+        // the new env. A stale adapter would keep advertising old models.
+        existing.registration()
+        void existing.connection.dispose().catch((error: unknown) => {
+          ctx.logger.warn(`llm-acp: connection disposal for "${id}" failed: ${error instanceof Error ? error.message : String(error)}`)
+        })
+        active.delete(id)
+        try {
+          active.set(id, createServer(id, server))
+        } catch (error: unknown) {
+          ctx.logger.error(`llm-acp: failed to rebuild server "${id}": ${error instanceof Error ? error.message : String(error)}`)
         }
       }
     }

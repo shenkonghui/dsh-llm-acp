@@ -32,6 +32,10 @@ dsh plugin --profile my-acp remove @deepseek-ai/dsh-llm-acp
 
 安装后，在 Web UI 中打开 **设置 → ACP 服务**。浏览 ACP 注册表，在任意 agent（如 Devin、Codex、Claude Agent）上点击 **添加**，即可将其配置为 ACP 服务器。每个已配置的服务器会创建一个独立的 provider 路由 `acp-<server-id>`。
 
+在 **我的服务** 标签页中，点击任意已配置服务器上的 **编辑** 按钮，可以：
+- 设置**环境变量**用于认证（如 `DEEPSEEK_API_KEY`、`OPENAI_API_KEY`）。每个服务器的环境变量会与插件级 `env` 合并，服务级优先。
+- 选择要**启用的模型**。从服务器发现的模型目录中多选要暴露的模型，不选则启用全部已发现的模型。
+
 也可以直接在 `settings.yaml` 中配置：
 
 ```yaml
@@ -42,6 +46,11 @@ llm-acp:
       args:
         - acp
       name: Devin
+      env:
+        DEEPSEEK_API_KEY: sk-xxx
+      models:
+        - deepseek-chat
+        - deepseek-reasoner
 ```
 
 ## 工作原理

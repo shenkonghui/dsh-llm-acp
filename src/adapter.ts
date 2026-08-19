@@ -28,6 +28,12 @@ export interface AcpAdapterOptions {
   emitReasoning: boolean
   /** Model id to fall back to when ACP model discovery returns nothing. */
   defaultModel: { id: string; name: string }
+  /**
+   * Model ids to expose from the discovered catalog. When omitted or empty,
+   * every discovered model is exposed. When non-empty, only the listed models
+   * (intersected with the discovered set) appear in `listModels`.
+   */
+  enabledModels?: readonly string[] | undefined
 }
 
 /** Render the harness message history plus system prompt into one ACP text block. */
@@ -74,7 +80,11 @@ export class AcpAdapter extends LlmAdapter {
 
   constructor(private readonly config: AcpAdapterOptions) {
     super()
-    this.models = [{ provider: config.provider, id: config.defaultModel.id, name: config.defaultModel.name }]
+    const fallback = [{ provider: config.provider, id: config.defaultModel.id, name: config.defaultModel.name }]
+    const allow = config.enabledModels
+    this.models = allow !== undefined && allow.length > 0 && !allow.includes(config.defaultModel.id)
+      ? []
+      : fallback
     this.modelsReady = this.discoverModels()
   }
 
@@ -83,7 +93,11 @@ export class AcpAdapter extends LlmAdapter {
     try {
       const discovered = await this.config.connection.discoverModels()
       if (discovered !== undefined && discovered.length > 0) {
-        this.models = discovered.map(m => ({ provider: this.config.provider, id: m.id, name: m.name }))
+        const all = discovered.map(m => ({ provider: this.config.provider, id: m.id, name: m.name }))
+        const allow = this.config.enabledModels
+        this.models = allow !== undefined && allow.length > 0
+          ? all.filter(m => allow.includes(m.id))
+          : all
       }
     } catch {
       // Keep the fallback model list; discovery is best-effort.

@@ -10,6 +10,11 @@ export type AcpSettingsLocaleKey =
   | 'noServers' | 'serverCommand' | 'serverArgs' | 'serverName'
   | 'distributionNpx' | 'distributionBinary' | 'distributionUvx'
   | 'version' | 'authors' | 'repository' | 'website'
+  | 'edit' | 'collapse' | 'save' | 'saving'
+  | 'envVars' | 'envVarsHint' | 'envKey' | 'envValue'
+  | 'addEnvVar' | 'noEnvVars'
+  | 'modelSelect' | 'modelSelectHint' | 'noModels' | 'modelsLoading'
+  | 'selectAll' | 'selectNone'
 
 /** English copy. */
 export const en: Record<AcpSettingsLocaleKey, string> = {
@@ -38,6 +43,22 @@ export const en: Record<AcpSettingsLocaleKey, string> = {
   authors: 'Authors',
   repository: 'Repository',
   website: 'Website',
+  edit: 'Edit',
+  collapse: 'Collapse',
+  save: 'Save',
+  saving: 'Saving…',
+  envVars: 'Environment Variables',
+  envVarsHint: 'Set environment variables for authentication (e.g. API keys). These are merged on top of the plugin-level env.',
+  envKey: 'Key',
+  envValue: 'Value',
+  addEnvVar: 'Add variable',
+  noEnvVars: 'No environment variables set.',
+  modelSelect: 'Enabled Models',
+  modelSelectHint: 'Select which models to expose from this server. Leave empty to expose all discovered models.',
+  noModels: 'No models discovered yet. The server may still be starting.',
+  modelsLoading: 'Loading models…',
+  selectAll: 'Select all',
+  selectNone: 'Select none',
 }
 
 /** Chinese copy. */
@@ -67,4 +88,20 @@ export const zh: Record<AcpSettingsLocaleKey, string> = {
   authors: '作者',
   repository: '仓库',
   website: '网站',
+  edit: '编辑',
+  collapse: '收起',
+  save: '保存',
+  saving: '保存中…',
+  envVars: '环境变量',
+  envVarsHint: '为 ACP 服务设置环境变量用于认证（如 API Key），会与插件级环境变量合并。',
+  envKey: '键名',
+  envValue: '键值',
+  addEnvVar: '添加变量',
+  noEnvVars: '尚未设置环境变量。',
+  modelSelect: '启用模型',
+  modelSelectHint: '选择要启用的模型，不选则启用全部已发现的模型。',
+  noModels: '尚未发现模型，服务可能仍在启动中。',
+  modelsLoading: '模型加载中…',
+  selectAll: '全选',
+  selectNone: '全不选',
 }
