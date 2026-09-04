@@ -14,8 +14,10 @@ import { isAbsolute, resolve } from 'node:path'
 import { accessSync, constants, statSync } from 'node:fs'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
+import type {} from '@deepseek-ai/dsh-agent'
+import type {} from '@deepseek-ai/dsh-user-approval'
 import { MAX_TIMER_DELAY_MS } from '@deepseek-ai/dsh-timeout'
-import { deepEqualJson, installSettingsSection, settingsNamespace } from '@deepseek-ai/dsh-settings'
+import type {} from '@deepseek-ai/dsh-settings'
 import type { AdapterRegistrationHandle, DirectoryRegistrationHandle, LlmConfigurableProvider } from '@deepseek-ai/dsh-llm'
 import { AcpAdapter } from './adapter.ts'
 import {
@@ -23,7 +25,6 @@ import {
   DEFAULT_DISPOSE_EOF_GRACE_MS,
   DEFAULT_DISPOSE_GRACE_MS,
 } from './connection.ts'
-import type { PermissionPolicy } from './types.ts'
 import registryData from './registry.json' with { type: 'json' }
 
 export { AcpAdapter } from './adapter.ts'
@@ -38,10 +39,25 @@ export type * from './types.ts'
 export { registryData as acpRegistry }
 
 export const name = 'llm-acp'
-export const inject = ['llm', 'subprocess']
+export const inject = ['llm', 'subprocess', 'settings']
 
 /** Settings namespace owned by this plugin. */
-const NS = settingsNamespace('llm-acp')
+const NS = 'llm-acp'
+
+/** Structural deep equality over JSON-compatible data (objects, arrays, primitives). */
+function deepEqualJson(a: unknown, b: unknown): boolean {
+  if (a === b) return true
+  if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) return false
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false
+    return a.every((entry, index) => deepEqualJson(entry, b[index]))
+  }
+  const left = a as Record<string, unknown>
+  const right = b as Record<string, unknown>
+  const keys = Object.keys(left)
+  if (keys.length !== Object.keys(right).length) return false
+  return keys.every(key => key in right && deepEqualJson(left[key], right[key]))
+}
 
 /** One configured ACP server entry in settings. */
 export interface AcpServerConfig {
@@ -67,8 +83,6 @@ export interface AcpServerConfig {
 
 /** Plugin config: defaults applied to every spawned ACP server. */
 export interface Config {
-  /** How to auto-answer the child's `session/request_permission` prompts (default `reject`). */
-  permission?: PermissionPolicy
   /** Extra environment variables merged on top of the scrubbed parent env. */
   env?: Record<string, string>
   /** Whether to translate `agent_thought_chunk` into `reasoning-delta` chunks (default `false`). */
@@ -93,7 +107,6 @@ export interface Config {
 }
 
 export const Config: z<Config> = z.object({
-  permission: z.union(['allow', 'reject'] as const).default('allow'),
   env: z.dict(z.string()).default({}),
   emitReasoning: z.boolean().default(true),
   defaultModelId: z.string().default('devin'),
@@ -153,6 +166,13 @@ function assertUsableCwd(label: string, cwd: string): string {
 /** The shape after schemastery applied the defaults. */
 type ResolvedConfig = Required<Omit<Config, 'cwd' | 'servers'>> & Pick<Config, 'cwd' | 'servers'>
 
+/** Session permission fields used to route ACP permission requests. */
+interface PermissionPresetReader {
+  readonly names: readonly string[]
+  current(events: readonly unknown[]): string
+  resolve(name: string): { sandbox: string; approval: string }
+}
+
 /** One active ACP server: connection, adapter registration, and provider route. */
 interface ActiveServer {
   connection: AcpConnection
@@ -210,7 +230,7 @@ export function apply(ctx: Context, config: Config): void {
     ? process.cwd()
     : assertUsableCwd('config cwd', resolve(config.cwd))
 
-  /** Current settings source; updated by `installSettingsSection`. */
+  /** Current settings source; updated by `settings.installSection`. */
   let currentSettings: () => { servers: Record<string, AcpServerConfig> } = () => ({ servers: {} })
   /** Servers from the composition entry (inline config). */
   const configServers = (): Map<string, AcpServerConfig> => {
@@ -243,7 +263,6 @@ export function apply(ctx: Context, config: Config): void {
       command: server.command,
       args: server.args,
       cwd,
-      permission: resolved.permission,
       env: { ...resolved.env, ...(server.env ?? {}) },
       disposeEofGraceMs: resolved.disposeEofGraceMs,
       disposeGraceMs: resolved.disposeGraceMs,
@@ -256,6 +275,34 @@ export function apply(ctx: Context, config: Config): void {
       emitReasoning: resolved.emitReasoning,
       defaultModel: { id: resolved.defaultModelId, name: resolved.defaultModelName },
       enabledModels: server.models,
+      permissionRequester: () => {
+        const agents = ctx.get('agents')
+        const agent = agents?.currentInitiator()
+        if (agent === undefined) return undefined
+        const permissionPresets = ctx.get('permissionPresets' as never) as PermissionPresetReader | undefined
+        if (permissionPresets !== undefined) {
+          const current = permissionPresets.current(agent.session.events)
+          if (permissionPresets.names.includes(current)) {
+            const preset = permissionPresets.resolve(current)
+            if (preset.sandbox === 'danger-full-access' && preset.approval === 'never') {
+              return async () => 'allow'
+            }
+          }
+        }
+        const approval = ctx.get('approval')
+        if (approval === undefined) return undefined
+        return async ({ title, signal }) => {
+          const outcome = await approval.request({
+            agent,
+            toolName: `ACP: ${title}`,
+            reason: `${server.name} requested permission to run "${title}".`,
+            signal,
+          })
+          if (outcome === 'allowed-once') return 'allow'
+          if (outcome === 'cancelled') return 'cancel'
+          return 'reject'
+        }
+      },
     })
     const registration = ctx.llm.registerAdapter([routeName(serverId)], adapter)
     return { connection, registration, fingerprint: serverFingerprint(server) }
@@ -323,7 +370,17 @@ export function apply(ctx: Context, config: Config): void {
   reconcileDirectory()
 
   // Install the settings section for dynamic server management.
-  installSettingsSection(ctx, NS, SettingsSchema, { servers: {} }, {
+  // `installSection` is on SettingsProvider in dsh-settings ≥0.1.2-rc.1; the
+  // local 0.1.0-rc.5 type lacks it, so cast to the minimal call signature.
+  type InstallSectionFn = <T>(
+    owner: Context,
+    ns: string,
+    schema: z<T>,
+    entry: T,
+    hooks: { setSource: (source: () => T) => void; onChange: () => void; validate?: (value: T) => void },
+  ) => void
+  (ctx.settings as unknown as { installSection: InstallSectionFn }).installSection(
+    ctx, NS, SettingsSchema, { servers: {} }, {
     setSource: (source) => {
       currentSettings = source as () => { servers: Record<string, AcpServerConfig> }
     },

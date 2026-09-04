@@ -49,6 +49,8 @@ dsh plugin --profile my-acp remove @deepseek-ai/dsh-llm-acp
 - 设置**环境变量**用于认证（如 `DEEPSEEK_API_KEY`、`OPENAI_API_KEY`）。每个服务器的环境变量会与插件级 `env` 合并，服务级优先。
 - 选择要**启用的模型**。从服务器发现的模型目录中多选要暴露的模型，不选则启用全部已发现的模型。
 
+ACP server 不单独保存权限策略。它复用会话输入框中的权限列表：`read-only` 和 `workspace-write` 将敏感操作转发到 harness 审批界面，`danger-full-access` 自动允许。
+
 也可以直接在 `settings.yaml` 中配置：
 
 ```yaml
@@ -92,7 +94,6 @@ binary 类型使用可执行文件的 basename，这样已安装到 PATH 的二�
 
 | 配置 | 默认值 | 说明 |
 |---|---|---|
-| `permission` | `allow` | 自动应答 `session/request_permission`：`reject` 拒绝所有请求，`allow` 选择第一个 `allow_once`/`allow_always` 选项。 |
 | `emitReasoning` | `true` | 是否将 `agent_thought_chunk` 和扩展进度通知转换为 `reasoning-delta` chunk。 |
 | `defaultModelId` | `glm-5-2` | ACP 发现未返回模型时的回退模型 ID。 |
 | `defaultModelName` | `GLM-5.2 High` | 回退模型显示名称。 |
@@ -109,7 +110,7 @@ binary 类型使用可执行文件的 basename，这样已安装到 PATH 的二�
 4. 当 `emitReasoning` 开启时，`agent_thought_chunk` 更新转换为 `reasoning-delta` chunk。
 5. `session/prompt` 响应的终态 `stopReason` 转换为 `finish` chunk。
 
-工具调用增量不会被输出。ACP 服务器内部执行自己的工具。
+工具调用增量不会被输出。ACP 服务器内部执行自己的工具。`session/request_permission` 复用当前会话的权限预设：`danger-full-access` 自动允许，其他预设通过 harness 一次性审批请求处理；审批不可用、失败或 ACP 未提供 `allow_once` 时拒绝执行。
 
 ### 停止原因映射
 

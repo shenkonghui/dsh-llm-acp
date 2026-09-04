@@ -1,3 +1,5 @@
+/// <reference types="node" />
+
 /**
  * Keyless integration tests for the ACP LLM adapter. Each spawns a REAL
  * subprocess — the scripted mock ACP server reused from dsh-subagent-acp — and
@@ -12,12 +14,15 @@ import { describe, expect, it } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import Loader from '@deepseek-ai/cordis-plugin-loader'
 import { fileURLToPath } from 'node:url'
+import AgentRuntime, { type Agent } from '@deepseek-ai/dsh-agent'
 import { BlockAssembler, createUserMessage, type StreamChunk } from '@deepseek-ai/dsh-llm'
 import LlmRuntime from '@deepseek-ai/dsh-llm'
+import type { SessionEvent } from '@deepseek-ai/dsh-session'
+import ApprovalService, { type ApprovalOutcome } from '@deepseek-ai/dsh-user-approval'
 import * as acp from '../src/index.ts'
 import LocalSubprocessRuntime from '@deepseek-ai/dsh-subprocess-local'
 
-const mockServer = fileURLToPath(new URL('../../../subagent/subagent-acp/tests/mock-acp-server.ts', import.meta.url))
+const mockServer = fileURLToPath(new URL('../../deepseek-harness/packages/subagent/subagent-acp/tests/mock-acp-server.ts', import.meta.url))
 
 interface SetupEnv {
   [key: string]: string
@@ -27,13 +32,25 @@ interface SetupEnv {
  * Mount the ACP LLM adapter pointed at the mock server, scripted by `mockEnv`.
  * `emitReasoning` selects whether thought chunks become reasoning-delta.
  */
-async function setup(mockEnv: SetupEnv = {}, opts: { emitReasoning?: boolean; permission?: 'allow' | 'reject' } = {}) {
+async function setup(mockEnv: SetupEnv = {}, opts: {
+  emitReasoning?: boolean
+  permissionPreset?: 'read-only' | 'workspace-write' | 'danger-full-access'
+} = {}) {
   const ctx = new Context()
   await ctx.plugin(Loader)
+  await ctx.plugin(AgentRuntime)
+  await ctx.plugin(ApprovalService)
+  if (opts.permissionPreset !== undefined) {
+    const preset = opts.permissionPreset
+    ctx.provide('permissionPresets' as never, {
+      names: [preset],
+      current: () => preset,
+      resolve: () => ({ sandbox: preset, approval: preset === 'danger-full-access' ? 'never' : 'ask' }),
+    } as never)
+  }
   await ctx.plugin(LlmRuntime)
   await ctx.plugin(LocalSubprocessRuntime)
   await ctx.plugin(acp, {
-    permission: opts.permission ?? 'reject',
     emitReasoning: opts.emitReasoning ?? false,
     env: mockEnv,
     servers: {
@@ -69,6 +86,24 @@ function finishChunk(chunks: StreamChunk[]): Extract<StreamChunk, { type: 'finis
   const finish = chunks.find(c => c.type === 'finish')
   if (finish === undefined) throw new Error('no finish chunk emitted')
   return finish as Extract<StreamChunk, { type: 'finish' }>
+}
+
+/** Minimal initiating agent with an open turn for the approval service audit pair. */
+function fakeAgent(): Agent {
+  const events: Array<{ type: string; data?: Record<string, unknown> }> = [
+    { type: 'turn/start' },
+    { type: 'user/message' },
+  ]
+  return {
+    session: {
+      events,
+      append: (type: string, data: Record<string, unknown>) => {
+        const event = { type, data }
+        events.push(event)
+        return event as unknown as SessionEvent
+      },
+    },
+  } as unknown as Agent
 }
 
 describe('dsh-llm-acp', () => {
@@ -153,6 +188,58 @@ describe('dsh-llm-acp', () => {
       const chunks = await collect(stream)
       expect(chunks.filter(c => c.type === 'reasoning-delta')).toHaveLength(0)
       expect(assembledText(chunks)).toBe('answer')
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('uses the workspace-write session preset and forwards the ACP permission request to approval', async () => {
+    const ctx = await setup(
+      { MOCK_PERMISSION: '1', MOCK_TEXT: 'approved' },
+      { permissionPreset: 'workspace-write' },
+    )
+    const received: Array<{ toolName: string; reason?: string }> = []
+    ctx.on('approval/request', (request) => {
+      received.push({
+        toolName: request.toolName,
+        ...request.reason === undefined ? {} : { reason: request.reason },
+      })
+      return Promise.resolve<ApprovalOutcome>('allowed-once')
+    })
+    try {
+      const chunks = await ctx.agents.withInitiator(fakeAgent(), () => collect(ctx.llm.stream({
+        provider: 'acp-test',
+        model: 'any',
+        messages: [createUserMessage({ content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } })],
+      })))
+      expect(assembledText(chunks)).toBe('approved')
+      expect(received).toEqual([{
+        toolName: 'ACP: mock side effect',
+        reason: 'Test ACP requested permission to run "mock side effect".',
+      }])
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('uses the danger-full-access session preset without opening an approval prompt', async () => {
+    const ctx = await setup(
+      { MOCK_PERMISSION: '1', MOCK_TEXT: 'full access' },
+      { permissionPreset: 'danger-full-access' },
+    )
+    let requested = false
+    ctx.on('approval/request', () => {
+      requested = true
+      return Promise.resolve<ApprovalOutcome>('rejected')
+    })
+    try {
+      const chunks = await ctx.agents.withInitiator(fakeAgent(), () => collect(ctx.llm.stream({
+        provider: 'acp-test',
+        model: 'any',
+        messages: [createUserMessage({ content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } })],
+      })))
+      expect(assembledText(chunks)).toBe('full access')
+      expect(requested).toBe(false)
     } finally {
       await ctx.fiber.dispose()
     }

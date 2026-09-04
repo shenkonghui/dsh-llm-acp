@@ -4,8 +4,6 @@
  */
 import type { StopReason } from '@agentclientprotocol/sdk';
 import type { FinishReason } from '@deepseek-ai/dsh-llm';
-/** How to auto-answer the child's `session/request_permission` prompts. */
-export type PermissionPolicy = 'allow' | 'reject';
 /**
  * Map an ACP {@link StopReason} to a harness {@link FinishReason}.
  *

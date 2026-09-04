@@ -4,7 +4,7 @@ import { useEffect, useMemo, useState } from 'react'
 import type {
   InjectFace, PropsLocale, PropsRuntime,
 } from '@deepseek-ai/dsh-client-ui-slots'
-import type { IApiClient, ModelProviderGroup } from '@deepseek-ai/dsh-api-remotes/client'
+import type { IApiClient } from '@deepseek-ai/dsh-api-remotes/client'
 import type { AcpSettingsLocaleKey } from './locales.ts'
 import css from './AcpSettingsSection.module.css'
 
@@ -109,18 +109,19 @@ interface EnvDraftRow {
   value: string
 }
 
-/** Load discovered models for one ACP provider route from the host catalog. */
+/** Load the full discovered model catalog for one ACP provider route.
+ * Uses `llm.discoverModels` (not `llm.models`) so the reply is the unfiltered
+ * set — `listModels` already applies the server's `enabledModels` selection,
+ * which would hide unselected models from the multi-select editor. */
 async function loadProviderModels(
   api: AcpSettingsSectionInjected['api'],
+  settingsNs: string,
   providerRoute: string,
 ): Promise<DiscoveredModel[]> {
   try {
-    const response = await api.llm.models({})
+    const response = await api.llm.discoverModels({ settingsNs, provider: providerRoute })
     if (!response.result.ok) return []
-    const groups: readonly ModelProviderGroup[] = response.result.value.groups
-    const group = groups.find(g => g.id === providerRoute)
-    if (group === undefined) return []
-    return group.models.map(m => ({ id: m.id, name: m.name }))
+    return response.result.value.models.map((m: { id: string; name?: string }) => ({ id: m.id, name: m.name ?? m.id }))
   } catch {
     return []
   }
@@ -164,7 +165,7 @@ export function AcpSettingsSection(props: AcpSettingsSectionProps) {
     try {
       const response = await api.settings.describe({})
       if (response.result.ok) {
-        const views = response.result.value.namespaces
+        const views = response.result.value.namespaces as Array<{ ns: string; value: unknown }>
         const ns = views.find(v => v.ns === settingsNs)
         if (ns !== undefined) {
           const data = ns.value as { servers?: Record<string, AcpServerEntry> }
@@ -237,7 +238,7 @@ export function AcpSettingsSection(props: AcpSettingsSectionProps) {
     }
     // Fetch discovered models for this provider route.
     setModelsLoading(prev => new Set(prev).add(id))
-    const models = await loadProviderModels(api, `acp-${id}`)
+    const models = await loadProviderModels(api, settingsNs, `acp-${id}`)
     setDiscoveredModels(prev => ({ ...prev, [id]: models }))
     setModelsLoading(prev => {
       const next = new Set(prev)
@@ -246,7 +247,7 @@ export function AcpSettingsSection(props: AcpSettingsSectionProps) {
     })
   }
 
-  /** Save env and models drafts for one server to settings. */
+  /** Save the editable drafts for one server to settings. */
   const saveServerConfig = async (id: string): Promise<void> => {
     setSavingId(id)
     setError(undefined)

@@ -13,6 +13,7 @@
 import { LlmAdapter } from '@deepseek-ai/dsh-llm';
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, StreamChunk } from '@deepseek-ai/dsh-llm';
 import { AcpConnection } from './connection.ts';
+import type { AcpPermissionRequester } from './connection.ts';
 /** Constructor options for {@link AcpAdapter}. */
 export interface AcpAdapterOptions {
     /** The long-lived ACP client connection; ready after `connection.ready` resolves. */
@@ -26,6 +27,14 @@ export interface AcpAdapterOptions {
         id: string;
         name: string;
     };
+    /**
+     * Model ids to expose from the discovered catalog. When omitted or empty,
+     * every discovered model is exposed. When non-empty, only the listed models
+     * (intersected with the discovered set) appear in `listModels`.
+     */
+    enabledModels?: readonly string[] | undefined;
+    /** Capture an interactive permission requester from the current agent turn. */
+    permissionRequester?: (() => AcpPermissionRequester | undefined) | undefined;
 }
 /**
  * The ACP-backed LLM adapter. One instance serves every model name under its

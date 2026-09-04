@@ -14,7 +14,6 @@
  */
 import { type ContentBlock as AcpContentBlock, type StopReason } from '@agentclientprotocol/sdk';
 import type { SubprocessHandle, SubprocessSpawnSpec } from '@deepseek-ai/dsh-subprocess';
-import type { PermissionPolicy } from './types.ts';
 /** EOF grace for child flush and nested-process teardown; wider than the signal grace. */
 export declare const DEFAULT_DISPOSE_EOF_GRACE_MS = 6000;
 /** Default POSIX grace between SIGTERM and SIGKILL on dispose. */
@@ -36,6 +35,15 @@ type QueuedUpdate = {
     kind: 'error';
     error: Error;
 };
+/** Decision returned by an interactive ACP permission requester. */
+export type AcpPermissionDecision = 'allow' | 'reject' | 'cancel';
+/** Permission details forwarded from an ACP server to an interactive requester. */
+export interface AcpPermissionRequest {
+    title: string;
+    signal: AbortSignal;
+}
+/** Interactive permission requester captured for one prompt session. */
+export type AcpPermissionRequester = (request: AcpPermissionRequest) => Promise<AcpPermissionDecision>;
 /**
  * Cooperative teardown ladder over the subprocess seam's public verbs: stdin
  * EOF (the child's window to flush and reap descendants), then the
@@ -53,8 +61,6 @@ export interface AcpConnectionSpec {
     args: string[];
     /** Absolute working directory for the child process and its ACP sessions. */
     cwd: string;
-    /** How to auto-answer the child's permission prompts. */
-    permission: PermissionPolicy;
     /** Extra environment variables merged on top of the scrubbed parent env. */
     env: Record<string, string>;
     /** Grace (ms) for the child's EOF-driven quiesce on dispose. */
@@ -65,6 +71,12 @@ export interface AcpConnectionSpec {
     spawn: (spec: SubprocessSpawnSpec) => SubprocessHandle;
     /** Sink for connection-level warnings (wired to `ctx.logger.warn`). */
     onWarn?: (message: string) => void;
+    /**
+     * Resolves the API key to pass to `authenticate` when the ACP server
+     * advertises auth methods. Returns `undefined` to skip authentication
+     * (the server will reject `session/new` if it requires auth).
+     */
+    resolveAuthApiKey?: () => Promise<string | undefined>;
 }
 /**
  * One long-lived ACP client connection backed by a single child server
@@ -83,6 +95,18 @@ export declare class AcpConnection {
     /** Resolves when the ACP server has completed `initialize`. */
     get ready(): Promise<void>;
     private initialize;
+    /**
+     * Call `authenticate` when the server advertises auth methods. Picks the
+     * first method and lets the server handle its own authentication flow
+     * (e.g. browser-based PKCE). When a credential resolver is configured and
+     * returns a key, it is passed as `_meta.api_key` for servers that accept
+     * direct key authentication; otherwise the server initiates its own flow.
+     */
+    private authenticateIfNeeded;
+    /** Resolve one ACP permission request through its owning session. */
+    private requestPermission;
+    /** Select an advertised rejection option, or cancel when none is available. */
+    private rejectPermission;
     /** Push an inbound session/update into the owning session's queue. */
     private enqueueUpdate;
     /**
@@ -139,8 +163,9 @@ export declare class AcpConnection {
      * @param sessionId - the remote session id from {@link AcpConnection.newSession}.
      * @param prompt - ACP content blocks forming the single user message.
      * @param signal - cancellation; abort triggers a best-effort ACP cancel.
+     * @param permissionRequester - interactive requester captured for this prompt.
      */
-    promptStream(sessionId: string, prompt: AcpContentBlock[], signal: AbortSignal): AsyncGenerator<QueuedUpdate>;
+    promptStream(sessionId: string, prompt: AcpContentBlock[], signal: AbortSignal, permissionRequester?: AcpPermissionRequester): AsyncGenerator<QueuedUpdate>;
     /**
      * Close one ACP session after a prompt completes. Best-effort: errors are
      * swallowed because the session may already be gone.

@@ -19,8 +19,11 @@ import {
   ndJsonStream,
   PROTOCOL_VERSION,
   type Agent as AcpAgent,
+  type AuthenticateRequest,
+  type AuthMethod,
   type Client,
   type ContentBlock as AcpContentBlock,
+  type InitializeResponse,
   type RequestPermissionRequest,
   type RequestPermissionResponse,
   type SessionConfigOption,
@@ -28,7 +31,6 @@ import {
   type StopReason,
 } from '@agentclientprotocol/sdk'
 import type { SubprocessHandle, SubprocessSpawnSpec } from '@deepseek-ai/dsh-subprocess'
-import type { PermissionPolicy } from './types.ts'
 
 /** EOF grace for child flush and nested-process teardown; wider than the signal grace. */
 export const DEFAULT_DISPOSE_EOF_GRACE_MS = 6_000
@@ -44,10 +46,24 @@ type QueuedUpdate =
   | { kind: 'done'; reason: StopReason }
   | { kind: 'error'; error: Error }
 
+/** Decision returned by an interactive ACP permission requester. */
+export type AcpPermissionDecision = 'allow' | 'reject' | 'cancel'
+
+/** Permission details forwarded from an ACP server to an interactive requester. */
+export interface AcpPermissionRequest {
+  title: string
+  signal: AbortSignal
+}
+
+/** Interactive permission requester captured for one prompt session. */
+export type AcpPermissionRequester = (request: AcpPermissionRequest) => Promise<AcpPermissionDecision>
+
 /** Per-session update queue, fed by the SDK push callback and drained by generators. */
 interface SessionQueue {
   queue: QueuedUpdate[]
   resolve: (() => void) | undefined
+  permissionRequester: AcpPermissionRequester | undefined
+  signal: AbortSignal
 }
 
 /** Bounded whole-tree exit wait: polls the handle's tree liveness until it exits or `ms` elapses. */
@@ -93,8 +109,6 @@ export interface AcpConnectionSpec {
   args: string[]
   /** Absolute working directory for the child process and its ACP sessions. */
   cwd: string
-  /** How to auto-answer the child's permission prompts. */
-  permission: PermissionPolicy
   /** Extra environment variables merged on top of the scrubbed parent env. */
   env: Record<string, string>
   /** Grace (ms) for the child's EOF-driven quiesce on dispose. */
@@ -105,6 +119,12 @@ export interface AcpConnectionSpec {
   spawn: (spec: SubprocessSpawnSpec) => SubprocessHandle
   /** Sink for connection-level warnings (wired to `ctx.logger.warn`). */
   onWarn?: (message: string) => void
+  /**
+   * Resolves the API key to pass to `authenticate` when the ACP server
+   * advertises auth methods. Returns `undefined` to skip authentication
+   * (the server will reject `session/new` if it requires auth).
+   */
+  resolveAuthApiKey?: () => Promise<string | undefined>
 }
 
 /**
@@ -139,13 +159,7 @@ export class AcpConnection {
         return Promise.resolve()
       },
       requestPermission: (params: RequestPermissionRequest): Promise<RequestPermissionResponse> => {
-        if (spec.permission === 'allow') {
-          const allow = params.options.find(o => o.kind === 'allow_once' || o.kind === 'allow_always')
-          if (allow !== undefined) {
-            return Promise.resolve({ outcome: { outcome: 'selected', optionId: allow.optionId } })
-          }
-        }
-        return Promise.resolve({ outcome: { outcome: 'cancelled' } })
+        return this.requestPermission(params)
       },
       extNotification: (method: string, params: Record<string, unknown>): Promise<void> => {
         this.handleExtNotification(method, params)
@@ -176,10 +190,66 @@ export class AcpConnection {
       (err: unknown) => Promise.reject(err instanceof Error ? err : new Error(String(err))),
     )
     spawnFailed.catch(() => { /* observed by the startup race */ })
-    await Promise.race([
+    const initResult: InitializeResponse = await Promise.race([
       this.conn.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} }),
       spawnFailed,
     ])
+    await this.authenticateIfNeeded(initResult)
+  }
+
+  /**
+   * Call `authenticate` when the server advertises auth methods. Picks the
+   * first method and lets the server handle its own authentication flow
+   * (e.g. browser-based PKCE). When a credential resolver is configured and
+   * returns a key, it is passed as `_meta.api_key` for servers that accept
+   * direct key authentication; otherwise the server initiates its own flow.
+   */
+  private async authenticateIfNeeded(initResult: InitializeResponse): Promise<void> {
+    const methods: AuthMethod[] | undefined = initResult.authMethods
+    if (methods === undefined || methods.length === 0) return
+    const method = methods[0]
+    if (method === undefined) return
+    const apiKey = this.spec.resolveAuthApiKey !== undefined
+      ? await this.spec.resolveAuthApiKey().catch(() => undefined)
+      : undefined
+    const params: AuthenticateRequest = {
+      methodId: method.id,
+      ...(apiKey !== undefined ? { _meta: { api_key: apiKey } } : {}),
+    }
+    await this.conn.authenticate(params)
+  }
+
+  /** Resolve one ACP permission request through its owning session. */
+  private async requestPermission(params: RequestPermissionRequest): Promise<RequestPermissionResponse> {
+    const entry = this.queues.get(params.sessionId)
+    if (entry?.permissionRequester === undefined) {
+      this.spec.onWarn?.('llm-acp: interactive permission request failed closed because no active harness approval requester was available')
+      return this.rejectPermission(params)
+    }
+    let decision: AcpPermissionDecision
+    try {
+      const title = typeof params.toolCall.title === 'string' && params.toolCall.title.length > 0
+        ? params.toolCall.title
+        : 'ACP operation'
+      decision = await entry.permissionRequester({ title, signal: entry.signal })
+    } catch (error: unknown) {
+      this.spec.onWarn?.(`llm-acp: permission request failed closed: ${error instanceof Error ? error.message : String(error)}`)
+      return this.rejectPermission(params)
+    }
+    if (decision === 'cancel') return { outcome: { outcome: 'cancelled' } }
+    if (decision === 'reject') return this.rejectPermission(params)
+    const option = params.options.find(item => item.kind === 'allow_once')
+    return option === undefined
+      ? this.rejectPermission(params)
+      : { outcome: { outcome: 'selected', optionId: option.optionId } }
+  }
+
+  /** Select an advertised rejection option, or cancel when none is available. */
+  private rejectPermission(params: RequestPermissionRequest): RequestPermissionResponse {
+    const option = params.options.find(item => item.kind === 'reject_once' || item.kind === 'reject_always')
+    return option === undefined
+      ? { outcome: { outcome: 'cancelled' } }
+      : { outcome: { outcome: 'selected', optionId: option.optionId } }
   }
 
   /** Push an inbound session/update into the owning session's queue. */
@@ -339,13 +409,15 @@ export class AcpConnection {
    * @param sessionId - the remote session id from {@link AcpConnection.newSession}.
    * @param prompt - ACP content blocks forming the single user message.
    * @param signal - cancellation; abort triggers a best-effort ACP cancel.
+   * @param permissionRequester - interactive requester captured for this prompt.
    */
   async *promptStream(
     sessionId: string,
     prompt: AcpContentBlock[],
     signal: AbortSignal,
+    permissionRequester?: AcpPermissionRequester,
   ): AsyncGenerator<QueuedUpdate> {
-    const entry: SessionQueue = { queue: [], resolve: undefined }
+    const entry: SessionQueue = { queue: [], resolve: undefined, permissionRequester, signal }
     this.queues.set(sessionId, entry)
     const onAbort = (): void => {
       void this.conn.cancel({ sessionId }).catch(() => { /* child gone */ })

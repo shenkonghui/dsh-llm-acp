@@ -16,6 +16,7 @@ import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, StreamChunk } from
 import type { ContentBlock as AcpContentBlock } from '@agentclientprotocol/sdk'
 import type { Message } from '@deepseek-ai/dsh-llm'
 import { AcpConnection } from './connection.ts'
+import type { AcpPermissionRequester } from './connection.ts'
 import { acpFinishReason } from './types.ts'
 
 /** Constructor options for {@link AcpAdapter}. */
@@ -34,6 +35,8 @@ export interface AcpAdapterOptions {
    * (intersected with the discovered set) appear in `listModels`.
    */
   enabledModels?: readonly string[] | undefined
+  /** Capture an interactive permission requester from the current agent turn. */
+  permissionRequester?: (() => AcpPermissionRequester | undefined) | undefined
 }
 
 /** Render the harness message history plus system prompt into one ACP text block. */
@@ -128,6 +131,7 @@ export class AcpAdapter extends LlmAdapter {
    * avoid resource leaks on the server side.
    */
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
+    const permissionRequester = this.config.permissionRequester?.()
     await this.config.connection.ready
     let sessionId: string
     try {
@@ -165,7 +169,7 @@ export class AcpAdapter extends LlmAdapter {
     }
 
     try {
-      for await (const update of this.config.connection.promptStream(sessionId, prompt, signal)) {
+      for await (const update of this.config.connection.promptStream(sessionId, prompt, signal, permissionRequester)) {
         switch (update.kind) {
           case 'text': {
             if (update.text.length === 0) break

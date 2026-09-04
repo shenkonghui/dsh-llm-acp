@@ -36,6 +36,8 @@ In the **My Servers** tab, click **Edit** on any configured server to:
 - Set **environment variables** for authentication (e.g. `DEEPSEEK_API_KEY`, `OPENAI_API_KEY`). Per-server env is merged on top of the plugin-level `env`.
 - Select which **models** to expose from the server's discovered catalog. Leave empty to expose all discovered models.
 
+ACP servers do not store separate permission policies. They use the existing session permission list: `read-only` and `workspace-write` forward sensitive operations to the harness approval UI, while `danger-full-access` allows them automatically.
+
 Alternatively, configure servers directly in `settings.yaml`:
 
 ```yaml
@@ -79,7 +81,6 @@ Binary entries use the executable basename so a PATH-installed binary is found d
 
 | Config | Default | Meaning |
 |---|---|---|
-| `permission` | `allow` | Auto-answer `session/request_permission`: `reject` declines every prompt, `allow` selects the first `allow_once`/`allow_always` option. |
 | `emitReasoning` | `true` | Whether `agent_thought_chunk` and extension progress notifications become `reasoning-delta` chunks. |
 | `defaultModelId` | `glm-5-2` | Fallback model id when ACP discovery returns no models. |
 | `defaultModelName` | `GLM-5.2 High` | Fallback model display name. |
@@ -96,7 +97,7 @@ Each `stream()` call:
 4. When `emitReasoning` is on, `agent_thought_chunk` updates become `reasoning-delta` chunks.
 5. The terminal `session/prompt` response `stopReason` becomes the `finish` chunk.
 
-Tool-call deltas are never emitted. The ACP server executes its own tools internally.
+Tool-call deltas are never emitted. The ACP server executes its own tools internally. `session/request_permission` follows the current session permission preset: `danger-full-access` allows automatically, while other presets use a one-shot harness approval request. Unavailable or failing approval and ACP requests without `allow_once` fail closed.
 
 ### Stop-reason mapping
 

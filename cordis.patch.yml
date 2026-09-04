@@ -8,7 +8,6 @@
     - id: llm-acp
       name: '@deepseek-ai/dsh-llm-acp'
       config:
-        permission: reject
         emitReasoning: false
         defaultModelId: glm-5-2
         defaultModelName: GLM-5.2 High

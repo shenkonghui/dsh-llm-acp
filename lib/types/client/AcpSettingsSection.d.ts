@@ -33,6 +33,8 @@ export interface AcpServerEntry {
     command: string;
     args: string[];
     name: string;
+    env?: Record<string, string>;
+    models?: string[];
 }
 /** Injected dependencies from the apply closure. */
 export interface AcpSettingsSectionInjected {
@@ -41,8 +43,8 @@ export interface AcpSettingsSectionInjected {
         version: string;
         agents: AcpRegistryAgent[];
     };
-    /** Wire face for settings reads/writes. */
-    api: Pick<IApiClient, 'settings'>;
+    /** Wire face for settings reads/writes and model catalog discovery. */
+    api: Pick<IApiClient, 'settings' | 'llm'>;
     /** Settings namespace for ACP servers. */
     settingsNs: string;
 }

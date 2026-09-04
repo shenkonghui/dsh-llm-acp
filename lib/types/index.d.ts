@@ -11,7 +11,6 @@
  */
 import type { Context } from '@deepseek-ai/cordis';
 import z from '@deepseek-ai/schemastery';
-import type { PermissionPolicy } from './types.ts';
 import registryData from './registry.json';
 export { AcpAdapter } from './adapter.ts';
 export type { AcpAdapterOptions } from './adapter.ts';
@@ -29,11 +28,21 @@ export interface AcpServerConfig {
     args: string[];
     /** Human-readable display name for the provider. */
     name: string;
+    /**
+     * Per-server environment variables merged on top of the plugin-level `env`.
+     * Use this for credentials the ACP server needs (e.g. `DEEPSEEK_API_KEY`,
+     * `OPENAI_API_KEY`). Per-server values override plugin-level ones.
+     */
+    env?: Record<string, string>;
+    /**
+     * Model ids to expose from this server's discovered catalog. When omitted or
+     * empty, every discovered model is exposed. When non-empty, only the listed
+     * models (intersected with the discovered set) appear in `listModels`.
+     */
+    models?: string[];
 }
 /** Plugin config: defaults applied to every spawned ACP server. */
 export interface Config {
-    /** How to auto-answer the child's `session/request_permission` prompts (default `reject`). */
-    permission?: PermissionPolicy;
     /** Extra environment variables merged on top of the scrubbed parent env. */
     env?: Record<string, string>;
     /** Whether to translate `agent_thought_chunk` into `reasoning-delta` chunks (default `false`). */
