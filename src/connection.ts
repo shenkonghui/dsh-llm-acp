@@ -19,6 +19,7 @@ import {
   ndJsonStream,
   PROTOCOL_VERSION,
   type Agent as AcpAgent,
+  type AgentCapabilities,
   type AuthenticateRequest,
   type AuthMethod,
   type Client,
@@ -26,7 +27,9 @@ import {
   type InitializeResponse,
   type RequestPermissionRequest,
   type RequestPermissionResponse,
+  type SessionCapabilities,
   type SessionConfigOption,
+  type SessionInfo,
   type SessionNotification,
   type StopReason,
 } from '@agentclientprotocol/sdk'
@@ -140,6 +143,10 @@ export class AcpConnection {
   private readonly readyPromise: Promise<void>
   private disposed = false
   private disposal: Promise<void> | undefined
+  /** Capabilities advertised by the agent in its `initialize` response. */
+  private agentCapabilities: AgentCapabilities | undefined
+  /** Session lifecycle capabilities advertised by the agent. */
+  private sessionCapabilities: SessionCapabilities | undefined
 
   constructor(spec: AcpConnectionSpec) {
     this.spec = spec
@@ -194,7 +201,24 @@ export class AcpConnection {
       this.conn.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} }),
       spawnFailed,
     ])
+    this.agentCapabilities = initResult.agentCapabilities
+    this.sessionCapabilities = initResult.agentCapabilities?.sessionCapabilities
     await this.authenticateIfNeeded(initResult)
+  }
+
+  /** Whether the agent advertises `session/load` (session reuse). */
+  get supportsLoadSession(): boolean {
+    return this.agentCapabilities?.loadSession === true
+  }
+
+  /** Whether the agent advertises `session/list` via sessionCapabilities. */
+  get supportsListSessions(): boolean {
+    return this.sessionCapabilities?.list != null && this.sessionCapabilities.list !== null
+  }
+
+  /** Whether the agent advertises `session/delete` via sessionCapabilities. */
+  get supportsDeleteSession(): boolean {
+    return this.sessionCapabilities?.delete != null && this.sessionCapabilities.delete !== null
   }
 
   /**
@@ -358,6 +382,52 @@ export class AcpConnection {
   }
 
   /**
+   * Load an existing ACP session by id (`session/load`). Only available when
+   * the agent advertises the `loadSession` capability. Returns the session's
+   * current config options (models, modes, etc.) if the server publishes them.
+   * @param sessionId - the remote session id to resume.
+   * @returns the config options published by the server, or `undefined`.
+   */
+  async loadSession(sessionId: string): Promise<SessionConfigOption[] | undefined> {
+    const session = await this.conn.loadSession({ sessionId, cwd: this.spec.cwd, mcpServers: [] })
+    const configOptions: Array<SessionConfigOption> | null | undefined = Reflect.get(session, 'configOptions')
+    return configOptions ?? undefined
+  }
+
+  /**
+   * List existing ACP sessions (`session/list`). Only available when the agent
+   * advertises the `session/list` capability. Returns `undefined` when the
+   * agent does not support listing.
+   * @param cursor - optional pagination cursor from a previous response.
+   * @returns the session list and optional next cursor, or `undefined`.
+   */
+  async listSessions(cursor?: string): Promise<{ sessions: SessionInfo[]; nextCursor?: string } | undefined> {
+    if (!this.supportsListSessions) return undefined
+    const result = await this.conn.listSessions({ cursor: cursor ?? null })
+    const nextCursor = result.nextCursor
+    return nextCursor !== null && nextCursor !== undefined
+      ? { sessions: result.sessions, nextCursor }
+      : { sessions: result.sessions }
+  }
+
+  /**
+   * Delete an ACP session (`session/delete`). Only available when the agent
+   * advertises the `session/delete` capability. Best-effort: errors are
+   * swallowed because the session may already be gone.
+   * @param sessionId - the remote session id to delete.
+   * @returns `true` if the session was deleted, `false` if unsupported or failed.
+   */
+  async deleteSession(sessionId: string): Promise<boolean> {
+    if (!this.supportsDeleteSession) return false
+    try {
+      await this.conn.deleteSession({ sessionId })
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  /**
    * Probe the ACP server for its model catalog by creating a throwaway session
    * and reading the `configOptions` (category `model`) from the `session/new`
    * response. The probe session is closed immediately. Returns `undefined` when
@@ -365,6 +435,19 @@ export class AcpConnection {
    * @returns the model entries, or `undefined` if none were advertised.
    */
   async discoverModels(): Promise<readonly { id: string; name: string }[] | undefined> {
+    const options = await this.discoverConfigOptions()
+    if (options === undefined) return undefined
+    return this.extractModels(options)
+  }
+
+  /**
+   * Probe the ACP server for its full config option catalog by creating a
+   * throwaway session and reading `configOptions` from the `session/new`
+   * response. The probe session is closed immediately. Returns `undefined`
+   * when the server publishes no config options.
+   * @returns all config options (models, modes, thought levels, etc.).
+   */
+  async discoverConfigOptions(): Promise<readonly SessionConfigOption[] | undefined> {
     await this.ready
     const session = await this.conn.newSession({ cwd: this.spec.cwd, mcpServers: [] })
     const configOptions: Array<SessionConfigOption> | null | undefined = Reflect.get(session, 'configOptions')
@@ -373,11 +456,16 @@ export class AcpConnection {
       void this.conn.closeSession({ sessionId }).catch(() => { /* probe session best-effort close */ })
     }
     if (configOptions === undefined || configOptions === null) return undefined
-    const modelOption = configOptions.find(opt => opt.category === 'model' && opt.type === 'select')
+    return configOptions
+  }
+
+  /** Extract model entries from a config option list (category `model`, type `select`). */
+  private extractModels(options: readonly SessionConfigOption[]): { id: string; name: string }[] | undefined {
+    const modelOption = options.find(opt => opt.category === 'model' && opt.type === 'select')
     if (modelOption === undefined || modelOption.type !== 'select') return undefined
-    const options = Array.isArray(modelOption.options) ? modelOption.options : []
+    const selectOptions = Array.isArray(modelOption.options) ? modelOption.options : []
     const models: { id: string; name: string }[] = []
-    for (const opt of options) {
+    for (const opt of selectOptions) {
       if ('value' in opt && typeof opt.value === 'string' && typeof opt.name === 'string') {
         models.push({ id: opt.value, name: opt.name })
       }

@@ -316,6 +316,16 @@
   padding: 4px;
 }
 
+.modelSearch {
+  width: 100%;
+  padding: 6px 10px;
+  border: 1px solid var(--dsw-border, #e0e0e0);
+  border-radius: 4px;
+  font-size: 13px;
+  box-sizing: border-box;
+  margin-bottom: 4px;
+}
+
 .modelRow {
   display: flex;
   align-items: center;

@@ -12,7 +12,7 @@
  *
  * @module @deepseek-ai/dsh-llm-acp/connection
  */
-import { type ContentBlock as AcpContentBlock, type StopReason } from '@agentclientprotocol/sdk';
+import { type ContentBlock as AcpContentBlock, type SessionConfigOption, type SessionInfo, type StopReason } from '@agentclientprotocol/sdk';
 import type { SubprocessHandle, SubprocessSpawnSpec } from '@deepseek-ai/dsh-subprocess';
 /** EOF grace for child flush and nested-process teardown; wider than the signal grace. */
 export declare const DEFAULT_DISPOSE_EOF_GRACE_MS = 6000;
@@ -91,10 +91,20 @@ export declare class AcpConnection {
     private readonly readyPromise;
     private disposed;
     private disposal;
+    /** Capabilities advertised by the agent in its `initialize` response. */
+    private agentCapabilities;
+    /** Session lifecycle capabilities advertised by the agent. */
+    private sessionCapabilities;
     constructor(spec: AcpConnectionSpec);
     /** Resolves when the ACP server has completed `initialize`. */
     get ready(): Promise<void>;
     private initialize;
+    /** Whether the agent advertises `session/load` (session reuse). */
+    get supportsLoadSession(): boolean;
+    /** Whether the agent advertises `session/list` via sessionCapabilities. */
+    get supportsListSessions(): boolean;
+    /** Whether the agent advertises `session/delete` via sessionCapabilities. */
+    get supportsDeleteSession(): boolean;
     /**
      * Call `authenticate` when the server advertises auth methods. Picks the
      * first method and lets the server handle its own authentication flow
@@ -132,6 +142,33 @@ export declare class AcpConnection {
      */
     newSession(): Promise<string>;
     /**
+     * Load an existing ACP session by id (`session/load`). Only available when
+     * the agent advertises the `loadSession` capability. Returns the session's
+     * current config options (models, modes, etc.) if the server publishes them.
+     * @param sessionId - the remote session id to resume.
+     * @returns the config options published by the server, or `undefined`.
+     */
+    loadSession(sessionId: string): Promise<SessionConfigOption[] | undefined>;
+    /**
+     * List existing ACP sessions (`session/list`). Only available when the agent
+     * advertises the `session/list` capability. Returns `undefined` when the
+     * agent does not support listing.
+     * @param cursor - optional pagination cursor from a previous response.
+     * @returns the session list and optional next cursor, or `undefined`.
+     */
+    listSessions(cursor?: string): Promise<{
+        sessions: SessionInfo[];
+        nextCursor?: string;
+    } | undefined>;
+    /**
+     * Delete an ACP session (`session/delete`). Only available when the agent
+     * advertises the `session/delete` capability. Best-effort: errors are
+     * swallowed because the session may already be gone.
+     * @param sessionId - the remote session id to delete.
+     * @returns `true` if the session was deleted, `false` if unsupported or failed.
+     */
+    deleteSession(sessionId: string): Promise<boolean>;
+    /**
      * Probe the ACP server for its model catalog by creating a throwaway session
      * and reading the `configOptions` (category `model`) from the `session/new`
      * response. The probe session is closed immediately. Returns `undefined` when
@@ -142,6 +179,16 @@ export declare class AcpConnection {
         id: string;
         name: string;
     }[] | undefined>;
+    /**
+     * Probe the ACP server for its full config option catalog by creating a
+     * throwaway session and reading `configOptions` from the `session/new`
+     * response. The probe session is closed immediately. Returns `undefined`
+     * when the server publishes no config options.
+     * @returns all config options (models, modes, thought levels, etc.).
+     */
+    discoverConfigOptions(): Promise<readonly SessionConfigOption[] | undefined>;
+    /** Extract model entries from a config option list (category `model`, type `select`). */
+    private extractModels;
     /**
      * Set the model for one ACP session via `session/set_config_option`. Best-effort:
      * if the server rejects the config id or value, the error surfaces from the

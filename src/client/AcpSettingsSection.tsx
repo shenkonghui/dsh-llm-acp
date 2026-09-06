@@ -1,10 +1,9 @@
 /** ACP Servers settings section: registry browser and configured-server list. */
 
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type {
   InjectFace, PropsLocale, PropsRuntime,
 } from '@deepseek-ai/dsh-client-ui-slots'
-import type { IApiClient } from '@deepseek-ai/dsh-api-remotes/client'
 import type { AcpSettingsLocaleKey } from './locales.ts'
 import css from './AcpSettingsSection.module.css'
 
@@ -34,12 +33,45 @@ export interface AcpServerEntry {
   models?: string[]
 }
 
+/** Wire view of one registered settings namespace (the fields this section reads). */
+interface AcpNamespaceView {
+  ns: string
+  value: unknown
+  revision: number
+}
+
+/** One path-addressed settings edit (the wire op this section sends). */
+export type AcpSettingsPathOp =
+  | { op: 'set'; path: string[]; value: unknown }
+  | { op: 'unset'; path: string[] }
+
+/** Wire result of one Remote call: the ok branch carries the value, the failure branch the message. */
+interface AcpRemoteResult<T> {
+  readonly ok: boolean
+  readonly value?: T
+  readonly error?: { readonly message: string }
+}
+
+/**
+ * The narrow Remote face this section calls, adapted from `ctx.remote` by the
+ * apply closure so the component stays free of transport types.
+ */
+export interface AcpSettingsSectionApi {
+  describeSettings(): Promise<AcpRemoteResult<{ namespaces: readonly AcpNamespaceView[] }>>
+  mutateSettings(
+    ns: string,
+    ops: readonly AcpSettingsPathOp[],
+    expectedRevision: number | undefined,
+  ): Promise<AcpRemoteResult<unknown>>
+  discoverModels(settingsNs: string, provider: string): Promise<AcpRemoteResult<readonly DiscoveredModel[]>>
+}
+
 /** Injected dependencies from the apply closure. */
 export interface AcpSettingsSectionInjected {
   /** The ACP registry data (bundled at build time). */
   registry: { version: string; agents: AcpRegistryAgent[] }
   /** Wire face for settings reads/writes and model catalog discovery. */
-  api: Pick<IApiClient, 'settings' | 'llm'>
+  api: AcpSettingsSectionApi
   /** Settings namespace for ACP servers. */
   settingsNs: string
 }
@@ -110,18 +142,18 @@ interface EnvDraftRow {
 }
 
 /** Load the full discovered model catalog for one ACP provider route.
- * Uses `llm.discoverModels` (not `llm.models`) so the reply is the unfiltered
- * set — `listModels` already applies the server's `enabledModels` selection,
- * which would hide unselected models from the multi-select editor. */
+ * Uses model discovery (not the filtered catalog) so the reply is the
+ * unfiltered set — `listModels` already applies the server's `enabledModels`
+ * selection, which would hide unselected models from the multi-select editor. */
 async function loadProviderModels(
   api: AcpSettingsSectionInjected['api'],
   settingsNs: string,
   providerRoute: string,
 ): Promise<DiscoveredModel[]> {
   try {
-    const response = await api.llm.discoverModels({ settingsNs, provider: providerRoute })
-    if (!response.result.ok) return []
-    return response.result.value.models.map((m: { id: string; name?: string }) => ({ id: m.id, name: m.name ?? m.id }))
+    const response = await api.discoverModels(settingsNs, providerRoute)
+    if (!response.ok) return []
+    return (response.value ?? []).map(m => ({ id: m.id, name: m.name ?? m.id }))
   } catch {
     return []
   }
@@ -158,16 +190,21 @@ export function AcpSettingsSection(props: AcpSettingsSectionProps) {
   const [modelDrafts, setModelDrafts] = useState<Record<string, string[]>>({})
   const [discoveredModels, setDiscoveredModels] = useState<Record<string, DiscoveredModel[]>>({})
   const [modelsLoading, setModelsLoading] = useState<Set<string>>(new Set())
+  const [modelSearch, setModelSearch] = useState<Record<string, string>>({})
   const [savingId, setSavingId] = useState<string | undefined>()
+
+  /** Revision of the `llm-acp` namespace at the last read; sent back on writes
+   * so a stale editor is refused instead of silently overwriting. */
+  const revisionRef = useRef<number | undefined>(undefined)
 
   /** Load current servers from settings. */
   const loadServers = async (): Promise<void> => {
     try {
-      const response = await api.settings.describe({})
-      if (response.result.ok) {
-        const views = response.result.value.namespaces as Array<{ ns: string; value: unknown }>
-        const ns = views.find(v => v.ns === settingsNs)
+      const response = await api.describeSettings()
+      if (response.ok) {
+        const ns = response.value?.namespaces.find(v => v.ns === settingsNs)
         if (ns !== undefined) {
+          revisionRef.current = ns.revision
           const data = ns.value as { servers?: Record<string, AcpServerEntry> }
           setServers(data?.servers ?? {})
         }
@@ -189,12 +226,13 @@ export function AcpSettingsSection(props: AcpSettingsSectionProps) {
     setError(undefined)
     try {
       const serverEntry = { command: cmd.command, args: cmd.args, name: agent.name, env: {}, models: [] }
-      const response = await api.settings.mutate({
-        ns: settingsNs,
-        ops: [{ op: 'set', path: ['servers', agent.id], value: serverEntry }],
-      })
-      if (!response.result.ok) {
-        setError(response.result.error.message)
+      const response = await api.mutateSettings(
+        settingsNs,
+        [{ op: 'set', path: ['servers', agent.id], value: serverEntry }],
+        revisionRef.current,
+      )
+      if (!response.ok) {
+        setError(response.error?.message ?? 'unknown error')
       } else {
         await loadServers()
       }
@@ -209,12 +247,13 @@ export function AcpSettingsSection(props: AcpSettingsSectionProps) {
     setRemovingId(id)
     setError(undefined)
     try {
-      const response = await api.settings.mutate({
-        ns: settingsNs,
-        ops: [{ op: 'unset', path: ['servers', id] }],
-      })
-      if (!response.result.ok) {
-        setError(response.result.error.message)
+      const response = await api.mutateSettings(
+        settingsNs,
+        [{ op: 'unset', path: ['servers', id] }],
+        revisionRef.current,
+      )
+      if (!response.ok) {
+        setError(response.error?.message ?? 'unknown error')
       } else {
         await loadServers()
       }
@@ -254,15 +293,16 @@ export function AcpSettingsSection(props: AcpSettingsSectionProps) {
     try {
       const env = draftsToEnv(envDrafts[id] ?? [])
       const models = modelDrafts[id] ?? []
-      const response = await api.settings.mutate({
-        ns: settingsNs,
-        ops: [
+      const response = await api.mutateSettings(
+        settingsNs,
+        [
           { op: 'set', path: ['servers', id, 'env'], value: env },
           { op: 'set', path: ['servers', id, 'models'], value: models },
         ],
-      })
-      if (!response.result.ok) {
-        setError(response.result.error.message)
+        revisionRef.current,
+      )
+      if (!response.ok) {
+        setError(response.error?.message ?? 'unknown error')
       } else {
         await loadServers()
       }
@@ -499,22 +539,42 @@ export function AcpSettingsSection(props: AcpSettingsSectionProps) {
                           ) : models.length === 0 ? (
                             <p className={css.emptyInline}>{t('noModels')}</p>
                           ) : (
-                            <div className={css.modelList}>
-                              {models.map(model => {
-                                const checked = selectedModels.includes(model.id)
-                                return (
-                                  <label key={model.id} className={css.modelRow}>
-                                    <input
-                                      type="checkbox"
-                                      checked={checked}
-                                      onChange={() => { toggleModel(id, model.id) }}
-                                    />
-                                    <span className={css.modelName}>{model.name}</span>
-                                    <span className={css.modelId}>{model.id}</span>
-                                  </label>
-                                )
-                              })}
-                            </div>
+                            <>
+                              <input
+                                type="search"
+                                className={css.modelSearch}
+                                placeholder={t('modelSearch')}
+                                value={modelSearch[id] ?? ''}
+                                onChange={e => { setModelSearch(prev => ({ ...prev, [id]: e.target.value })) }}
+                              />
+                              <div className={css.modelList}>
+                                {models
+                                  .filter(model => {
+                                    const q = (modelSearch[id] ?? '').trim().toLowerCase()
+                                    if (q === '') return true
+                                    return model.name.toLowerCase().includes(q) || model.id.toLowerCase().includes(q)
+                                  })
+                                  .sort((a, b) => {
+                                    const aSelected = selectedModels.includes(a.id) ? 0 : 1
+                                    const bSelected = selectedModels.includes(b.id) ? 0 : 1
+                                    return aSelected - bSelected
+                                  })
+                                  .map(model => {
+                                    const checked = selectedModels.includes(model.id)
+                                    return (
+                                      <label key={model.id} className={css.modelRow}>
+                                        <input
+                                          type="checkbox"
+                                          checked={checked}
+                                          onChange={() => { toggleModel(id, model.id) }}
+                                        />
+                                        <span className={css.modelName}>{model.name}</span>
+                                        <span className={css.modelId}>{model.id}</span>
+                                      </label>
+                                    )
+                                  })}
+                              </div>
+                            </>
                           )}
                           {models.length > 0 && (
                             <div className={css.modelActions}>

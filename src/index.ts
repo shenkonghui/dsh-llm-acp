@@ -18,7 +18,8 @@ import type {} from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-user-approval'
 import { MAX_TIMER_DELAY_MS } from '@deepseek-ai/dsh-timeout'
 import type {} from '@deepseek-ai/dsh-settings'
-import type { AdapterRegistrationHandle, DirectoryRegistrationHandle, LlmConfigurableProvider } from '@deepseek-ai/dsh-llm'
+import type { AdapterRegistrationHandle, DirectoryRegistrationHandle, LlmConfigurableProvider, LlmDiscoveredModel, LlmModelDiscoveryRequest } from '@deepseek-ai/dsh-llm'
+import type { Session } from '@deepseek-ai/dsh-session'
 import { AcpAdapter } from './adapter.ts'
 import {
   AcpConnection,
@@ -169,13 +170,14 @@ type ResolvedConfig = Required<Omit<Config, 'cwd' | 'servers'>> & Pick<Config, '
 /** Session permission fields used to route ACP permission requests. */
 interface PermissionPresetReader {
   readonly names: readonly string[]
-  current(events: readonly unknown[]): string
+  current(session: Session): string
   resolve(name: string): { sandbox: string; approval: string }
 }
 
 /** One active ACP server: connection, adapter registration, and provider route. */
 interface ActiveServer {
   connection: AcpConnection
+  adapter: AcpAdapter
   registration: AdapterRegistrationHandle
   /** JSON fingerprint of the config this server was created from, for change detection. */
   fingerprint: string
@@ -259,15 +261,28 @@ export function apply(ctx: Context, config: Config): void {
 
   /** Create one ACP connection + adapter for a server. */
   function createServer(serverId: string, server: AcpServerConfig): ActiveServer {
+    const serverEnv = { ...resolved.env, ...(server.env ?? {}) }
     const connection = new AcpConnection({
       command: server.command,
       args: server.args,
       cwd,
-      env: { ...resolved.env, ...(server.env ?? {}) },
+      env: serverEnv,
       disposeEofGraceMs: resolved.disposeEofGraceMs,
       disposeGraceMs: resolved.disposeGraceMs,
       spawn: spec => ctx.subprocess.spawn(spec),
       onWarn: message => ctx.logger.warn(message),
+      // Resolve an API key from the server's env to avoid triggering a
+      // browser-based PKCE flow on every connection. ACP servers that accept
+      // direct key auth (e.g. via _meta.api_key) use it silently; servers
+      // that require interactive auth fall back to their own flow.
+      resolveAuthApiKey: async () => {
+        // Common credential env var names ACP servers accept.
+        for (const key of ['DEEPSEEK_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'API_KEY']) {
+          const value = serverEnv[key]
+          if (typeof value === 'string' && value.length > 0) return value
+        }
+        return undefined
+      },
     })
     const adapter = new AcpAdapter({
       connection,
@@ -281,7 +296,12 @@ export function apply(ctx: Context, config: Config): void {
         if (agent === undefined) return undefined
         const permissionPresets = ctx.get('permissionPresets' as never) as PermissionPresetReader | undefined
         if (permissionPresets !== undefined) {
-          const current = permissionPresets.current(agent.session.events)
+          // permissionPresets.current(session) reads the session projection
+          // internally via sessionProjections.stateOf(session, ...), which
+          // calls session.snapshotEvents() itself. Pass the session object,
+          // not a pre-snapshotted events array.
+          const sessionLike = agent.session as Session
+          const current = permissionPresets.current(sessionLike)
           if (permissionPresets.names.includes(current)) {
             const preset = permissionPresets.resolve(current)
             if (preset.sandbox === 'danger-full-access' && preset.approval === 'never') {
@@ -305,7 +325,7 @@ export function apply(ctx: Context, config: Config): void {
       },
     })
     const registration = ctx.llm.registerAdapter([routeName(serverId)], adapter)
-    return { connection, registration, fingerprint: serverFingerprint(server) }
+    return { connection, adapter, registration, fingerprint: serverFingerprint(server) }
   }
 
   /** Reconcile active connections with the current server set. */
@@ -316,6 +336,7 @@ export function apply(ctx: Context, config: Config): void {
     // Remove servers that are no longer configured.
     for (const [id, server] of active) {
       if (!desiredIds.has(id)) {
+        server.adapter.disposeSessions()
         server.registration()
         void server.connection.dispose().catch((error: unknown) => {
           ctx.logger.warn(`llm-acp: connection disposal for "${id}" failed: ${error instanceof Error ? error.message : String(error)}`)
@@ -337,6 +358,7 @@ export function apply(ctx: Context, config: Config): void {
         // Config changed (env, models, command, …): tear down and rebuild so
         // the adapter picks up the new enabledModels and the connection gets
         // the new env. A stale adapter would keep advertising old models.
+        existing.adapter.disposeSessions()
         existing.registration()
         void existing.connection.dispose().catch((error: unknown) => {
           ctx.logger.warn(`llm-acp: connection disposal for "${id}" failed: ${error instanceof Error ? error.message : String(error)}`)
@@ -368,6 +390,33 @@ export function apply(ctx: Context, config: Config): void {
   // Initial registration from config servers.
   reconcileServers()
   reconcileDirectory()
+
+  // Register model discovery so the settings UI can query each ACP server's
+  // model catalog via `remote.llm.discoverModels(settingsNs, { provider })`.
+  // The provider route (`acp-<id>`) maps to the active connection; we call its
+  // `discoverModels()` which creates a throwaway ACP session and reads the
+  // `configOptions` (category `model`) from the `session/new` response.
+  // A bounded timeout prevents the UI from hanging when the ACP server needs
+  // interactive auth (e.g. browser PKCE) before it can create sessions.
+  ctx.effect(() => ctx.llm.registerModelDiscovery(NS, async (request: LlmModelDiscoveryRequest, _signal?: AbortSignal) => {
+    const provider = request.provider ?? ''
+    if (provider.length === 0) return []
+    if (!provider.startsWith('acp-')) return []
+    const serverId = provider.slice(4)
+    const server = active.get(serverId)
+    if (server === undefined) return []
+    try {
+      const discovered = await Promise.race([
+        server.connection.discoverModels(),
+        new Promise<undefined>(resolve => setTimeout(() => resolve(undefined), 10_000)),
+      ])
+      if (discovered === undefined) return []
+      const models: LlmDiscoveredModel[] = discovered.map(m => ({ id: m.id, name: m.name }))
+      return models
+    } catch {
+      return []
+    }
+  }), 'llm-acp.modelDiscovery()')
 
   // Install the settings section for dynamic server management.
   // `installSection` is on SettingsProvider in dsh-settings ≥0.1.2-rc.1; the
@@ -407,6 +456,7 @@ export function apply(ctx: Context, config: Config): void {
       if (disposed) return
       disposed = true
       for (const [, server] of active) {
+        server.adapter.disposeSessions()
         server.registration()
         void server.connection.dispose().catch(() => {})
       }

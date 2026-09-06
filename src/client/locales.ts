@@ -14,7 +14,7 @@ export type AcpSettingsLocaleKey =
   | 'envVars' | 'envVarsHint' | 'envKey' | 'envValue'
   | 'addEnvVar' | 'noEnvVars'
   | 'modelSelect' | 'modelSelectHint' | 'noModels' | 'modelsLoading'
-  | 'selectAll' | 'selectNone'
+  | 'modelSearch' | 'selectAll' | 'selectNone'
 
 /** English copy. */
 export const en: Record<AcpSettingsLocaleKey, string> = {
@@ -57,6 +57,7 @@ export const en: Record<AcpSettingsLocaleKey, string> = {
   modelSelectHint: 'Select which models to expose from this server. Leave empty to expose all discovered models.',
   noModels: 'No models discovered yet. The server may still be starting.',
   modelsLoading: 'Loading models…',
+  modelSearch: 'Filter models…',
   selectAll: 'Select all',
   selectNone: 'Select none',
 }
@@ -102,6 +103,7 @@ export const zh: Record<AcpSettingsLocaleKey, string> = {
   modelSelectHint: '选择要启用的模型，不选则启用全部已发现的模型。',
   noModels: '尚未发现模型，服务可能仍在启动中。',
   modelsLoading: '模型加载中…',
+  modelSearch: '筛选模型…',
   selectAll: '全选',
   selectNone: '全不选',
 }

@@ -1,17 +1,19 @@
 /**
  * `AcpAdapter`: an {@link LlmAdapter} that delegates each model call to a
- * long-lived external ACP server. One `stream()` call creates a fresh ACP
- * session, sends the full conversation as a single user message, and translates
- * the streamed `agent_message_chunk` / `agent_thought_chunk` updates into
+ * long-lived external ACP server. When the agent advertises `session/load`,
+ * subsequent turns within the same dsh session reuse the ACP session and send
+ * only the new user message — avoiding full-history resend. Without
+ * `loadSession`, each `stream()` call creates a fresh ACP session, sends the
+ * full conversation as a single user message, and closes it after.
+ *
+ * `agent_message_chunk` / `agent_thought_chunk` updates are translated into
  * harness `StreamChunk`s. Tool-call deltas are never emitted: the ACP server
- * executes its own tools internally and does not expose tool-call argument
- * deltas to the client, so the harness agent loop sees a single tool-less
- * assistant step per turn.
+ * executes its own tools internally.
  *
  * @module @deepseek-ai/dsh-llm-acp/adapter
  */
 import { LlmAdapter } from '@deepseek-ai/dsh-llm';
-import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, StreamChunk } from '@deepseek-ai/dsh-llm';
+import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, PreparedAdapterCall, StreamChunk } from '@deepseek-ai/dsh-llm';
 import { AcpConnection } from './connection.ts';
 import type { AcpPermissionRequester } from './connection.ts';
 /** Constructor options for {@link AcpAdapter}. */
@@ -49,6 +51,8 @@ export declare class AcpAdapter extends LlmAdapter {
     private models;
     /** Resolves when the model discovery probe finishes (success or fallback). */
     private readonly modelsReady;
+    /** Reused ACP sessions keyed by dsh session id (only when `loadSession` is supported). */
+    private readonly sessionMap;
     constructor(config: AcpAdapterOptions);
     /** Probe the ACP server for its model catalog and cache the result. */
     private discoverModels;
@@ -59,15 +63,22 @@ export declare class AcpAdapter extends LlmAdapter {
      * no model config option.
      */
     listModels(provider: string): Promise<readonly LlmModelInfo[]>;
+    resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo>;
+    prepareCall(provider: string, model: string, _signal?: AbortSignal): Promise<PreparedAdapterCall>;
     /**
-     * Stream one model call by opening a fresh ACP session and sending the full
-     * conversation as one user message. Yields `text-delta` (and optionally
-     * `reasoning-delta`) chunks as the ACP server streams assistant output, then
-     * a terminal `finish` chunk. Tool-call deltas are never emitted.
+     * Stream one model call. When the ACP agent supports `session/load` and the
+     * request carries a dsh `sessionId`, the ACP session is reused across turns:
+     * only new user messages are sent, avoiding full-history resend. Without
+     * `loadSession` or for one-shot calls, a fresh ACP session is created with
+     * the full conversation and closed after the prompt.
      *
-     * After the stream completes, the ACP session is closed best-effort to
-     * avoid resource leaks on the server side.
+     * Yields `text-delta` (and optionally `reasoning-delta`) chunks as the ACP
+     * server streams assistant output, then a terminal `finish` chunk.
      */
     stream(options: GenerateOptions): AsyncIterable<StreamChunk>;
+    /** Create a fresh ACP session, throwing `LlmError` on failure. */
+    private createSession;
+    /** Close all reused ACP sessions. Called when the adapter's connection is disposed. */
+    disposeSessions(): void;
 }
 //# sourceMappingURL=adapter.d.ts.map
