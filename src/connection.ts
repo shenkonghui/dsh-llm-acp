@@ -20,10 +20,10 @@ import {
   PROTOCOL_VERSION,
   type Agent as AcpAgent,
   type AgentCapabilities,
-  type AuthenticateRequest,
   type AuthMethod,
   type Client,
   type ContentBlock as AcpContentBlock,
+  type Implementation,
   type InitializeResponse,
   type RequestPermissionRequest,
   type RequestPermissionResponse,
@@ -37,6 +37,17 @@ import type { SubprocessHandle, SubprocessSpawnSpec } from '@deepseek-ai/dsh-sub
 
 /** EOF grace for child flush and nested-process teardown; wider than the signal grace. */
 export const DEFAULT_DISPOSE_EOF_GRACE_MS = 6_000
+
+/**
+ * How long to wait for a key-less `authenticate` round before continuing
+ * without it. Servers with cached credentials (e.g. codebuddy) resolve in
+ * well under a second; an interactive browser flow keeps running
+ * server-side and settles later, after the user completes the login.
+ */
+const KEYLESS_AUTH_TIMEOUT_MS = 15_000
+
+/** Resolve after `ms` milliseconds. */
+const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms))
 
 /** Default POSIX grace between SIGTERM and SIGKILL on dispose. */
 export const DEFAULT_DISPOSE_GRACE_MS = 3_000
@@ -147,6 +158,16 @@ export class AcpConnection {
   private agentCapabilities: AgentCapabilities | undefined
   /** Session lifecycle capabilities advertised by the agent. */
   private sessionCapabilities: SessionCapabilities | undefined
+  /** Agent name/version published in the `initialize` response (`agentInfo`). */
+  private agentInfo: Implementation | undefined
+  /** Negotiated ACP protocol version from the `initialize` response. */
+  private protocolVersion: number | undefined
+  /**
+   * Browser login URL published via the `_codebuddy.ai/authUrl` extension
+   * notification while an interactive `authenticate` round is in flight.
+   * Captured so a key-less auth timeout can tell the user where to log in.
+   */
+  private pendingAuthUrl: string | undefined
 
   constructor(spec: AcpConnectionSpec) {
     this.spec = spec
@@ -197,13 +218,28 @@ export class AcpConnection {
       (err: unknown) => Promise.reject(err instanceof Error ? err : new Error(String(err))),
     )
     spawnFailed.catch(() => { /* observed by the startup race */ })
-    const initResult: InitializeResponse = await Promise.race([
-      this.conn.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} }),
-      spawnFailed,
-    ])
+    let initResult: InitializeResponse
+    try {
+      initResult = await Promise.race([
+        this.conn.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} }),
+        spawnFailed,
+      ])
+    } catch (error: unknown) {
+      throw new Error(
+        `ACP server "${this.spec.command}" failed to initialize: ${error instanceof Error ? error.message : String(error)}`,
+      )
+    }
     this.agentCapabilities = initResult.agentCapabilities
     this.sessionCapabilities = initResult.agentCapabilities?.sessionCapabilities
-    await this.authenticateIfNeeded(initResult)
+    this.agentInfo = initResult.agentInfo ?? undefined
+    this.protocolVersion = initResult.protocolVersion
+    try {
+      await this.authenticateIfNeeded(initResult)
+    } catch (error: unknown) {
+      throw new Error(
+        `ACP server "${this.spec.command}" failed to authenticate: ${error instanceof Error ? error.message : String(error)}`,
+      )
+    }
   }
 
   /** Whether the agent advertises `session/load` (session reuse). */
@@ -222,11 +258,31 @@ export class AcpConnection {
   }
 
   /**
-   * Call `authenticate` when the server advertises auth methods. Picks the
-   * first method and lets the server handle its own authentication flow
-   * (e.g. browser-based PKCE). When a credential resolver is configured and
-   * returns a key, it is passed as `_meta.api_key` for servers that accept
-   * direct key authentication; otherwise the server initiates its own flow.
+   * Server identity published in the `initialize` response: the agent's
+   * reported name/version and the negotiated ACP protocol version. Returns
+   * `undefined` before {@link ready} settles or when the agent omits
+   * `agentInfo`; callers that need a populated answer should `await ready`
+   * first.
+   * @returns the agent name/version and protocol version, or `undefined`.
+   */
+  getServerInfo(): { agentName: string; agentVersion: string; protocolVersion: number } | undefined {
+    const info = this.agentInfo
+    if (info === undefined) return undefined
+    const protocolVersion = this.protocolVersion
+    if (protocolVersion === undefined) return undefined
+    return { agentName: info.name, agentVersion: info.version, protocolVersion }
+  }
+
+  /**
+   * Call `authenticate` when the server advertises auth methods. A resolved
+   * API key is passed as `_meta.api_key` for servers that accept direct key
+   * authentication. Without a key, `authenticate` is still attempted once
+   * with the first advertised method: servers with cached credentials
+   * (e.g. codebuddy) resolve that call immediately — and only then accept
+   * `session/new`. The key-less attempt is bounded and best-effort: on
+   * timeout or error the connection still comes up, and a browser login
+   * URL published via the `_codebuddy.ai/authUrl` extension notification is
+   * surfaced in the warning so the user can complete an interactive login.
    */
   private async authenticateIfNeeded(initResult: InitializeResponse): Promise<void> {
     const methods: AuthMethod[] | undefined = initResult.authMethods
@@ -236,11 +292,31 @@ export class AcpConnection {
     const apiKey = this.spec.resolveAuthApiKey !== undefined
       ? await this.spec.resolveAuthApiKey().catch(() => undefined)
       : undefined
-    const params: AuthenticateRequest = {
-      methodId: method.id,
-      ...(apiKey !== undefined ? { _meta: { api_key: apiKey } } : {}),
+    if (apiKey !== undefined) {
+      await this.conn.authenticate({ methodId: method.id, _meta: { api_key: apiKey } })
+      return
     }
-    await this.conn.authenticate(params)
+    this.pendingAuthUrl = undefined
+    const attempt = this.conn.authenticate({ methodId: method.id })
+    const settled = await Promise.race([
+      attempt.then(
+        () => ({ done: true as const, error: undefined }),
+        (error: unknown) => ({ done: true as const, error }),
+      ),
+      sleep(KEYLESS_AUTH_TIMEOUT_MS).then(() => ({ done: false as const, error: undefined })),
+    ])
+    if (settled.done) {
+      if (settled.error !== undefined) {
+        const message = settled.error instanceof Error ? settled.error.message : String(settled.error)
+        this.spec.onWarn?.(`llm-acp: key-less authentication for "${this.spec.command}" failed: ${message}`)
+      }
+      return
+    }
+    const url = this.pendingAuthUrl
+    this.spec.onWarn?.(
+      `llm-acp: interactive authentication for "${this.spec.command}" is still pending after ${KEYLESS_AUTH_TIMEOUT_MS}ms`
+      + (url !== undefined ? ` — complete the login in a browser: ${url}` : ''),
+    )
   }
 
   /** Resolve one ACP permission request through its owning session. */
@@ -332,6 +408,14 @@ export class AcpConnection {
     if (method === '_cognition.ai/mcp/serversChanged') return
     // `_cognition.ai/connection_retry` indicates a backend retry.
     if (method === '_cognition.ai/connection_retry') return
+    // `_codebuddy.ai/authUrl` publishes the browser login URL for an
+    // in-flight `authenticate` round (codebuddy). Captured so a key-less
+    // interactive auth can surface it to the user instead of hanging silently.
+    if (method === '_codebuddy.ai/authUrl') {
+      const authUrl = typeof params.authUrl === 'string' ? params.authUrl : ''
+      if (authUrl.length > 0) this.pendingAuthUrl = authUrl
+      return
+    }
     // Unknown extension notifications are silently consumed.
   }
 
@@ -459,7 +543,10 @@ export class AcpConnection {
     return configOptions
   }
 
-  /** Extract model entries from a config option list (category `model`, type `select`). */
+  /** Extract model entries from a config option list (category `model`, type `select`).
+   * Handles both flat option lists and grouped option lists per the ACP
+   * `SessionConfigSelectOptions` union: a group entry carries its own
+   * `options` array of leaf values, so flatten one level before collecting. */
   private extractModels(options: readonly SessionConfigOption[]): { id: string; name: string }[] | undefined {
     const modelOption = options.find(opt => opt.category === 'model' && opt.type === 'select')
     if (modelOption === undefined || modelOption.type !== 'select') return undefined
@@ -468,6 +555,12 @@ export class AcpConnection {
     for (const opt of selectOptions) {
       if ('value' in opt && typeof opt.value === 'string' && typeof opt.name === 'string') {
         models.push({ id: opt.value, name: opt.name })
+      } else if ('group' in opt && Array.isArray(opt.options)) {
+        for (const leaf of opt.options) {
+          if ('value' in leaf && typeof leaf.value === 'string' && typeof leaf.name === 'string') {
+            models.push({ id: leaf.value, name: leaf.name })
+          }
+        }
       }
     }
     return models.length > 0 ? models : undefined

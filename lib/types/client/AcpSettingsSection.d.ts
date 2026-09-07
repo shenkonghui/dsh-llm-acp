@@ -87,6 +87,8 @@ export type AcpSettingsSectionProps = PropsRuntime<'settings.section'> & PropsLo
 interface DiscoveredModel {
     id: string;
     name: string;
+    /** Carries the ACP protocol version on the `acp-info-<id>` route. */
+    contextWindow?: number;
 }
 /** Render the ACP Servers settings section. */
 export declare function AcpSettingsSection(props: AcpSettingsSectionProps): import("react").JSX.Element;

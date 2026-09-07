@@ -12,10 +12,13 @@ import type {} from '@deepseek-ai/dsh-client-locale/client'
 import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
 // Type-only: the settings shell's SlotMap merge (the 'settings.section' entry).
 import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
+// Type-only: the sidebar shell's SlotMap merge (sidebar.footer.action entry).
+import type {} from '@deepseek-ai/dsh-client-ui-sidebar/client'
 // Type-only: the ctx.remote merge and forwarded-event key face.
 import type {} from '@deepseek-ai/dsh-api-remotes/client'
 import { AcpSettingsSection } from './AcpSettingsSection.tsx'
 import type { AcpSettingsPathOp, AcpSettingsSectionApi, AcpSettingsSectionInjected } from './AcpSettingsSection.tsx'
+import { AcpStatusBar } from './AcpStatusBar.tsx'
 import { en, zh, type AcpSettingsLocaleKey } from './locales.ts'
 // Registry data is bundled at build time from the ACP registry repository.
 import registryData from '../registry.json' with { type: 'json' }
@@ -72,4 +75,19 @@ export function apply(ctx: ClientContext): void {
     locale: NS,
     inject: injected,
   }, AcpSettingsSection))
+
+  // Sidebar footer indicator: ACP server connection status.
+  const footerApi: AcpSettingsSectionApi = {
+    describeSettings: () => remote.settings.describe(),
+    mutateSettings: (ns, ops, expectedRevision) =>
+      remote.settings.mutate(ns, ops as AcpSettingsPathOp[], expectedRevision),
+    discoverModels: (settingsNs, provider) => remote.llm.discoverModels(settingsNs, { provider }),
+  }
+  ctx.slots.inject('sidebar.footer.action', () => ctx.slots.register({
+    name: 'sidebar.footer.action',
+    id: 'acp-status',
+    order: 50,
+    locale: NS,
+    inject: () => ({ api: footerApi, settingsNs: LLM_ACP_NS }),
+  }, AcpStatusBar))
 }

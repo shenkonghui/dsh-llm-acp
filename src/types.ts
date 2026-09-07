@@ -28,7 +28,14 @@ export function acpFinishReason(
     case 'max_tokens':
       return { kind: 'max-tokens' }
     case 'refusal':
-      return { kind: 'error', failure: { ...failure, code: 'REFUSAL' } }
+      return {
+        kind: 'error',
+        failure: {
+          ...failure,
+          code: 'REFUSAL',
+          message: `${failure.message} (the ACP server refused the request — check that the model id is valid and the server is authenticated)`,
+        },
+      }
     case 'cancelled':
       return { kind: 'aborted', failure }
     case 'max_turn_requests':

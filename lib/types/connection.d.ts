@@ -95,6 +95,16 @@ export declare class AcpConnection {
     private agentCapabilities;
     /** Session lifecycle capabilities advertised by the agent. */
     private sessionCapabilities;
+    /** Agent name/version published in the `initialize` response (`agentInfo`). */
+    private agentInfo;
+    /** Negotiated ACP protocol version from the `initialize` response. */
+    private protocolVersion;
+    /**
+     * Browser login URL published via the `_codebuddy.ai/authUrl` extension
+     * notification while an interactive `authenticate` round is in flight.
+     * Captured so a key-less auth timeout can tell the user where to log in.
+     */
+    private pendingAuthUrl;
     constructor(spec: AcpConnectionSpec);
     /** Resolves when the ACP server has completed `initialize`. */
     get ready(): Promise<void>;
@@ -106,11 +116,28 @@ export declare class AcpConnection {
     /** Whether the agent advertises `session/delete` via sessionCapabilities. */
     get supportsDeleteSession(): boolean;
     /**
-     * Call `authenticate` when the server advertises auth methods. Picks the
-     * first method and lets the server handle its own authentication flow
-     * (e.g. browser-based PKCE). When a credential resolver is configured and
-     * returns a key, it is passed as `_meta.api_key` for servers that accept
-     * direct key authentication; otherwise the server initiates its own flow.
+     * Server identity published in the `initialize` response: the agent's
+     * reported name/version and the negotiated ACP protocol version. Returns
+     * `undefined` before {@link ready} settles or when the agent omits
+     * `agentInfo`; callers that need a populated answer should `await ready`
+     * first.
+     * @returns the agent name/version and protocol version, or `undefined`.
+     */
+    getServerInfo(): {
+        agentName: string;
+        agentVersion: string;
+        protocolVersion: number;
+    } | undefined;
+    /**
+     * Call `authenticate` when the server advertises auth methods. A resolved
+     * API key is passed as `_meta.api_key` for servers that accept direct key
+     * authentication. Without a key, `authenticate` is still attempted once
+     * with the first advertised method: servers with cached credentials
+     * (e.g. codebuddy) resolve that call immediately — and only then accept
+     * `session/new`. The key-less attempt is bounded and best-effort: on
+     * timeout or error the connection still comes up, and a browser login
+     * URL published via the `_codebuddy.ai/authUrl` extension notification is
+     * surfaced in the warning so the user can complete an interactive login.
      */
     private authenticateIfNeeded;
     /** Resolve one ACP permission request through its owning session. */
@@ -187,7 +214,10 @@ export declare class AcpConnection {
      * @returns all config options (models, modes, thought levels, etc.).
      */
     discoverConfigOptions(): Promise<readonly SessionConfigOption[] | undefined>;
-    /** Extract model entries from a config option list (category `model`, type `select`). */
+    /** Extract model entries from a config option list (category `model`, type `select`).
+     * Handles both flat option lists and grouped option lists per the ACP
+     * `SessionConfigSelectOptions` union: a group entry carries its own
+     * `options` array of leaf values, so flatten one level before collecting. */
     private extractModels;
     /**
      * Set the model for one ACP session via `session/set_config_option`. Best-effort:

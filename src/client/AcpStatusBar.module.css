@@ -1,0 +1,101 @@
+.wrapper {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+
+.trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: none;
+  background: none;
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--dsw-alias-label-secondary, #888);
+  padding: 2px 4px;
+  border-radius: 4px;
+}
+
+.trigger:hover {
+  background: var(--dsw-alias-fill-hover, rgba(0, 0, 0, 0.06));
+}
+
+.dot {
+  flex-shrink: 0;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.dotOk {
+  background: #22c55e;
+}
+
+.dotWarn {
+  background: #f59e0b;
+}
+
+.dotErr {
+  background: #ef4444;
+}
+
+.dotPending {
+  background: var(--dsw-alias-label-tertiary, #bbb);
+}
+
+.label {
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.count {
+  font-variant-numeric: tabular-nums;
+  opacity: 0.8;
+}
+
+.popover {
+  position: absolute;
+  bottom: calc(100% + 4px);
+  left: 0;
+  min-width: 200px;
+  max-width: 280px;
+  background: var(--dsw-alias-elevated-fill, #fff);
+  border: 1px solid var(--dsw-alias-border, #e0e0e0);
+  border-radius: 8px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12);
+  padding: 6px;
+  z-index: 100;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.serverRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px;
+  border-radius: 4px;
+  font-size: 12px;
+}
+
+.serverRow:hover {
+  background: var(--dsw-alias-fill-hover, rgba(0, 0, 0, 0.04));
+}
+
+.serverName {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 500;
+}
+
+.serverDetail {
+  flex-shrink: 0;
+  color: var(--dsw-alias-label-tertiary, #999);
+  font-size: 11px;
+}

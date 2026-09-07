@@ -120,6 +120,33 @@ function deriveCommand(agent: AcpRegistryAgent): { command: string; args: string
   return undefined
 }
 
+/** Derive the bin name an npm package installs (heuristic: last path segment
+ * of the package name, without scope or version). `@scope/name@ver` → `name`,
+ * `name@ver` → `name`. Used to probe PATH before falling back to `npx -y`. */
+function npmBinName(pkg: string): string | undefined {
+  if (pkg.startsWith('@')) {
+    const scoped = pkg.split('@', 2)[1]
+    return scoped?.split('/').pop()
+  }
+  return pkg.split('@')[0]
+}
+
+/** Probe the host PATH for `bin` via the `acp-resolve-<bin>` discovery route.
+ * Returns the absolute path when found, `undefined` otherwise. */
+async function resolveBinInPath(
+  api: AcpSettingsSectionInjected['api'],
+  settingsNs: string,
+  bin: string,
+): Promise<string | undefined> {
+  try {
+    const response = await api.discoverModels(settingsNs, `acp-resolve-${bin}`)
+    if (!response.ok) return undefined
+    return (response.value ?? [])[0]?.id
+  } catch {
+    return undefined
+  }
+}
+
 /** Distribution type label for display. */
 function distributionType(agent: AcpRegistryAgent): string {
   const dist = agent.distribution
@@ -133,12 +160,18 @@ function distributionType(agent: AcpRegistryAgent): string {
 interface DiscoveredModel {
   id: string
   name: string
+  /** Carries the ACP protocol version on the `acp-info-<id>` route. */
+  contextWindow?: number
 }
 
-/** Draft environment variable row for the editor. */
-interface EnvDraftRow {
-  key: string
-  value: string
+/** Live server identity published by the ACP `initialize` response. */
+interface ServerInfo {
+  /** Agent name from `agentInfo.name`. */
+  agentName: string
+  /** Agent version from `agentInfo.version`. */
+  agentVersion: string
+  /** Negotiated ACP protocol version. */
+  protocolVersion?: number
 }
 
 /** Load the full discovered model catalog for one ACP provider route.
@@ -157,6 +190,47 @@ async function loadProviderModels(
   } catch {
     return []
   }
+}
+
+/** Load the live server identity (agent name/version, ACP protocol version)
+ * via the `acp-info-<id>` discovery route. Returns `undefined` when the
+ * server has not yet completed `initialize` or omits `agentInfo`. */
+async function loadServerInfo(
+  api: AcpSettingsSectionInjected['api'],
+  settingsNs: string,
+  serverId: string,
+): Promise<ServerInfo | undefined> {
+  try {
+    const response = await api.discoverModels(settingsNs, `acp-info-${serverId}`)
+    if (!response.ok) return undefined
+    const entry = (response.value ?? [])[0]
+    if (entry === undefined) return undefined
+    const protocolVersion = entry.contextWindow
+    return {
+      agentName: entry.id,
+      agentVersion: entry.name ?? '',
+      ...(protocolVersion === undefined ? {} : { protocolVersion }),
+    }
+  } catch {
+    return undefined
+  }
+}
+
+/** Compact version label for a server card: live agent version first, then
+ * the registry version as a fallback when the server has not reported yet. */
+function serverVersionLabel(
+  info: ServerInfo | undefined,
+  registryAgent: AcpRegistryAgent | undefined,
+): string | undefined {
+  if (info !== undefined && info.agentVersion.length > 0) return `v${info.agentVersion}`
+  if (registryAgent !== undefined) return `v${registryAgent.version}`
+  return undefined
+}
+
+/** Draft environment variable row for the editor. */
+interface EnvDraftRow {
+  key: string
+  value: string
 }
 
 /** Convert an env record to editable draft rows. */
@@ -192,6 +266,7 @@ export function AcpSettingsSection(props: AcpSettingsSectionProps) {
   const [modelsLoading, setModelsLoading] = useState<Set<string>>(new Set())
   const [modelSearch, setModelSearch] = useState<Record<string, string>>({})
   const [savingId, setSavingId] = useState<string | undefined>()
+  const [serverInfo, setServerInfo] = useState<Record<string, ServerInfo | undefined>>({})
 
   /** Revision of the `llm-acp` namespace at the last read; sent back on writes
    * so a stale editor is refused instead of silently overwriting. */
@@ -206,7 +281,17 @@ export function AcpSettingsSection(props: AcpSettingsSectionProps) {
         if (ns !== undefined) {
           revisionRef.current = ns.revision
           const data = ns.value as { servers?: Record<string, AcpServerEntry> }
-          setServers(data?.servers ?? {})
+          const next = data?.servers ?? {}
+          setServers(next)
+          // Best-effort: refresh live server version info. The `acp-info-<id>`
+          // route reads the cached `initialize` identity (no session), so the
+          // parallel fetches are cheap; each resolves independently and may
+          // stay `undefined` until the connection finishes initializing.
+          for (const id of Object.keys(next)) {
+            void loadServerInfo(api, settingsNs, id).then(info => {
+              setServerInfo(prev => (prev[id] === info ? prev : { ...prev, [id]: info }))
+            })
+          }
         }
       }
     } catch {
@@ -218,14 +303,29 @@ export function AcpSettingsSection(props: AcpSettingsSectionProps) {
 
   useEffect(() => { void loadServers() }, [])
 
-  /** Add a registry agent as a configured server. */
+  /** Add a registry agent as a configured server. For `npx -y <pkg>` agents,
+   * probe the host PATH first and store the local bin directly when present,
+   * so the UI shows and the spawn uses the installed binary without an npm
+   * fetch on every start. */
   const addServer = async (agent: AcpRegistryAgent): Promise<void> => {
     const cmd = deriveCommand(agent)
     if (cmd === undefined) return
     setAddingId(agent.id)
     setError(undefined)
     try {
-      const serverEntry = { command: cmd.command, args: cmd.args, name: agent.name, env: {}, models: [] }
+      let command = cmd.command
+      let args = cmd.args
+      if (command === 'npx' && agent.distribution.npx !== undefined) {
+        const bin = npmBinName(agent.distribution.npx.package)
+        if (bin !== undefined) {
+          const resolved = await resolveBinInPath(api, settingsNs, bin)
+          if (resolved !== undefined) {
+            command = resolved
+            args = agent.distribution.npx.args ?? []
+          }
+        }
+      }
+      const serverEntry = { command, args, name: agent.name, env: {}, models: [] }
       const response = await api.mutateSettings(
         settingsNs,
         [{ op: 'set', path: ['servers', agent.id], value: serverEntry }],
@@ -275,10 +375,30 @@ export function AcpSettingsSection(props: AcpSettingsSectionProps) {
       setEnvDrafts(prev => ({ ...prev, [id]: envToDrafts(server.env) }))
       setModelDrafts(prev => ({ ...prev, [id]: server.models ?? [] }))
     }
-    // Fetch discovered models for this provider route.
+    // Fetch discovered models and live server info for this provider route.
     setModelsLoading(prev => new Set(prev).add(id))
-    const models = await loadProviderModels(api, settingsNs, `acp-${id}`)
+    const [models, info] = await Promise.all([
+      loadProviderModels(api, settingsNs, `acp-${id}`),
+      loadServerInfo(api, settingsNs, id),
+    ])
     setDiscoveredModels(prev => ({ ...prev, [id]: models }))
+    setServerInfo(prev => (prev[id] === info ? prev : { ...prev, [id]: info }))
+    setModelsLoading(prev => {
+      const next = new Set(prev)
+      next.delete(id)
+      return next
+    })
+  }
+
+  /** Re-fetch the model catalog and live server info for one server. */
+  const refreshModels = async (id: string): Promise<void> => {
+    setModelsLoading(prev => new Set(prev).add(id))
+    const [models, info] = await Promise.all([
+      loadProviderModels(api, settingsNs, `acp-${id}`),
+      loadServerInfo(api, settingsNs, id),
+    ])
+    setDiscoveredModels(prev => ({ ...prev, [id]: models }))
+    setServerInfo(prev => (prev[id] === info ? prev : { ...prev, [id]: info }))
     setModelsLoading(prev => {
       const next = new Set(prev)
       next.delete(id)
@@ -452,6 +572,9 @@ export function AcpSettingsSection(props: AcpSettingsSectionProps) {
                 const selectedModels = modelDrafts[id] ?? []
                 const models = discoveredModels[id] ?? []
                 const isLoadingModels = modelsLoading.has(id)
+                const info = serverInfo[id]
+                const registryAgent = registry.agents.find(a => a.id === id)
+                const versionLabel = serverVersionLabel(info, registryAgent)
                 return (
                   <div key={id} className={css.serverCardBlock}>
                     <div className={css.serverCard}>
@@ -462,6 +585,9 @@ export function AcpSettingsSection(props: AcpSettingsSectionProps) {
                         </p>
                         <div className={css.agentMeta}>
                           <span>acp-{id}</span>
+                          {versionLabel !== undefined && (
+                            <span>{t('serverVersion')}: {versionLabel}</span>
+                          )}
                         </div>
                       </div>
                       <div className={css.cardActions}>
@@ -488,6 +614,28 @@ export function AcpSettingsSection(props: AcpSettingsSectionProps) {
                     </div>
                     {isExpanded && (
                       <div className={css.serverDetail}>
+                        <div className={css.detailSection}>
+                          <p className={css.detailHeading}>{t('serverVersion')}</p>
+                          {info !== undefined ? (
+                            <div className={css.versionInfo}>
+                              <span className={css.versionName}>{info.agentName}</span>
+                              <span className={css.versionTag}>v{info.agentVersion}</span>
+                              {info.protocolVersion !== undefined && (
+                                <span className={css.versionTag}>
+                                  {t('serverProtocol')}: {info.protocolVersion}
+                                </span>
+                              )}
+                            </div>
+                          ) : registryAgent !== undefined ? (
+                            <div className={css.versionInfo}>
+                              <span className={css.versionName}>{registryAgent.name}</span>
+                              <span className={css.versionTag}>v{registryAgent.version}</span>
+                            </div>
+                          ) : (
+                            <p className={css.emptyInline}>{t('serverVersionUnknown')}</p>
+                          )}
+                        </div>
+
                         <div className={css.detailSection}>
                           <p className={css.detailHeading}>{t('envVars')}</p>
                           <p className={css.detailHint}>{t('envVarsHint')}</p>
@@ -532,12 +680,24 @@ export function AcpSettingsSection(props: AcpSettingsSectionProps) {
                         </div>
 
                         <div className={css.detailSection}>
-                          <p className={css.detailHeading}>{t('modelSelect')}</p>
+                          <div className={css.modelSelectHeader}>
+                            <p className={css.detailHeading}>{t('modelSelect')}</p>
+                            <button
+                              type="button"
+                              className={css.refreshButton}
+                              disabled={isLoadingModels}
+                              onClick={() => { void refreshModels(id) }}
+                            >
+                              {isLoadingModels ? t('refreshingModels') : t('refreshModels')}
+                            </button>
+                          </div>
                           <p className={css.detailHint}>{t('modelSelectHint')}</p>
                           {isLoadingModels ? (
                             <p className={css.emptyInline}>{t('modelsLoading')}</p>
                           ) : models.length === 0 ? (
-                            <p className={css.emptyInline}>{t('noModels')}</p>
+                            <p className={css.emptyInline}>
+                              {info !== undefined ? t('noModelsConnected') : t('noModels')}
+                            </p>
                           ) : (
                             <>
                               <input

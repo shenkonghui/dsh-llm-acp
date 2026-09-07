@@ -179,7 +179,21 @@ export class AcpAdapter extends LlmAdapter {
    */
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
     const permissionRequester = this.config.permissionRequester?.()
-    await this.config.connection.ready
+    try {
+      await this.config.connection.ready
+    } catch (error: unknown) {
+      yield {
+        type: 'finish',
+        reason: {
+          kind: 'error',
+          failure: {
+            code: 'ACP_INIT_FAILED',
+            message: `llm-acp: ACP server failed to initialize: ${error instanceof Error ? error.message : String(error)}`,
+          },
+        },
+      }
+      return
+    }
 
     const canReuse = this.config.connection.supportsLoadSession
       && options.sessionId !== undefined
