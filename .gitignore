@@ -1,3 +1,13 @@
 node_modules/
 *.tsbuildinfo
 .DS_Store
+
+# Local scratch/probe files and backups
+*-scratch.ts
+*-scratch.ts.bak
+*-scratch.d.ts
+*-scratch.d.ts.map
+*-scratch.js
+*-scratch.js.map
+*.bak
+.workbuddy/
