@@ -19,6 +19,16 @@ export type AcpSettingsLocaleKey =
   | 'serverVersion' | 'serverProtocol' | 'serverVersionUnknown'
   | 'noModelsConnected'
   | 'statusLabel' | 'statusSummary' | 'statusConnected' | 'statusDisconnected' | 'statusChecking'
+  | 'test' | 'testTitle' | 'testSkipped'
+  | 'testStep_handshake' | 'testStep_models' | 'testStep_message'
+  | 'testHandshakeFail' | 'testNoModels' | 'testNoResponse'
+  | 'authPending' | 'authOpen'
+  | 'customAdd' | 'customTitle' | 'customId' | 'customIdHint' | 'customName'
+  | 'customCommand' | 'customCommandHint' | 'customArgs' | 'customArgsHint'
+  | 'customEnv' | 'customEnvHint' | 'customSave' | 'customSaving'
+  | 'customIdRequired' | 'customIdExists' | 'customCommandRequired'
+  | 'customModels' | 'customModelsHint' | 'noCustomModels'
+  | 'addCustomModel' | 'customModelId' | 'customModelName'
 
 /** English copy. */
 export const en: Record<AcpSettingsLocaleKey, string> = {
@@ -75,6 +85,39 @@ export const en: Record<AcpSettingsLocaleKey, string> = {
   statusConnected: '{n} models',
   statusDisconnected: 'offline',
   statusChecking: 'checking…',
+  test: 'Test',
+  testTitle: 'Test ACP Server',
+  testSkipped: 'Skipped (previous step failed)',
+  testStep_handshake: 'Auth handshake',
+  testStep_models: 'Fetch models',
+  testStep_message: 'Send message',
+  testHandshakeFail: 'Handshake failed or the server has not initialized.',
+  testNoModels: 'No models discovered.',
+  testNoResponse: 'No result returned — the host plugin may be running a stale build; restart the harness and retry.',
+  authPending: 'This server is waiting for an interactive login.',
+  authOpen: 'Open login page',
+  customAdd: 'Add custom agent',
+  customTitle: 'Add Custom ACP Agent',
+  customId: 'Server ID',
+  customIdHint: 'Unique identifier for this server (lowercase letters, digits, hyphens).',
+  customName: 'Display name',
+  customCommand: 'Launch command',
+  customCommandHint: 'Executable path or command name (e.g. npx, node, /usr/local/bin/my-agent).',
+  customArgs: 'Arguments',
+  customArgsHint: 'Space-separated command arguments.',
+  customEnv: 'Environment variables',
+  customEnvHint: 'Environment variables passed to the agent process (e.g. API keys).',
+  customSave: 'Add',
+  customSaving: 'Adding…',
+  customIdRequired: 'Server ID is required.',
+  customIdExists: 'A server with this ID already exists.',
+  customCommandRequired: 'Launch command is required.',
+  customModels: 'Custom models',
+  customModelsHint: 'User-defined models to expose in addition to (or instead of) the discovered catalog. Custom models with the same id as a discovered model override its display name.',
+  noCustomModels: 'No custom models defined.',
+  addCustomModel: 'Add custom model',
+  customModelId: 'Model id',
+  customModelName: 'Display name',
 }
 
 /** Chinese copy. */
@@ -132,4 +175,37 @@ export const zh: Record<AcpSettingsLocaleKey, string> = {
   statusConnected: '{n} 个模型',
   statusDisconnected: '离线',
   statusChecking: '检测中…',
+  test: '测试',
+  testTitle: '测试 ACP 服务',
+  testSkipped: '已跳过（前序步骤失败）',
+  testStep_handshake: '认证握手',
+  testStep_models: '获取模型',
+  testStep_message: '发送消息',
+  testHandshakeFail: '握手失败或服务尚未完成初始化。',
+  testNoModels: '未发现任何模型。',
+  testNoResponse: '服务未返回结果——宿主端插件可能在运行旧版本，请重启 harness 后重试。',
+  authPending: '此服务正在等待交互式登录。',
+  authOpen: '打开登录页面',
+  customAdd: '添加自定义 Agent',
+  customTitle: '添加自定义 ACP Agent',
+  customId: '服务 ID',
+  customIdHint: '此服务的唯一标识符（小写字母、数字、连字符）。',
+  customName: '显示名称',
+  customCommand: '启动命令',
+  customCommandHint: '可执行文件路径或命令名（如 npx、node、/usr/local/bin/my-agent）。',
+  customArgs: '参数',
+  customArgsHint: '以空格分隔的命令参数。',
+  customEnv: '环境变量',
+  customEnvHint: '传递给 agent 进程的环境变量（如 API Key）。',
+  customSave: '添加',
+  customSaving: '添加中…',
+  customIdRequired: '服务 ID 不能为空。',
+  customIdExists: '此 ID 已存在。',
+  customCommandRequired: '启动命令不能为空。',
+  customModels: '自定义模型',
+  customModelsHint: '在已发现的模型目录之外额外暴露的用户自定义模型。与已发现模型同 id 的自定义模型会覆盖其显示名称。',
+  noCustomModels: '未定义自定义模型。',
+  addCustomModel: '添加自定义模型',
+  customModelId: '模型 ID',
+  customModelName: '显示名称',
 }

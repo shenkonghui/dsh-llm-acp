@@ -80,6 +80,13 @@ export interface AcpServerConfig {
    * models (intersected with the discovered set) appear in `listModels`.
    */
   models?: string[]
+  /**
+   * User-defined models to expose in addition to (or instead of) the discovered
+   * catalog. Each entry has an `id` (sent to the ACP server as the model name)
+   * and a `name` (display label). Custom models with the same id as a discovered
+   * model override its display name; custom models with unique ids are added.
+   */
+  customModels?: { id: string; name: string }[]
 }
 
 /** Plugin config: defaults applied to every spawned ACP server. */
@@ -121,6 +128,10 @@ export const Config: z<Config> = z.object({
     name: z.string().required(),
     env: z.dict(z.string()).default({}),
     models: z.array(z.string()).default([]),
+    customModels: z.array(z.object({
+      id: z.string().required(),
+      name: z.string().default(''),
+    })).default([]),
   })).default({}),
 })
 
@@ -132,6 +143,10 @@ const SettingsSchema = z.object({
     name: z.string().required(),
     env: z.dict(z.string()).default({}),
     models: z.array(z.string()).default([]),
+    customModels: z.array(z.object({
+      id: z.string().required(),
+      name: z.string().default(''),
+    })).default([]),
   })).default({}),
 })
 
@@ -247,6 +262,7 @@ function serverFingerprint(server: AcpServerConfig): string {
     name: server.name,
     env: server.env ?? {},
     models: server.models ?? [],
+    customModels: server.customModels ?? [],
   })
 }
 
@@ -310,6 +326,26 @@ export function apply(ctx: Context, config: Config): void {
   /** Active connections keyed by server id. */
   const active = new Map<string, ActiveServer>()
 
+  /** Best-effort system-browser open for an interactive login URL; failure keeps the URL in the auth warning. */
+  function openBrowser(url: string): void {
+    const argv = process.platform === 'darwin'
+      ? ['open', url]
+      : process.platform === 'win32'
+        ? ['cmd', '/c', 'start', '', url]
+        : ['xdg-open', url]
+    try {
+      const handle = ctx.subprocess.spawn({
+        argv,
+        cwd,
+        stdio: { stdin: 'ignore', stdout: 'inherit', stderr: 'inherit' },
+        graceMs: resolved.disposeGraceMs,
+      })
+      handle.done.catch(() => { /* opener missing or failed; the key-less auth timeout warning still shows the URL */ })
+    } catch {
+      // Spawn refused synchronously; the key-less auth timeout warning still shows the URL.
+    }
+  }
+
   /** Create one ACP connection + adapter for a server. */
   function createServer(serverId: string, server: AcpServerConfig): ActiveServer {
     const serverEnv = { ...resolved.env, ...(server.env ?? {}) }
@@ -326,6 +362,7 @@ export function apply(ctx: Context, config: Config): void {
       disposeGraceMs: resolved.disposeGraceMs,
       spawn: spec => ctx.subprocess.spawn(spec),
       onWarn: message => ctx.logger.warn(message),
+      onAuthUrl: openBrowser,
       // Resolve an API key from the server's configured env. When present,
       // it is passed via _meta.api_key so ACP servers that accept direct
       // key auth skip interactive flows. When absent, authenticate is not
@@ -345,6 +382,7 @@ export function apply(ctx: Context, config: Config): void {
       emitReasoning: resolved.emitReasoning,
       defaultModel: { id: resolved.defaultModelId, name: resolved.defaultModelName },
       enabledModels: server.models,
+      customModels: server.customModels,
       permissionRequester: () => {
         const agents = ctx.get('agents')
         const agent = agents?.currentInitiator()
@@ -467,6 +505,24 @@ export function apply(ctx: Context, config: Config): void {
   // the `LlmDiscoveredModel` wire shape: `id` is the absolute path, `name`
   // is the bin name. Only the ACP settings UI consumes this route.
   const RESOLVE_PREFIX = 'acp-resolve-'
+  // A fourth route convention, `acp-test-<id>`, runs an end-to-end probe for
+  // the settings UI's server test dialog: create a throwaway session, send a
+  // short prompt, collect the streamed reply, and close the session. The reply
+  // reuses the `LlmDiscoveredModel` wire shape: `id` is `ok` or `error`, and
+  // `name` carries the reply text or the failure message. Only the ACP
+  // settings UI consumes this route.
+  const TEST_PREFIX = 'acp-test-'
+  // A fifth route convention, `acp-auth-<id>`, reports the server's pending
+  // interactive-auth browser URL captured from the `_codebuddy.ai/authUrl`
+  // extension notification. The reply reuses the `LlmDiscoveredModel` wire
+  // shape: `id` is `auth` with `name` carrying the URL while a login is
+  // pending, `id` `none` otherwise. Only the ACP settings UI consumes this
+  // route.
+  const AUTH_PREFIX = 'acp-auth-'
+  /** How long to wait for `initialize` before the test probe reports failure. */
+  const TEST_INIT_TIMEOUT_MS = 15_000
+  /** How long to wait for the probe prompt's terminal update before aborting. */
+  const TEST_PROMPT_TIMEOUT_MS = 60_000
   ctx.effect(() => ctx.llm.registerModelDiscovery(NS, async (request: LlmModelDiscoveryRequest, _signal?: AbortSignal) => {
     const provider = request.provider ?? ''
     if (provider.length === 0) return []
@@ -480,22 +536,100 @@ export function apply(ctx: Context, config: Config): void {
     if (provider.startsWith(INFO_PREFIX)) {
       const serverId = provider.slice(INFO_PREFIX.length)
       const server = active.get(serverId)
-      if (server === undefined) return []
+      if (server === undefined) return [{ id: 'error', name: 'server is not running — no active connection found for this server id; the server may have been removed or never started' }]
+      let readySettled = false
+      let readyError: Error | undefined
       try {
         await Promise.race([
-          server.connection.ready,
+          server.connection.ready.then(() => { readySettled = true }, (error: unknown) => { readyError = error instanceof Error ? error : new Error(String(error)) }),
           new Promise(resolve => setTimeout(() => resolve(undefined), 10_000)),
         ])
-      } catch {
-        return []
+      } catch (error: unknown) {
+        return [{
+          id: 'error',
+          name: `initialize threw synchronously: ${error instanceof Error ? error.message : String(error)}`,
+        }]
+      }
+      if (readyError !== undefined) {
+        return [{
+          id: 'error',
+          name: `initialize failed: ${readyError.message}`,
+        }]
+      }
+      if (!readySettled) {
+        const authUrl = server.connection.getPendingAuthUrl()
+        return [{
+          id: 'error',
+          name: `initialize timed out after 10s — the agent may still be starting (e.g. npx fetching a package), waiting for an interactive login, or the process may have exited`
+            + (authUrl !== undefined ? `; a browser login is pending: ${authUrl}` : '; check the host logs for llm-acp warnings'),
+        }]
       }
       const info = server.connection.getServerInfo()
-      if (info === undefined) return []
+      if (info === undefined) {
+        return [{
+          id: 'error',
+          name: 'initialize completed but no protocol version was negotiated — the agent may have returned an invalid initialize response',
+        }]
+      }
+      if (info.agentInfoMissing) {
+        return [{
+          id: 'unknown',
+          name: `agentInfo missing — initialize succeeded (protocol ${info.protocolVersion}) but the agent omitted or published an invalid agentInfo; the ACP SDK silently drops agentInfo that fails schema validation (name and version must be non-empty strings); the server may still be functional`,
+          contextWindow: info.protocolVersion,
+        }]
+      }
       return [{
         id: info.agentName,
         name: info.agentVersion,
         contextWindow: info.protocolVersion,
       }]
+    }
+    if (provider.startsWith(TEST_PREFIX)) {
+      const serverId = provider.slice(TEST_PREFIX.length)
+      const server = active.get(serverId)
+      if (server === undefined) return [{ id: 'error', name: 'server is not running — no active connection found for this server id; the server may have been removed or never started' }]
+      const fail = (error: unknown): LlmDiscoveredModel[] => [{
+        id: 'error',
+        name: error instanceof Error ? error.message : String(error),
+      }]
+      try {
+        await Promise.race([
+          server.connection.ready,
+          new Promise((_, reject) => setTimeout(() => reject(new Error(`initialize timed out after ${TEST_INIT_TIMEOUT_MS}ms — the agent may still be starting, waiting for an interactive login, or the process may have exited; check the host logs for llm-acp warnings`)), TEST_INIT_TIMEOUT_MS)),
+        ])
+      } catch (error: unknown) {
+        return fail(error)
+      }
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), TEST_PROMPT_TIMEOUT_MS)
+      let sessionId: string | undefined
+      try {
+        sessionId = await server.connection.newSession()
+        let reply = ''
+        for await (const update of server.connection.promptStream(
+          sessionId,
+          [{ type: 'text', text: 'Reply with exactly: pong' }],
+          controller.signal,
+        )) {
+          if (update.kind === 'text') reply += update.text
+          else if (update.kind === 'done') return [{ id: 'ok', name: reply }]
+          else if (update.kind === 'error') throw new Error(update.error.message)
+        }
+        if (controller.signal.aborted) throw new Error(`prompt timed out after ${TEST_PROMPT_TIMEOUT_MS}ms — the agent accepted the prompt but did not respond within the deadline; it may be stuck on an interactive login, a permission request, or an internal error`)
+        throw new Error('stream ended without a stop reason — the agent closed the prompt stream without sending a terminal update; this may indicate a crash or protocol violation')
+      } catch (error: unknown) {
+        return fail(error)
+      } finally {
+        clearTimeout(timer)
+        if (sessionId !== undefined) server.connection.closeSession(sessionId)
+      }
+    }
+    if (provider.startsWith(AUTH_PREFIX)) {
+      const serverId = provider.slice(AUTH_PREFIX.length)
+      const server = active.get(serverId)
+      const url = server?.connection.getPendingAuthUrl()
+      if (url === undefined || url.length === 0) return [{ id: 'none', name: '' }]
+      return [{ id: 'auth', name: url }]
     }
     if (!provider.startsWith('acp-')) return []
     const serverId = provider.slice(4)

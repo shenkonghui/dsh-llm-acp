@@ -37,6 +37,13 @@ export interface AcpAdapterOptions {
    * (intersected with the discovered set) appear in `listModels`.
    */
   enabledModels?: readonly string[] | undefined
+  /**
+   * User-defined models to expose in addition to the discovered catalog.
+   * Each entry has an `id` (sent to the ACP server as the model name) and a
+   * `name` (display label). Custom models with the same id as a discovered
+   * model override its display name; custom models with unique ids are added.
+   */
+  customModels?: readonly { id: string; name: string }[] | undefined
   /** Capture an interactive permission requester from the current agent turn. */
   permissionRequester?: (() => AcpPermissionRequester | undefined) | undefined
 }
@@ -94,6 +101,41 @@ interface ReusedSession {
   messagesSent: number
 }
 
+/** Deduplicate model entries by id, keeping the first occurrence (highest priority). */
+function dedupModels(models: readonly LlmModelInfo[]): LlmModelInfo[] {
+  const seen = new Set<string>()
+  const result: LlmModelInfo[] = []
+  for (const m of models) {
+    if (seen.has(m.id)) continue
+    seen.add(m.id)
+    result.push(m)
+  }
+  return result
+}
+
+/** Merge custom models into a discovered catalog: custom entries override
+ * matching ids' display names and append unique ids. */
+function mergeCustomModels(
+  discovered: readonly LlmModelInfo[],
+  custom: readonly { id: string; name: string }[],
+  provider: string,
+): LlmModelInfo[] {
+  const customMap = new Map<string, string>()
+  for (const m of custom) {
+    customMap.set(m.id, m.name.length > 0 ? m.name : m.id)
+  }
+  const result: LlmModelInfo[] = discovered.map(m => {
+    const customName = customMap.get(m.id)
+    return customName !== undefined ? { ...m, name: customName } : m
+  })
+  for (const [id, name] of customMap) {
+    if (!discovered.some(m => m.id === id)) {
+      result.push({ provider, id, name })
+    }
+  }
+  return result
+}
+
 /**
  * The ACP-backed LLM adapter. One instance serves every model name under its
  * registered provider route. The model catalog is discovered once from the
@@ -113,9 +155,17 @@ export class AcpAdapter extends LlmAdapter {
     super()
     const fallback = [{ provider: config.provider, id: config.defaultModel.id, name: config.defaultModel.name }]
     const allow = config.enabledModels
-    this.models = allow !== undefined && allow.length > 0 && !allow.includes(config.defaultModel.id)
-      ? []
-      : fallback
+    const custom = config.customModels ?? []
+    const customEntries = custom.map(m => ({ provider: config.provider, id: m.id, name: m.name.length > 0 ? m.name : m.id }))
+    // Before discovery: start with custom models plus the fallback (when not
+    // filtered out by enabledModels). This gives immediate model visibility
+    // even when the ACP server is still initializing.
+    let initial: LlmModelInfo[] = [...customEntries]
+    if (!(allow !== undefined && allow.length > 0 && !allow.includes(config.defaultModel.id))) {
+      initial = [...initial, ...fallback]
+    }
+    // Dedup by id: custom models take priority over the fallback placeholder.
+    this.models = dedupModels(initial)
     this.modelsReady = this.discoverModels()
   }
 
@@ -126,12 +176,14 @@ export class AcpAdapter extends LlmAdapter {
       if (discovered !== undefined && discovered.length > 0) {
         const all = discovered.map(m => ({ provider: this.config.provider, id: m.id, name: m.name }))
         const allow = this.config.enabledModels
-        this.models = allow !== undefined && allow.length > 0
+        const filtered = allow !== undefined && allow.length > 0
           ? all.filter(m => allow.includes(m.id))
           : all
+        // Merge custom models: override names for matching ids, append unique ids.
+        this.models = mergeCustomModels(filtered, this.config.customModels ?? [], this.config.provider)
       }
     } catch {
-      // Keep the fallback model list; discovery is best-effort.
+      // Keep the fallback + custom model list; discovery is best-effort.
     }
   }
 

@@ -115,6 +115,48 @@ function acpContentText(content: AcpContentBlock): string {
   return content.type === 'text' ? content.text : ''
 }
 
+/** Truncate a string to a display-friendly length for permission prompts. */
+function truncate(s: string, max = 120): string {
+  return s.length > max ? s.slice(0, max - 1) + '…' : s
+}
+
+/** Best-effort stringification of a non-string `rawInput` value. */
+function tryStringify(value: unknown): string {
+  try {
+    return typeof value === 'string' ? value : JSON.stringify(value)
+  } catch {
+    return String(value)
+  }
+}
+
+/** Build a human-readable description of the tool call needing permission.
+ * Prefers the server-provided `title`; when absent, derives one from
+ * `kind`, `locations` (file paths), and `rawInput` so the user sees what
+ * they are approving instead of a generic "ACP operation". */
+function describePermissionToolCall(toolCall: RequestPermissionRequest['toolCall']): string {
+  const title = typeof toolCall.title === 'string' && toolCall.title.length > 0
+    ? toolCall.title
+    : ''
+  if (title.length > 0) return title
+  const kind = toolCall.kind ?? ''
+  const locations = toolCall.locations ?? []
+  const paths = locations
+    .map(loc => loc.path)
+    .filter((p): p is string => typeof p === 'string' && p.length > 0)
+  const rawInput = toolCall.rawInput
+  const inputSummary = typeof rawInput === 'string' && rawInput.length > 0
+    ? rawInput
+    : rawInput !== undefined && rawInput !== null
+      ? tryStringify(rawInput)
+      : ''
+  if (kind.length > 0 && paths.length > 0) return `${kind}: ${paths.join(', ')}`
+  if (kind.length > 0 && inputSummary.length > 0) return `${kind}: ${truncate(inputSummary)}`
+  if (kind.length > 0) return kind
+  if (paths.length > 0) return paths.join(', ')
+  if (inputSummary.length > 0) return truncate(inputSummary)
+  return 'ACP operation'
+}
+
 /** Resolved spawn spec for the long-lived ACP server process. */
 export interface AcpConnectionSpec {
   /** The executable to spawn (the external ACP agent server). */
@@ -133,6 +175,13 @@ export interface AcpConnectionSpec {
   spawn: (spec: SubprocessSpawnSpec) => SubprocessHandle
   /** Sink for connection-level warnings (wired to `ctx.logger.warn`). */
   onWarn?: (message: string) => void
+  /**
+   * Notified with the browser login URL when the server publishes it via the
+   * `_codebuddy.ai/authUrl` extension notification during an interactive
+   * `authenticate` round. The host decides how to surface it (e.g. open the
+   * system browser); failures must not affect the connection.
+   */
+  onAuthUrl?: (url: string) => void
   /**
    * Resolves the API key to pass to `authenticate` when the ACP server
    * advertises auth methods. Returns `undefined` to skip authentication
@@ -260,17 +309,33 @@ export class AcpConnection {
   /**
    * Server identity published in the `initialize` response: the agent's
    * reported name/version and the negotiated ACP protocol version. Returns
-   * `undefined` before {@link ready} settles or when the agent omits
-   * `agentInfo`; callers that need a populated answer should `await ready`
-   * first.
-   * @returns the agent name/version and protocol version, or `undefined`.
+   * `undefined` before {@link ready} settles or when no protocol version was
+   * negotiated. When the agent omitted or published an invalid `agentInfo`
+   * (the SDK silently drops `agentInfo` failing schema validation —
+   * `name`/`version` are required non-empty strings), `agentInfoMissing`
+   * is `true` and `agentName`/`agentVersion` are empty; callers that need a
+   * populated answer should `await ready` first.
+   * @returns the agent name/version, protocol version, and whether
+   * `agentInfo` was missing; or `undefined` when no protocol version exists.
    */
-  getServerInfo(): { agentName: string; agentVersion: string; protocolVersion: number } | undefined {
-    const info = this.agentInfo
-    if (info === undefined) return undefined
+  getServerInfo(): { agentName: string; agentVersion: string; protocolVersion: number; agentInfoMissing: boolean } | undefined {
     const protocolVersion = this.protocolVersion
     if (protocolVersion === undefined) return undefined
-    return { agentName: info.name, agentVersion: info.version, protocolVersion }
+    const info = this.agentInfo
+    if (info === undefined) {
+      return { agentName: '', agentVersion: '', protocolVersion, agentInfoMissing: true }
+    }
+    return { agentName: info.name, agentVersion: info.version, protocolVersion, agentInfoMissing: false }
+  }
+
+  /**
+   * The browser login URL most recently published via the
+   * `_codebuddy.ai/authUrl` extension notification, or `undefined` when no
+   * interactive login is pending. The settings UI surfaces it as a clickable
+   * link so a headless host can still complete the browser login.
+   */
+  getPendingAuthUrl(): string | undefined {
+    return this.pendingAuthUrl
   }
 
   /**
@@ -328,9 +393,8 @@ export class AcpConnection {
     }
     let decision: AcpPermissionDecision
     try {
-      const title = typeof params.toolCall.title === 'string' && params.toolCall.title.length > 0
-        ? params.toolCall.title
-        : 'ACP operation'
+      const title = describePermissionToolCall(params.toolCall)
+      this.spec.onWarn?.(`llm-acp: permission request toolCall=${JSON.stringify(params.toolCall)} -> title="${title}"`)
       decision = await entry.permissionRequester({ title, signal: entry.signal })
     } catch (error: unknown) {
       this.spec.onWarn?.(`llm-acp: permission request failed closed: ${error instanceof Error ? error.message : String(error)}`)
@@ -413,7 +477,10 @@ export class AcpConnection {
     // interactive auth can surface it to the user instead of hanging silently.
     if (method === '_codebuddy.ai/authUrl') {
       const authUrl = typeof params.authUrl === 'string' ? params.authUrl : ''
-      if (authUrl.length > 0) this.pendingAuthUrl = authUrl
+      if (authUrl.length > 0) {
+        this.pendingAuthUrl = authUrl
+        this.spec.onAuthUrl?.(authUrl)
+      }
       return
     }
     // Unknown extension notifications are silently consumed.
