@@ -40,6 +40,16 @@ export interface AcpServerConfig {
      * models (intersected with the discovered set) appear in `listModels`.
      */
     models?: string[];
+    /**
+     * User-defined models to expose in addition to (or instead of) the discovered
+     * catalog. Each entry has an `id` (sent to the ACP server as the model name)
+     * and a `name` (display label). Custom models with the same id as a discovered
+     * model override its display name; custom models with unique ids are added.
+     */
+    customModels?: {
+        id: string;
+        name: string;
+    }[];
 }
 /** Plugin config: defaults applied to every spawned ACP server. */
 export interface Config {

@@ -34,6 +34,10 @@ export interface AcpServerEntry {
     name: string;
     env?: Record<string, string>;
     models?: string[];
+    customModels?: {
+        id: string;
+        name: string;
+    }[];
 }
 /** Wire view of one registered settings namespace (the fields this section reads). */
 interface AcpNamespaceView {

@@ -35,6 +35,16 @@ export interface AcpAdapterOptions {
      * (intersected with the discovered set) appear in `listModels`.
      */
     enabledModels?: readonly string[] | undefined;
+    /**
+     * User-defined models to expose in addition to the discovered catalog.
+     * Each entry has an `id` (sent to the ACP server as the model name) and a
+     * `name` (display label). Custom models with the same id as a discovered
+     * model override its display name; custom models with unique ids are added.
+     */
+    customModels?: readonly {
+        id: string;
+        name: string;
+    }[] | undefined;
     /** Capture an interactive permission requester from the current agent turn. */
     permissionRequester?: (() => AcpPermissionRequester | undefined) | undefined;
 }

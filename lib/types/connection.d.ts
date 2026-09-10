@@ -72,6 +72,13 @@ export interface AcpConnectionSpec {
     /** Sink for connection-level warnings (wired to `ctx.logger.warn`). */
     onWarn?: (message: string) => void;
     /**
+     * Notified with the browser login URL when the server publishes it via the
+     * `_codebuddy.ai/authUrl` extension notification during an interactive
+     * `authenticate` round. The host decides how to surface it (e.g. open the
+     * system browser); failures must not affect the connection.
+     */
+    onAuthUrl?: (url: string) => void;
+    /**
      * Resolves the API key to pass to `authenticate` when the ACP server
      * advertises auth methods. Returns `undefined` to skip authentication
      * (the server will reject `session/new` if it requires auth).
@@ -118,16 +125,28 @@ export declare class AcpConnection {
     /**
      * Server identity published in the `initialize` response: the agent's
      * reported name/version and the negotiated ACP protocol version. Returns
-     * `undefined` before {@link ready} settles or when the agent omits
-     * `agentInfo`; callers that need a populated answer should `await ready`
-     * first.
-     * @returns the agent name/version and protocol version, or `undefined`.
+     * `undefined` before {@link ready} settles or when no protocol version was
+     * negotiated. When the agent omitted or published an invalid `agentInfo`
+     * (the SDK silently drops `agentInfo` failing schema validation —
+     * `name`/`version` are required non-empty strings), `agentInfoMissing`
+     * is `true` and `agentName`/`agentVersion` are empty; callers that need a
+     * populated answer should `await ready` first.
+     * @returns the agent name/version, protocol version, and whether
+     * `agentInfo` was missing; or `undefined` when no protocol version exists.
      */
     getServerInfo(): {
         agentName: string;
         agentVersion: string;
         protocolVersion: number;
+        agentInfoMissing: boolean;
     } | undefined;
+    /**
+     * The browser login URL most recently published via the
+     * `_codebuddy.ai/authUrl` extension notification, or `undefined` when no
+     * interactive login is pending. The settings UI surfaces it as a clickable
+     * link so a headless host can still complete the browser login.
+     */
+    getPendingAuthUrl(): string | undefined;
     /**
      * Call `authenticate` when the server advertises auth methods. A resolved
      * API key is passed as `_meta.api_key` for servers that accept direct key
