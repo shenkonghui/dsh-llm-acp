@@ -70,6 +70,58 @@ llm-acp:
 
 ## 工作原理
 
+### 整体流程
+
+**1. 插件加载阶段（`apply()`，`src/index.ts`）**
+
+```
+dsh harness 启动
+  └─ apply(ctx, config)
+       ├─ 读取 llm-acp 设置命名空间 + 内联 config.servers，合并成服务器列表
+       ├─ 对每个服务器 createServer()：
+       │    ├─ resolveNpxShortcut()：npx -y <pkg> 若 bin 已在 PATH 则直接用 bin
+       │    ├─ new AcpConnection()：spawn 长生命周期子进程（stdin/stdout JSON-RPC）
+       │    │    └─ initialize() 握手 → 按需 authenticate()（用配置的 API key）
+       │    ├─ new AcpAdapter()：构造时 discoverModels() 探测模型目录
+       │    └─ ctx.llm.registerAdapter(['acp-<server-id>'], adapter)
+       └─ reconcileDirectory()：向设置页注册可配置 provider 目录
+```
+
+**2. 模型调用阶段（每次 `stream()`，`src/adapter.ts`）**
+
+```
+harness 请求模型
+  └─ AcpAdapter.stream(options)
+       ├─ await connection.ready（等 ACP initialize 完成）
+       ├─ Session 决策：
+       │    ├─ agent 支持 loadSession 且有 dsh sessionId
+       │    │    → session/load 复用，只发增量用户消息（renderPromptDelta）
+       │    │      失败/历史变短（compaction）→ 降级新建
+       │    └─ 否则 session/new 新建，全量历史渲染成一条文本块（renderPrompt）
+       ├─ setSessionModel()：best-effort 设置所选模型
+       ├─ session/prompt 流式循环：
+       │    ├─ agent_message_chunk  → text-delta chunk
+       │    ├─ agent_thought_chunk  → reasoning-delta（emitReasoning 开启时）
+       │    ├─ 扩展进度通知          → reasoning-delta
+       │    └─ stopReason 终态      → finish chunk（end_turn→stop 等）
+       └─ 收尾：复用 session 记入 sessionMap 供下轮复用；一次性 session 关闭
+```
+
+权限请求（`session/request_permission`）按当前会话的权限预设路由：`danger-full-access` 自动 allow，否则弹 harness 的 approval UI。
+
+**3. 设置界面阶段（浏览器端，`src/client/`）**
+
+```
+Web UI「设置 → ACP 服务」
+  ├─ 浏览内置 ACP 注册表（registry.json）→ 点「添加」写入 llm-acp.servers
+  ├─ 宿主端监听 settings 变更 → reconcileServers() 增删/重建连接（指纹比对）
+  ├─ 模型发现：registerModelDiscovery 路由 acp-<id> → 临时 session/new 读 configOptions
+  ├─ acp-info-<id>：只读 initialize 身份（agent 名/版本），不建 session
+  └─ acp-resolve-<bin>：探测 PATH，把 npx 形式改存本地 bin 路径
+```
+
+核心设计：**每个 ACP 服务器 = 一个常驻子进程 = 一个 provider 路由 `acp-<id>`**；工具由 ACP 服务器内部自己执行，适配器只透传文本/推理流，不接 harness 工具生态。
+
 ### 宿主端 — LLM 适配器
 
 `apply(ctx, config)` 从 `llm-acp` 设置命名空间读取已配置的服务器列表。对每个服务器，启动一个长生命周期的子进程，通过 stdin/stdout 建立 ACP `ClientSideConnection`，并在 `ctx.llm` 上注册路由为 `acp-<server-id>` 的 `AcpAdapter`。每次模型调用会创建新的 ACP session，将完整对话作为一条用户消息发送，并将流式 `agent_message_chunk` 更新转换为 harness 的 `StreamChunk`。
