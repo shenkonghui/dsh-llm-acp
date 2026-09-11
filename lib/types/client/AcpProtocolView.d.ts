@@ -14,7 +14,7 @@ export type AcpProtocolViewProps = ConvViewProps & PropsLocale<'settings.acp'> &
 /**
  * Poll all configured ACP servers for their recent protocol trace entries and
  * render them in a scrollable list. The view refreshes every 3 seconds while
- * visible.
+ * visible. Clicking an entry opens a detail pane with the full payload.
  */
 export declare function AcpProtocolView({ api, settingsNs, t, }: AcpProtocolViewProps): JSX.Element;
 //# sourceMappingURL=AcpProtocolView.d.ts.map
