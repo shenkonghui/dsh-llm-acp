@@ -19,6 +19,8 @@ interface ProtocolTraceEntry {
   dir: 'send' | 'recv'
   method: string
   summary: string
+  /** How many consecutive interactions this entry represents (default 1). */
+  count?: number
 }
 
 /** One configured ACP server from settings (mirrors the settings section's type). */
@@ -144,7 +146,12 @@ export function AcpProtocolView({
                   </span>
                   <span className={css.method}>{entry.method}</span>
                   <span className={css.server}>{server}</span>
-                  <span className={css.summary}>{entry.summary}</span>
+                  <span className={css.summary}>
+                    {entry.summary}
+                    {entry.count !== undefined && entry.count > 1 && (
+                      <span className={css.count}>×{entry.count}</span>
+                    )}
+                  </span>
                 </li>
               ))}
             </ul>

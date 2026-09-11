@@ -99,8 +99,10 @@ export interface AcpServerConfig {
 export interface Config {
   /** Extra environment variables merged on top of the scrubbed parent env. */
   env?: Record<string, string>
-  /** Whether to translate `agent_thought_chunk` into `reasoning-delta` chunks (default `false`). */
+  /** Whether to translate `agent_thought_chunk` into `reasoning-delta` chunks (default `true`). */
   emitReasoning?: boolean
+  /** Whether to surface extension progress notifications as reasoning blocks (default `false`). */
+  emitProgress?: boolean
   /** Fallback model id/name when ACP model discovery returns nothing. */
   defaultModelId?: string
   defaultModelName?: string
@@ -140,6 +142,7 @@ export interface Config {
 export const Config: z<Config> = z.object({
   env: z.dict(z.string()).default({}),
   emitReasoning: z.boolean().default(true),
+  emitProgress: z.boolean().default(false),
   defaultModelId: z.string().default('devin'),
   defaultModelName: z.string().default('Devin (ACP)'),
   disposeEofGraceMs: z.number().default(DEFAULT_DISPOSE_EOF_GRACE_MS),
@@ -414,6 +417,7 @@ export function apply(ctx: Context, config: Config): void {
       connection,
       provider: routeName(serverId),
       emitReasoning: resolved.emitReasoning,
+      emitProgress: resolved.emitProgress,
       defaultModel: { id: resolved.defaultModelId, name: resolved.defaultModelName },
       enabledModels: server.models,
       customModels: server.customModels,

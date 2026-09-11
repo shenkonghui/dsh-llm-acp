@@ -29,6 +29,10 @@ export interface AcpAdapterOptions {
   provider: string
   /** Whether to translate `agent_thought_chunk` into `reasoning-delta` chunks. */
   emitReasoning: boolean
+  /** Whether to surface extension progress text (e.g. `_cognition.ai/output`,
+   * `[tool: …]` notes) as reasoning blocks. Off by default: these carry
+   * server log noise rather than model thinking. */
+  emitProgress?: boolean
   /** Model id to fall back to when ACP model discovery returns nothing. */
   defaultModel: { id: string; name: string }
   /**
@@ -337,7 +341,7 @@ export class AcpAdapter extends LlmAdapter {
             // Extension notifications (e.g. Devin's _cognition.ai/output) that
             // carry human-readable progress text. Surface as reasoning so the
             // user sees activity during long operations without model text.
-            if (!emitReasoning || update.text.length === 0) break
+            if (this.config.emitProgress !== true || update.text.length === 0) break
             if (open === undefined || open.type !== 'reasoning') {
               yield* closeOpen()
               open = { type: 'reasoning', index: nextIndex++, text: '' }

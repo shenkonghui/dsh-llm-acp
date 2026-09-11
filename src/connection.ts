@@ -105,6 +105,10 @@ export interface ProtocolTraceEntry {
   method: string
   /** Human-readable summary of the payload. */
   summary: string
+  /** How many consecutive interactions this entry represents (default 1). */
+  count?: number
+  /** Internal merge key; consecutive entries with the same key collapse into one. */
+  collapseKey?: string
 }
 
 /** Maximum protocol trace entries retained (ring buffer). */
@@ -438,9 +442,18 @@ export class AcpConnection {
     return [...this.protocolTrace]
   }
 
-  /** Append one trace entry, evicting the oldest when the buffer is full. */
-  private traceEvent(dir: 'send' | 'recv', method: string, summary: string): void {
-    this.protocolTrace.push({ time: Date.now(), dir, method, summary })
+  /** Append one trace entry, evicting the oldest when the buffer is full.
+   * Consecutive entries sharing `collapseKey` merge into one with a `count`
+   * so per-token stream chunks do not flood the small buffer. */
+  private traceEvent(dir: 'send' | 'recv', method: string, summary: string, collapseKey?: string): void {
+    const last = this.protocolTrace[this.protocolTrace.length - 1]
+    if (collapseKey !== undefined && last !== undefined
+      && last.dir === dir && last.method === method && last.collapseKey === collapseKey) {
+      last.time = Date.now()
+      last.count = (last.count ?? 1) + 1
+      return
+    }
+    this.protocolTrace.push({ time: Date.now(), dir, method, summary, ...collapseKey === undefined ? {} : { collapseKey } })
     while (this.protocolTrace.length > MAX_PROTOCOL_TRACE) this.protocolTrace.shift()
   }
 
@@ -581,8 +594,18 @@ export class AcpConnection {
   private enqueueUpdate(params: SessionNotification): void {
     const entry = this.queues.get(params.sessionId)
     const update = params.update
-    this.traceEvent('recv', 'session/update', `${update.sessionUpdate} sessionId=${params.sessionId}`)
-    if (entry === undefined) return
+    if (entry === undefined) {
+      this.traceEvent('recv', 'session/update-dropped', `${update.sessionUpdate} sessionId=${params.sessionId}`,
+        `drop:${update.sessionUpdate}:${params.sessionId}`)
+      this.spec.onWarn?.(`llm-acp: dropped session/update ${update.sessionUpdate} for unqueued session ${params.sessionId}`)
+      return
+    }
+    const isChunk = update.sessionUpdate === 'agent_thought_chunk' || update.sessionUpdate === 'agent_message_chunk'
+    const preview = isChunk
+      ? ` text=${JSON.stringify(acpContentText(update.content).slice(0, 40))}`
+      : ''
+    this.traceEvent('recv', 'session/update', `${update.sessionUpdate} sessionId=${params.sessionId}${preview}`,
+      isChunk ? `update:${update.sessionUpdate}:${params.sessionId}` : undefined)
     if (update.sessionUpdate === 'agent_message_chunk') {
       entry.queue.push({ kind: 'text', text: acpContentText(update.content) })
     } else if (update.sessionUpdate === 'agent_thought_chunk') {
