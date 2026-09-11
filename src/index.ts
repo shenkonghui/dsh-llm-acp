@@ -23,8 +23,11 @@ import type { Session } from '@deepseek-ai/dsh-session'
 import { AcpAdapter } from './adapter.ts'
 import {
   AcpConnection,
+  DEFAULT_AUTH_TIMEOUT_MS,
   DEFAULT_DISPOSE_EOF_GRACE_MS,
   DEFAULT_DISPOSE_GRACE_MS,
+  DEFAULT_INIT_TIMEOUT_MS,
+  DEFAULT_SESSION_TIMEOUT_MS,
 } from './connection.ts'
 import registryData from './registry.json' with { type: 'json' }
 
@@ -32,8 +35,11 @@ export { AcpAdapter } from './adapter.ts'
 export type { AcpAdapterOptions } from './adapter.ts'
 export {
   AcpConnection,
+  DEFAULT_AUTH_TIMEOUT_MS,
   DEFAULT_DISPOSE_EOF_GRACE_MS,
   DEFAULT_DISPOSE_GRACE_MS,
+  DEFAULT_INIT_TIMEOUT_MS,
+  DEFAULT_SESSION_TIMEOUT_MS,
 } from './connection.ts'
 export type { AcpConnectionSpec } from './connection.ts'
 export type * from './types.ts'
@@ -103,6 +109,23 @@ export interface Config {
   /** Termination-escalation grace (ms) after SIGTERM before SIGKILL; must not exceed `MAX_TIMER_DELAY_MS`. */
   disposeGraceMs?: number
   /**
+   * Bound (ms) on the ACP `initialize` handshake plus any keyed `authenticate`
+   * round; must not exceed `MAX_TIMER_DELAY_MS`. Covers `npx` cold fetches, so
+   * keep it generous.
+   */
+  initTimeoutMs?: number
+  /**
+   * Bound (ms) on `session/new`, `session/load`, `session/list`, and
+   * `session/set_config_option`; must not exceed `MAX_TIMER_DELAY_MS`.
+   */
+  sessionTimeoutMs?: number
+  /**
+   * Bound (ms) on one `authenticate` round — the eager keyed attempt during
+   * `initialize`, or the lazy key-less attempt after a failed `session/new`;
+   * must not exceed `MAX_TIMER_DELAY_MS`.
+   */
+  authTimeoutMs?: number
+  /**
    * Working directory for child processes. A relative path resolves against the
    * harness launch directory at load. When omitted, the harness process cwd is used.
    */
@@ -121,6 +144,9 @@ export const Config: z<Config> = z.object({
   defaultModelName: z.string().default('Devin (ACP)'),
   disposeEofGraceMs: z.number().default(DEFAULT_DISPOSE_EOF_GRACE_MS),
   disposeGraceMs: z.number().default(DEFAULT_DISPOSE_GRACE_MS),
+  initTimeoutMs: z.number().default(DEFAULT_INIT_TIMEOUT_MS),
+  sessionTimeoutMs: z.number().default(DEFAULT_SESSION_TIMEOUT_MS),
+  authTimeoutMs: z.number().default(DEFAULT_AUTH_TIMEOUT_MS),
   cwd: z.string(),
   servers: z.dict(z.object({
     command: z.string().required(),
@@ -295,6 +321,9 @@ export function apply(ctx: Context, config: Config): void {
   const resolved = config as ResolvedConfig
   assertPositiveFinite('disposeEofGraceMs', resolved.disposeEofGraceMs)
   assertPositiveFinite('disposeGraceMs', resolved.disposeGraceMs)
+  assertPositiveFinite('initTimeoutMs', resolved.initTimeoutMs)
+  assertPositiveFinite('sessionTimeoutMs', resolved.sessionTimeoutMs)
+  assertPositiveFinite('authTimeoutMs', resolved.authTimeoutMs)
   const cwd = config.cwd === undefined || config.cwd === ''
     ? process.cwd()
     : assertUsableCwd('config cwd', resolve(config.cwd))
@@ -360,14 +389,19 @@ export function apply(ctx: Context, config: Config): void {
       env: serverEnv,
       disposeEofGraceMs: resolved.disposeEofGraceMs,
       disposeGraceMs: resolved.disposeGraceMs,
+      initTimeoutMs: resolved.initTimeoutMs,
+      sessionTimeoutMs: resolved.sessionTimeoutMs,
+      authTimeoutMs: resolved.authTimeoutMs,
       spawn: spec => ctx.subprocess.spawn(spec),
       onWarn: message => ctx.logger.warn(message),
       onAuthUrl: openBrowser,
       // Resolve an API key from the server's configured env. When present,
-      // it is passed via _meta.api_key so ACP servers that accept direct
-      // key auth skip interactive flows. When absent, authenticate is not
-      // called, letting servers with cached credentials (e.g. codebuddy)
-      // use their own stored session.
+      // it is passed via _meta.api_key in an eager authenticate round so ACP
+      // servers that accept direct key auth skip interactive flows. When
+      // absent, no authenticate call is made up front: servers using env
+      // credentials or a cached login go straight to session/new, and only
+      // a failed session/new triggers one lazy authenticate round — so a
+      // healthy server never opens a browser login it did not need.
       resolveAuthApiKey: async () => {
         for (const key of ['DEEPSEEK_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'DEVIN_API_KEY', 'API_KEY', 'CODEBUDDY_API_KEY', 'LLM_API_KEY']) {
           const value = serverEnv[key]

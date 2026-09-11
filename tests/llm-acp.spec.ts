@@ -23,6 +23,7 @@ import * as acp from '../src/index.ts'
 import LocalSubprocessRuntime from '@deepseek-ai/dsh-subprocess-local'
 
 const mockServer = fileURLToPath(new URL('../../deepseek-harness/packages/subagent/subagent-acp/tests/mock-acp-server.ts', import.meta.url))
+const authMockServer = fileURLToPath(new URL('./mock-acp-auth-server.ts', import.meta.url))
 
 interface SetupEnv {
   [key: string]: string
@@ -31,10 +32,14 @@ interface SetupEnv {
 /**
  * Mount the ACP LLM adapter pointed at the mock server, scripted by `mockEnv`.
  * `emitReasoning` selects whether thought chunks become reasoning-delta.
+ * `server` overrides the spawned fixture (default: the shared mock server);
+ * `config` merges extra plugin config (e.g. shorter timeouts).
  */
 async function setup(mockEnv: SetupEnv = {}, opts: {
   emitReasoning?: boolean
   permissionPreset?: 'read-only' | 'workspace-write' | 'danger-full-access'
+  server?: { command: string; args: string[] }
+  config?: Record<string, unknown>
 } = {}) {
   const ctx = new Context()
   await ctx.plugin(Loader)
@@ -50,13 +55,29 @@ async function setup(mockEnv: SetupEnv = {}, opts: {
   }
   await ctx.plugin(LlmRuntime)
   await ctx.plugin(LocalSubprocessRuntime)
+  // Minimal `settings` seam stub: the plugin's `installSection` call fails on
+  // `ctx.settings === undefined`, which aborts `apply` and rolls back every
+  // registered adapter. A static source is enough — tests never edit settings.
+  ctx.provide('settings' as never, {
+    installSection(
+      _owner: unknown,
+      _ns: string,
+      _schema: unknown,
+      entry: unknown,
+      hooks: { setSource: (source: () => unknown) => void },
+    ) {
+      hooks.setSource(() => entry)
+    },
+  } as never)
+  const server = opts.server ?? { command: process.execPath, args: [mockServer] }
   await ctx.plugin(acp, {
     emitReasoning: opts.emitReasoning ?? false,
     env: mockEnv,
+    ...opts.config,
     servers: {
       test: {
-        command: process.execPath,
-        args: [mockServer],
+        command: server.command,
+        args: server.args,
         name: 'Test ACP',
       },
     },
@@ -97,6 +118,10 @@ function fakeAgent(): Agent {
   return {
     session: {
       events,
+      // `approval.request` walks the log backwards via `seq`/`eventAt` to prove
+      // an open turn; a bare `events` array is not enough for that check.
+      get seq() { return events.length },
+      eventAt: (seq: number) => events[seq],
       append: (type: string, data: Record<string, unknown>) => {
         const event = { type, data }
         events.push(event)
@@ -262,4 +287,88 @@ describe('dsh-llm-acp', () => {
       await ctx.fiber.dispose()
     }
   })
+
+  it('never calls authenticate when session/new succeeds without it', async () => {
+    // The fixture advertises an auth method but exits the process if
+    // `authenticate` is ever called — the stream can only succeed when the
+    // connection goes straight to session/new.
+    const ctx = await setup(
+      { MOCK_AUTH_METHODS: '1', MOCK_AUTH_POISON: '1', MOCK_TEXT: 'no auth needed' },
+      { server: { command: process.execPath, args: [authMockServer] } },
+    )
+    try {
+      const chunks = await collect(ctx.llm.stream({
+        provider: 'acp-test',
+        model: 'any',
+        messages: [createUserMessage({ content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } })],
+      }))
+      expect(assembledText(chunks)).toBe('no auth needed')
+      expect(finishChunk(chunks).reason.kind).toBe('stop')
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('runs one lazy authenticate round when session/new requires auth', async () => {
+    // session/new fails until authenticate runs; the connection must recover
+    // via one bounded auth round and a retry, not hang or fail outright.
+    const ctx = await setup(
+      { MOCK_AUTH_METHODS: '1', MOCK_REQUIRE_AUTH: '1', MOCK_TEXT: 'authed answer' },
+      { server: { command: process.execPath, args: [authMockServer] } },
+    )
+    try {
+      const chunks = await collect(ctx.llm.stream({
+        provider: 'acp-test',
+        model: 'any',
+        messages: [createUserMessage({ content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } })],
+      }))
+      expect(assembledText(chunks)).toBe('authed answer')
+      expect(finishChunk(chunks).reason.kind).toBe('stop')
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('fails the stream when initialize never answers within initTimeoutMs', async () => {
+    const ctx = await setup(
+      { MOCK_SILENT_INIT: '1' },
+      { server: { command: process.execPath, args: [authMockServer] }, config: { initTimeoutMs: 800, disposeEofGraceMs: 500 } },
+    )
+    try {
+      const chunks = await collect(ctx.llm.stream({
+        provider: 'acp-test',
+        model: 'any',
+        messages: [createUserMessage({ content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } })],
+      }))
+      const reason = finishChunk(chunks).reason
+      expect(reason.kind).toBe('error')
+      if (reason.kind === 'error') expect(reason.failure.code).toBe('ACP_INIT_FAILED')
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  }, 30_000)
+
+  it('settles an aborted prompt when the server ignores session/cancel', async () => {
+    // MOCK_HANG + MOCK_IGNORE_CANCEL: the prompt never resolves on its own and
+    // the child never answers the cancel — the client must still settle the
+    // stream as aborted after the cancel grace.
+    const ctx = await setup({ MOCK_HANG: '1', MOCK_IGNORE_CANCEL: '1', MOCK_TEXT: 'chunk' })
+    const controller = new AbortController()
+    try {
+      const chunks: StreamChunk[] = []
+      for await (const chunk of ctx.llm.stream({
+        provider: 'acp-test',
+        model: 'any',
+        signal: controller.signal,
+        messages: [createUserMessage({ content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } })],
+      })) {
+        chunks.push(chunk)
+        if (chunk.type === 'text-delta') controller.abort()
+      }
+      const reason = finishChunk(chunks).reason
+      expect(reason.kind).toBe('aborted')
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  }, 30_000)
 })

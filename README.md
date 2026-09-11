@@ -81,7 +81,8 @@ dsh harness 启动
        ├─ 对每个服务器 createServer()：
        │    ├─ resolveNpxShortcut()：npx -y <pkg> 若 bin 已在 PATH 则直接用 bin
        │    ├─ new AcpConnection()：spawn 长生命周期子进程（stdin/stdout JSON-RPC）
-       │    │    └─ initialize() 握手 → 按需 authenticate()（用配置的 API key）
+       │    │    └─ initialize() 握手 → 仅配置了 API key 时才 authenticate()
+       │    │       （无 key 直接走 env/缓存登录；session/new 失败才惰性补一次 authenticate）
        │    ├─ new AcpAdapter()：构造时 discoverModels() 探测模型目录
        │    └─ ctx.llm.registerAdapter(['acp-<server-id>'], adapter)
        └─ reconcileDirectory()：向设置页注册可配置 provider 目录
@@ -151,6 +152,9 @@ binary 类型使用可执行文件的 basename，这样已安装到 PATH 的二�
 | `defaultModelName` | `GLM-5.2 High` | 回退模型显示名称。 |
 | `disposeEofGraceMs` | `6000` | stdin EOF 后等待平台终止的宽限时间（毫秒）。 |
 | `disposeGraceMs` | `3000` | SIGTERM 后等待 SIGKILL 的 POSIX 宽限时间（毫秒）。 |
+| `initTimeoutMs` | `120000` | `initialize` 握手（含 keyed `authenticate`）的上限（毫秒）。 |
+| `sessionTimeoutMs` | `60000` | `session/new`、`session/load`、`session/list`、`session/set_config_option` 的上限（毫秒）。 |
+| `authTimeoutMs` | `15000` | 单次 `authenticate` 调用的上限（毫秒）。 |
 
 ## 协议契约
 
@@ -192,6 +196,7 @@ pnpm build    # tsc -b && tsdown
 - **全量历史重发** — 适配器将整个 `messages` 数组渲染为一条用户消息。
 - **ACP v1（SDK 0.25.1）** — 适配器使用 `@agentclientprotocol/sdk` 0.25.1，其 `session/prompt` 响应携带终态 `stopReason`（v1 契约）。
 - **扩展协议处理** — Devin 的 `_cognition.ai/*` 通知被静默消费（进度文本在 `emitReasoning` 开启时作为 reasoning 输出）；其他非标准 ACP 扩展被吞掉以避免 SDK 错误日志。
+- **认证惰性化** — 未配置 API key 时不主动调用 `authenticate`：依赖 env 凭证或 CLI 缓存登录的 server 直接 `session/new` 成功；仅当 `session/new`/`session/load` 失败才执行一次有界（`authTimeoutMs`）的 `authenticate` 并重试。交互式浏览器登录只在确实需要时触发，URL 同时经警告日志与设置页 `acp-auth-<id>` 路由暴露。
 
 ## 许可证
 

@@ -1,14 +1,16 @@
 /**
  * Long-lived ACP client connection: spawns one external ACP server subprocess
  * at plugin load and drives it over JSON-RPC stdio. Each {@link AcpConnection.promptStream}
- * call creates a fresh ACP session, sends one user message, and yields the
+ * call targets one ACP session, sends one user message, and yields the
  * streamed assistant text/reasoning chunks plus a terminal stop reason.
  *
- * The connection is deliberately stateless across prompts (no session reuse):
- * every prompt creates a new ACP session and sends the full conversation as a
- * single user message. This avoids cross-prompt state synchronization with the
- * remote agent and stays safe under compaction/fork, at the cost of remote KV
- * cache reuse.
+ * Authentication is lazy: `authenticate` runs eagerly only when a configured
+ * API key resolves, and otherwise only after a `session/new`/`session/load`
+ * failure — servers that accept env credentials or a cached login never see
+ * an `authenticate` call, so a healthy server never triggers a browser login
+ * it did not need. Every handshake and session operation is bounded by its
+ * configured timeout so a wedged server fails fast instead of hanging the
+ * harness.
  *
  * @module @deepseek-ai/dsh-llm-acp/connection
  */
@@ -18,6 +20,12 @@ import type { SubprocessHandle, SubprocessSpawnSpec } from '@deepseek-ai/dsh-sub
 export declare const DEFAULT_DISPOSE_EOF_GRACE_MS = 6000;
 /** Default POSIX grace between SIGTERM and SIGKILL on dispose. */
 export declare const DEFAULT_DISPOSE_GRACE_MS = 3000;
+/** Default bound on the `initialize` handshake plus any keyed `authenticate` round. */
+export declare const DEFAULT_INIT_TIMEOUT_MS = 120000;
+/** Default bound on `session/new`, `session/load`, and `session/set_config_option`. */
+export declare const DEFAULT_SESSION_TIMEOUT_MS = 60000;
+/** Default bound on one `authenticate` round, keyed or key-less. */
+export declare const DEFAULT_AUTH_TIMEOUT_MS = 15000;
 /** One queued update delivered to a {@link AcpConnection.promptStream} consumer. */
 type QueuedUpdate = {
     kind: 'text';
@@ -67,6 +75,12 @@ export interface AcpConnectionSpec {
     disposeEofGraceMs: number;
     /** Termination-escalation grace (ms) after SIGTERM before SIGKILL. */
     disposeGraceMs: number;
+    /** Bound (ms) on the `initialize` handshake plus any keyed `authenticate` round. */
+    initTimeoutMs: number;
+    /** Bound (ms) on `session/new`, `session/load`, and `session/set_config_option`. */
+    sessionTimeoutMs: number;
+    /** Bound (ms) on one `authenticate` round, keyed or key-less. */
+    authTimeoutMs: number;
     /** Spawn function from the subprocess seam (`ctx.subprocess.spawn`). */
     spawn: (spec: SubprocessSpawnSpec) => SubprocessHandle;
     /** Sink for connection-level warnings (wired to `ctx.logger.warn`). */
@@ -106,6 +120,15 @@ export declare class AcpConnection {
     private agentInfo;
     /** Negotiated ACP protocol version from the `initialize` response. */
     private protocolVersion;
+    /** Auth methods advertised in the `initialize` response. */
+    private authMethods;
+    /**
+     * The connection's single `authenticate` round — the eager keyed attempt
+     * during `initialize`, or the lazy key-less attempt started on the first
+     * `session/new`/`session/load` failure. Set at most once; a second round
+     * cannot succeed where the first did not.
+     */
+    private authRound;
     /**
      * Browser login URL published via the `_codebuddy.ai/authUrl` extension
      * notification while an interactive `authenticate` round is in flight.
@@ -148,17 +171,37 @@ export declare class AcpConnection {
      */
     getPendingAuthUrl(): string | undefined;
     /**
-     * Call `authenticate` when the server advertises auth methods. A resolved
-     * API key is passed as `_meta.api_key` for servers that accept direct key
-     * authentication. Without a key, `authenticate` is still attempted once
-     * with the first advertised method: servers with cached credentials
-     * (e.g. codebuddy) resolve that call immediately — and only then accept
-     * `session/new`. The key-less attempt is bounded and best-effort: on
-     * timeout or error the connection still comes up, and a browser login
-     * URL published via the `_codebuddy.ai/authUrl` extension notification is
-     * surfaced in the warning so the user can complete an interactive login.
+     * Eager `authenticate` round, run during `initialize` only when the server
+     * advertises auth methods AND a configured API key resolves. The key rides
+     * as `_meta.api_key` for servers that accept direct key authentication; an
+     * API-key-shaped method is preferred over an interactive OAuth one when
+     * several are advertised. Without a key no `authenticate` call is made:
+     * servers that accept env credentials or a cached login go straight to
+     * `session/new`, and servers that truly require an interactive round reach
+     * it lazily through {@link ensureAuthenticated} on the first failed
+     * `session/new` — so a well-configured server never triggers a browser
+     * login it did not need.
      */
-    private authenticateIfNeeded;
+    private authenticateWithKey;
+    /**
+     * The connection's single key-less `authenticate` round, started lazily by
+     * {@link withAuthRetry} when `session/new`/`session/load` fails on a server
+     * that advertised auth methods. Servers with cached credentials (e.g.
+     * codebuddy) resolve the call immediately — and only then accept
+     * `session/new`. The round is bounded and best-effort: on timeout or error
+     * the connection stays usable, and a browser login URL published via the
+     * `_codebuddy.ai/authUrl` extension notification is surfaced in the
+     * warning so the user can complete an interactive login.
+     */
+    private ensureAuthenticated;
+    /**
+     * Run one session operation bounded by `sessionTimeoutMs`. On failure —
+     * once, and only while no `authenticate` round has run yet and the server
+     * advertised auth methods — run {@link ensureAuthenticated} and retry.
+     * This is the lazy-auth path: servers that accept env credentials or a
+     * cached login never see an `authenticate` call at all.
+     */
+    private withAuthRetry;
     /** Resolve one ACP permission request through its owning session. */
     private requestPermission;
     /** Select an advertised rejection option, or cancel when none is available. */

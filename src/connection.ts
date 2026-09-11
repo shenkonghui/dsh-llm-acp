@@ -1,14 +1,16 @@
 /**
  * Long-lived ACP client connection: spawns one external ACP server subprocess
  * at plugin load and drives it over JSON-RPC stdio. Each {@link AcpConnection.promptStream}
- * call creates a fresh ACP session, sends one user message, and yields the
+ * call targets one ACP session, sends one user message, and yields the
  * streamed assistant text/reasoning chunks plus a terminal stop reason.
  *
- * The connection is deliberately stateless across prompts (no session reuse):
- * every prompt creates a new ACP session and sends the full conversation as a
- * single user message. This avoids cross-prompt state synchronization with the
- * remote agent and stays safe under compaction/fork, at the cost of remote KV
- * cache reuse.
+ * Authentication is lazy: `authenticate` runs eagerly only when a configured
+ * API key resolves, and otherwise only after a `session/new`/`session/load`
+ * failure — servers that accept env credentials or a cached login never see
+ * an `authenticate` call, so a healthy server never triggers a browser login
+ * it did not need. Every handshake and session operation is bounded by its
+ * configured timeout so a wedged server fails fast instead of hanging the
+ * harness.
  *
  * @module @deepseek-ai/dsh-llm-acp/connection
  */
@@ -39,18 +41,48 @@ import type { SubprocessHandle, SubprocessSpawnSpec } from '@deepseek-ai/dsh-sub
 export const DEFAULT_DISPOSE_EOF_GRACE_MS = 6_000
 
 /**
- * How long to wait for a key-less `authenticate` round before continuing
- * without it. Servers with cached credentials (e.g. codebuddy) resolve in
- * well under a second; an interactive browser flow keeps running
- * server-side and settles later, after the user completes the login.
+ * Grace after `session/cancel` for the server to settle a hanging prompt.
+ * A non-cooperative server may never answer the cancel; the pending drain
+ * is force-settled as `cancelled` once this elapses so consumers are not
+ * stuck on a dead prompt.
  */
-const KEYLESS_AUTH_TIMEOUT_MS = 15_000
+const CANCEL_SETTLE_GRACE_MS = 5_000
 
 /** Resolve after `ms` milliseconds. */
 const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms))
 
+/** Reject `operation` with a labelled error when it does not settle within `ms`. */
+function withTimeout<T>(operation: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`llm-acp: ${label} timed out after ${ms}ms`)), ms)
+    operation.then(
+      value => { clearTimeout(timer); resolve(value) },
+      (error: unknown) => { clearTimeout(timer); reject(error instanceof Error ? error : new Error(String(error))) },
+    )
+  })
+}
+
+/**
+ * Prefer an API-key-shaped auth method when several are advertised: the
+ * first advertised method is often an interactive OAuth flow, which a keyed
+ * `authenticate` call must not select.
+ */
+function pickAuthMethod(methods: readonly AuthMethod[]): AuthMethod | undefined {
+  const keyed = methods.find(m => /api[-_]?key|token|credential/i.test(`${m.id} ${m.name}`))
+  return keyed ?? methods[0]
+}
+
 /** Default POSIX grace between SIGTERM and SIGKILL on dispose. */
 export const DEFAULT_DISPOSE_GRACE_MS = 3_000
+
+/** Default bound on the `initialize` handshake plus any keyed `authenticate` round. */
+export const DEFAULT_INIT_TIMEOUT_MS = 120_000
+
+/** Default bound on `session/new`, `session/load`, and `session/set_config_option`. */
+export const DEFAULT_SESSION_TIMEOUT_MS = 60_000
+
+/** Default bound on one `authenticate` round, keyed or key-less. */
+export const DEFAULT_AUTH_TIMEOUT_MS = 15_000
 
 /** One queued update delivered to a {@link AcpConnection.promptStream} consumer. */
 type QueuedUpdate =
@@ -171,6 +203,12 @@ export interface AcpConnectionSpec {
   disposeEofGraceMs: number
   /** Termination-escalation grace (ms) after SIGTERM before SIGKILL. */
   disposeGraceMs: number
+  /** Bound (ms) on the `initialize` handshake plus any keyed `authenticate` round. */
+  initTimeoutMs: number
+  /** Bound (ms) on `session/new`, `session/load`, and `session/set_config_option`. */
+  sessionTimeoutMs: number
+  /** Bound (ms) on one `authenticate` round, keyed or key-less. */
+  authTimeoutMs: number
   /** Spawn function from the subprocess seam (`ctx.subprocess.spawn`). */
   spawn: (spec: SubprocessSpawnSpec) => SubprocessHandle
   /** Sink for connection-level warnings (wired to `ctx.logger.warn`). */
@@ -211,6 +249,15 @@ export class AcpConnection {
   private agentInfo: Implementation | undefined
   /** Negotiated ACP protocol version from the `initialize` response. */
   private protocolVersion: number | undefined
+  /** Auth methods advertised in the `initialize` response. */
+  private authMethods: AuthMethod[] | undefined
+  /**
+   * The connection's single `authenticate` round — the eager keyed attempt
+   * during `initialize`, or the lazy key-less attempt started on the first
+   * `session/new`/`session/load` failure. Set at most once; a second round
+   * cannot succeed where the first did not.
+   */
+  private authRound: Promise<void> | undefined
   /**
    * Browser login URL published via the `_codebuddy.ai/authUrl` extension
    * notification while an interactive `authenticate` round is in flight.
@@ -253,7 +300,11 @@ export class AcpConnection {
         NodeReadable.toWeb(this.child.stdout) as ReadableStream<Uint8Array>,
       ),
     )
-    this.readyPromise = this.initialize()
+    this.readyPromise = withTimeout(
+      this.initialize(),
+      spec.initTimeoutMs,
+      `initialize of "${spec.command}"`,
+    )
   }
 
   /** Resolves when the ACP server has completed `initialize`. */
@@ -282,8 +333,9 @@ export class AcpConnection {
     this.sessionCapabilities = initResult.agentCapabilities?.sessionCapabilities
     this.agentInfo = initResult.agentInfo ?? undefined
     this.protocolVersion = initResult.protocolVersion
+    this.authMethods = initResult.authMethods ?? undefined
     try {
-      await this.authenticateIfNeeded(initResult)
+      await this.authenticateWithKey()
     } catch (error: unknown) {
       throw new Error(
         `ACP server "${this.spec.command}" failed to authenticate: ${error instanceof Error ? error.message : String(error)}`,
@@ -339,49 +391,93 @@ export class AcpConnection {
   }
 
   /**
-   * Call `authenticate` when the server advertises auth methods. A resolved
-   * API key is passed as `_meta.api_key` for servers that accept direct key
-   * authentication. Without a key, `authenticate` is still attempted once
-   * with the first advertised method: servers with cached credentials
-   * (e.g. codebuddy) resolve that call immediately — and only then accept
-   * `session/new`. The key-less attempt is bounded and best-effort: on
-   * timeout or error the connection still comes up, and a browser login
-   * URL published via the `_codebuddy.ai/authUrl` extension notification is
-   * surfaced in the warning so the user can complete an interactive login.
+   * Eager `authenticate` round, run during `initialize` only when the server
+   * advertises auth methods AND a configured API key resolves. The key rides
+   * as `_meta.api_key` for servers that accept direct key authentication; an
+   * API-key-shaped method is preferred over an interactive OAuth one when
+   * several are advertised. Without a key no `authenticate` call is made:
+   * servers that accept env credentials or a cached login go straight to
+   * `session/new`, and servers that truly require an interactive round reach
+   * it lazily through {@link ensureAuthenticated} on the first failed
+   * `session/new` — so a well-configured server never triggers a browser
+   * login it did not need.
    */
-  private async authenticateIfNeeded(initResult: InitializeResponse): Promise<void> {
-    const methods: AuthMethod[] | undefined = initResult.authMethods
+  private async authenticateWithKey(): Promise<void> {
+    const methods = this.authMethods
     if (methods === undefined || methods.length === 0) return
-    const method = methods[0]
-    if (method === undefined) return
     const apiKey = this.spec.resolveAuthApiKey !== undefined
       ? await this.spec.resolveAuthApiKey().catch(() => undefined)
       : undefined
-    if (apiKey !== undefined) {
-      await this.conn.authenticate({ methodId: method.id, _meta: { api_key: apiKey } })
-      return
-    }
-    this.pendingAuthUrl = undefined
-    const attempt = this.conn.authenticate({ methodId: method.id })
-    const settled = await Promise.race([
-      attempt.then(
-        () => ({ done: true as const, error: undefined }),
-        (error: unknown) => ({ done: true as const, error }),
-      ),
-      sleep(KEYLESS_AUTH_TIMEOUT_MS).then(() => ({ done: false as const, error: undefined })),
-    ])
-    if (settled.done) {
-      if (settled.error !== undefined) {
-        const message = settled.error instanceof Error ? settled.error.message : String(settled.error)
-        this.spec.onWarn?.(`llm-acp: key-less authentication for "${this.spec.command}" failed: ${message}`)
-      }
-      return
-    }
-    const url = this.pendingAuthUrl
-    this.spec.onWarn?.(
-      `llm-acp: interactive authentication for "${this.spec.command}" is still pending after ${KEYLESS_AUTH_TIMEOUT_MS}ms`
-      + (url !== undefined ? ` — complete the login in a browser: ${url}` : ''),
+    if (apiKey === undefined) return
+    const method = pickAuthMethod(methods)
+    if (method === undefined) return
+    this.authRound = withTimeout(
+      this.conn.authenticate({ methodId: method.id, _meta: { api_key: apiKey } }).then(() => {}),
+      this.spec.authTimeoutMs,
+      'authenticate',
     )
+    await this.authRound
+  }
+
+  /**
+   * The connection's single key-less `authenticate` round, started lazily by
+   * {@link withAuthRetry} when `session/new`/`session/load` fails on a server
+   * that advertised auth methods. Servers with cached credentials (e.g.
+   * codebuddy) resolve the call immediately — and only then accept
+   * `session/new`. The round is bounded and best-effort: on timeout or error
+   * the connection stays usable, and a browser login URL published via the
+   * `_codebuddy.ai/authUrl` extension notification is surfaced in the
+   * warning so the user can complete an interactive login.
+   */
+  private ensureAuthenticated(): Promise<void> {
+    if (this.authRound !== undefined) return this.authRound
+    // Key-less auth uses the first advertised method — the server's default,
+    // which is the method its cached-credential and interactive flows share.
+    const method = this.authMethods?.[0]
+    if (method === undefined) return Promise.resolve()
+    this.pendingAuthUrl = undefined
+    this.authRound = (async (): Promise<void> => {
+      const attempt = this.conn.authenticate({ methodId: method.id })
+      const settled = await Promise.race([
+        attempt.then(
+          () => ({ done: true as const, error: undefined }),
+          (error: unknown) => ({ done: true as const, error }),
+        ),
+        sleep(this.spec.authTimeoutMs).then(() => ({ done: false as const, error: undefined })),
+      ])
+      if (settled.done) {
+        if (settled.error !== undefined) {
+          const message = settled.error instanceof Error ? settled.error.message : String(settled.error)
+          this.spec.onWarn?.(`llm-acp: key-less authentication for "${this.spec.command}" failed: ${message}`)
+        }
+        return
+      }
+      const url = this.pendingAuthUrl
+      this.spec.onWarn?.(
+        `llm-acp: interactive authentication for "${this.spec.command}" is still pending after ${this.spec.authTimeoutMs}ms`
+        + (url !== undefined ? ` — complete the login in a browser: ${url}` : ''),
+      )
+    })()
+    return this.authRound
+  }
+
+  /**
+   * Run one session operation bounded by `sessionTimeoutMs`. On failure —
+   * once, and only while no `authenticate` round has run yet and the server
+   * advertised auth methods — run {@link ensureAuthenticated} and retry.
+   * This is the lazy-auth path: servers that accept env credentials or a
+   * cached login never see an `authenticate` call at all.
+   */
+  private async withAuthRetry<T>(label: string, call: () => Promise<T>): Promise<T> {
+    try {
+      return await withTimeout(call(), this.spec.sessionTimeoutMs, label)
+    } catch (error: unknown) {
+      if (this.authRound !== undefined || this.authMethods === undefined || this.authMethods.length === 0) throw error
+      const message = error instanceof Error ? error.message : String(error)
+      this.spec.onWarn?.(`llm-acp: ${label} failed for "${this.spec.command}" (${message}); running one authenticate round then retrying`)
+      await this.ensureAuthenticated()
+      return await withTimeout(call(), this.spec.sessionTimeoutMs, label)
+    }
   }
 
   /** Resolve one ACP permission request through its owning session. */
@@ -524,7 +620,8 @@ export class AcpConnection {
    * @returns the remote session id.
    */
   async newSession(): Promise<string> {
-    const session = await this.conn.newSession({ cwd: this.spec.cwd, mcpServers: [] })
+    const session = await this.withAuthRetry('session/new', () =>
+      this.conn.newSession({ cwd: this.spec.cwd, mcpServers: [] }))
     const returnedId: unknown = Reflect.get(session, 'sessionId')
     if (typeof returnedId !== 'string') {
       throw new Error('llm-acp: ACP server published a session without a string sessionId')
@@ -540,7 +637,8 @@ export class AcpConnection {
    * @returns the config options published by the server, or `undefined`.
    */
   async loadSession(sessionId: string): Promise<SessionConfigOption[] | undefined> {
-    const session = await this.conn.loadSession({ sessionId, cwd: this.spec.cwd, mcpServers: [] })
+    const session = await this.withAuthRetry('session/load', () =>
+      this.conn.loadSession({ sessionId, cwd: this.spec.cwd, mcpServers: [] }))
     const configOptions: Array<SessionConfigOption> | null | undefined = Reflect.get(session, 'configOptions')
     return configOptions ?? undefined
   }
@@ -554,7 +652,11 @@ export class AcpConnection {
    */
   async listSessions(cursor?: string): Promise<{ sessions: SessionInfo[]; nextCursor?: string } | undefined> {
     if (!this.supportsListSessions) return undefined
-    const result = await this.conn.listSessions({ cursor: cursor ?? null })
+    const result = await withTimeout(
+      this.conn.listSessions({ cursor: cursor ?? null }),
+      this.spec.sessionTimeoutMs,
+      'session/list',
+    )
     const nextCursor = result.nextCursor
     return nextCursor !== null && nextCursor !== undefined
       ? { sessions: result.sessions, nextCursor }
@@ -600,7 +702,8 @@ export class AcpConnection {
    */
   async discoverConfigOptions(): Promise<readonly SessionConfigOption[] | undefined> {
     await this.ready
-    const session = await this.conn.newSession({ cwd: this.spec.cwd, mcpServers: [] })
+    const session = await this.withAuthRetry('session/new', () =>
+      this.conn.newSession({ cwd: this.spec.cwd, mcpServers: [] }))
     const configOptions: Array<SessionConfigOption> | null | undefined = Reflect.get(session, 'configOptions')
     const sessionId: unknown = Reflect.get(session, 'sessionId')
     if (typeof sessionId === 'string') {
@@ -641,7 +744,11 @@ export class AcpConnection {
    * @param modelId - the model value id to select.
    */
   async setSessionModel(sessionId: string, modelId: string): Promise<void> {
-    await this.conn.setSessionConfigOption({ sessionId, configId: 'model', value: modelId })
+    await withTimeout(
+      this.conn.setSessionConfigOption({ sessionId, configId: 'model', value: modelId }),
+      this.spec.sessionTimeoutMs,
+      'session/set_config_option',
+    )
   }
 
   /**
@@ -667,10 +774,20 @@ export class AcpConnection {
   ): AsyncGenerator<QueuedUpdate> {
     const entry: SessionQueue = { queue: [], resolve: undefined, permissionRequester, signal }
     this.queues.set(sessionId, entry)
+    // On abort the server gets `session/cancel`; a non-cooperative server may
+    // never answer it, so after CANCEL_SETTLE_GRACE_MS the pending drain is
+    // force-settled as `cancelled` instead of waiting on a dead prompt.
+    let cancelTimer: ReturnType<typeof setTimeout> | undefined
     const onAbort = (): void => {
       void this.conn.cancel({ sessionId }).catch(() => { /* child gone */ })
+      cancelTimer = setTimeout(() => {
+        entry.queue.push({ kind: 'done', reason: 'cancelled' })
+        this.signal(entry)
+      }, CANCEL_SETTLE_GRACE_MS)
     }
     signal.addEventListener('abort', onAbort, { once: true })
+    // An already-aborted signal never fires 'abort' again — settle now.
+    if (signal.aborted) onAbort()
     const settled = this.conn.prompt({ sessionId, prompt }).then(
       (result) => {
         const stopReason: StopReason | undefined = Reflect.get(result, 'stopReason')
@@ -691,6 +808,7 @@ export class AcpConnection {
       }
     } finally {
       signal.removeEventListener('abort', onAbort)
+      if (cancelTimer !== undefined) clearTimeout(cancelTimer)
       this.queues.delete(sessionId)
     }
   }

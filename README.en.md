@@ -86,6 +86,9 @@ Binary entries use the executable basename so a PATH-installed binary is found d
 | `defaultModelName` | `GLM-5.2 High` | Fallback model display name. |
 | `disposeEofGraceMs` | `6000` | Positive grace after stdin EOF before platform termination. |
 | `disposeGraceMs` | `3000` | Positive POSIX grace after SIGTERM before SIGKILL. |
+| `initTimeoutMs` | `120000` | Bound on the `initialize` handshake (plus any keyed `authenticate` round). |
+| `sessionTimeoutMs` | `60000` | Bound on `session/new`, `session/load`, `session/list`, and `session/set_config_option`. |
+| `authTimeoutMs` | `15000` | Bound on one `authenticate` round. |
 
 ## Protocol contract
 
@@ -121,12 +124,12 @@ Built artifacts are committed to the repository, so `pnpm install` alone is suff
 ## Known Limitations and Deferred Work
 
 - **No harness tool ecosystem** — the ACP server executes its own tools; harness `GenerateOptions.tools` is ignored.
-- **No session reuse** — every `stream()` call creates a fresh ACP session and re-sends the full conversation.
 - **No token usage** — ACP v1 does not deliver token accounting; the adapter emits no `usage` chunk.
 - **System prompt is in-band** — ACP `session/new` has no system slot, so the harness system prompt is prepended to the user message text.
-- **Full-history re-send** — the adapter renders the entire `messages` array into one user message.
+- **Full-history re-send without `session/load`** — when the agent does not advertise `loadSession`, the adapter renders the entire `messages` array into one user message per call.
 - **ACP v1 (SDK 0.25.1)** — the adapter uses `@agentclientprotocol/sdk` 0.25.1, whose `session/prompt` response carries the terminal `stopReason` (v1 contract).
 - **Extension protocol handling** — Devin's `_cognition.ai/*` notifications are consumed silently (progress text surfaced as reasoning when `emitReasoning` is on); other non-standard ACP extensions are swallowed to prevent SDK error logs.
+- **Lazy authentication** — with no configured API key, `authenticate` is not called up front: servers accepting env credentials or a cached login go straight to `session/new`. Only a failed `session/new`/`session/load` triggers one bounded (`authTimeoutMs`) `authenticate` round plus a retry, so an interactive browser login only fires when genuinely required; the URL is surfaced via the warning log and the `acp-auth-<id>` settings route.
 
 ## License
 

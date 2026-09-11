@@ -15,8 +15,11 @@
 import { spawn as nodeSpawn } from 'node:child_process'
 import {
   AcpConnection,
+  DEFAULT_AUTH_TIMEOUT_MS,
   DEFAULT_DISPOSE_EOF_GRACE_MS,
   DEFAULT_DISPOSE_GRACE_MS,
+  DEFAULT_INIT_TIMEOUT_MS,
+  DEFAULT_SESSION_TIMEOUT_MS,
 } from '../lib/index.js'
 
 const INIT_TIMEOUT_MS = 15_000
@@ -89,6 +92,9 @@ const connection = new AcpConnection({
   env: {},
   disposeEofGraceMs: DEFAULT_DISPOSE_EOF_GRACE_MS,
   disposeGraceMs: DEFAULT_DISPOSE_GRACE_MS,
+  initTimeoutMs: DEFAULT_INIT_TIMEOUT_MS,
+  sessionTimeoutMs: DEFAULT_SESSION_TIMEOUT_MS,
+  authTimeoutMs: DEFAULT_AUTH_TIMEOUT_MS,
   spawn: spawnHandle,
   onWarn: message => console.log(`  [warn] ${message}`),
   resolveAuthApiKey: async () => {

@@ -14,7 +14,7 @@ import z from '@deepseek-ai/schemastery';
 import registryData from './registry.json';
 export { AcpAdapter } from './adapter.ts';
 export type { AcpAdapterOptions } from './adapter.ts';
-export { AcpConnection, DEFAULT_DISPOSE_EOF_GRACE_MS, DEFAULT_DISPOSE_GRACE_MS, } from './connection.ts';
+export { AcpConnection, DEFAULT_AUTH_TIMEOUT_MS, DEFAULT_DISPOSE_EOF_GRACE_MS, DEFAULT_DISPOSE_GRACE_MS, DEFAULT_INIT_TIMEOUT_MS, DEFAULT_SESSION_TIMEOUT_MS, } from './connection.ts';
 export type { AcpConnectionSpec } from './connection.ts';
 export type * from './types.ts';
 export { registryData as acpRegistry };
@@ -64,6 +64,23 @@ export interface Config {
     disposeEofGraceMs?: number;
     /** Termination-escalation grace (ms) after SIGTERM before SIGKILL; must not exceed `MAX_TIMER_DELAY_MS`. */
     disposeGraceMs?: number;
+    /**
+     * Bound (ms) on the ACP `initialize` handshake plus any keyed `authenticate`
+     * round; must not exceed `MAX_TIMER_DELAY_MS`. Covers `npx` cold fetches, so
+     * keep it generous.
+     */
+    initTimeoutMs?: number;
+    /**
+     * Bound (ms) on `session/new`, `session/load`, `session/list`, and
+     * `session/set_config_option`; must not exceed `MAX_TIMER_DELAY_MS`.
+     */
+    sessionTimeoutMs?: number;
+    /**
+     * Bound (ms) on one `authenticate` round — the eager keyed attempt during
+     * `initialize`, or the lazy key-less attempt after a failed `session/new`;
+     * must not exceed `MAX_TIMER_DELAY_MS`.
+     */
+    authTimeoutMs?: number;
     /**
      * Working directory for child processes. A relative path resolves against the
      * harness launch directory at load. When omitted, the harness process cwd is used.
