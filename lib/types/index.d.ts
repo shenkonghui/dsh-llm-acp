@@ -55,8 +55,10 @@ export interface AcpServerConfig {
 export interface Config {
     /** Extra environment variables merged on top of the scrubbed parent env. */
     env?: Record<string, string>;
-    /** Whether to translate `agent_thought_chunk` into `reasoning-delta` chunks (default `false`). */
+    /** Whether to translate `agent_thought_chunk` into `reasoning-delta` chunks (default `true`). */
     emitReasoning?: boolean;
+    /** Whether to surface extension progress notifications as reasoning blocks (default `false`). */
+    emitProgress?: boolean;
     /** Fallback model id/name when ACP model discovery returns nothing. */
     defaultModelId?: string;
     defaultModelName?: string;

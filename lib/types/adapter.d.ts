@@ -24,6 +24,10 @@ export interface AcpAdapterOptions {
     provider: string;
     /** Whether to translate `agent_thought_chunk` into `reasoning-delta` chunks. */
     emitReasoning: boolean;
+    /** Whether to surface extension progress text (e.g. `_cognition.ai/output`,
+     * `[tool: …]` notes) as reasoning blocks. Off by default: these carry
+     * server log noise rather than model thinking. */
+    emitProgress?: boolean;
     /** Model id to fall back to when ACP model discovery returns nothing. */
     defaultModel: {
         id: string;

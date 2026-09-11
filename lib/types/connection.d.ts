@@ -55,6 +55,10 @@ export interface ProtocolTraceEntry {
     method: string;
     /** Human-readable summary of the payload. */
     summary: string;
+    /** How many consecutive interactions this entry represents (default 1). */
+    count?: number;
+    /** Internal merge key; consecutive entries with the same key collapse into one. */
+    collapseKey?: string;
 }
 /** Permission details forwarded from an ACP server to an interactive requester. */
 export interface AcpPermissionRequest {
@@ -193,7 +197,9 @@ export declare class AcpConnection {
      * @returns a snapshot copy of the trace buffer.
      */
     getProtocolTrace(): readonly ProtocolTraceEntry[];
-    /** Append one trace entry, evicting the oldest when the buffer is full. */
+    /** Append one trace entry, evicting the oldest when the buffer is full.
+     * Consecutive entries sharing `collapseKey` merge into one with a `count`
+     * so per-token stream chunks do not flood the small buffer. */
     private traceEvent;
     /**
      * Eager `authenticate` round, run during `initialize` only when the server
