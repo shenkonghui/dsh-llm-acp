@@ -99,6 +99,10 @@ export type AcpPermissionDecision = 'allow' | 'reject' | 'cancel'
 export interface AcpPermissionRequest {
   title: string
   signal: AbortSignal
+  /** Human-readable labels of the permission options the server offered
+   * (e.g. "Allow once", "Reject always"), for display when the toolCall
+   * itself carries no descriptive fields. */
+  optionLabels?: readonly string[]
 }
 
 /** Interactive permission requester captured for one prompt session. */
@@ -164,8 +168,14 @@ function tryStringify(value: unknown): string {
 /** Build a human-readable description of the tool call needing permission.
  * Prefers the server-provided `title`; when absent, derives one from
  * `kind`, `locations` (file paths), and `rawInput` so the user sees what
- * they are approving instead of a generic "ACP operation". */
-function describePermissionToolCall(toolCall: RequestPermissionRequest['toolCall']): string {
+ * they are approving instead of a generic "ACP operation".
+ * When all tool-call fields are empty (some agents send only a
+ * `toolCallId`), the permission `options` labels are used as a fallback
+ * so the user at least sees what the agent is asking them to approve. */
+function describePermissionToolCall(
+  toolCall: RequestPermissionRequest['toolCall'],
+  options?: RequestPermissionRequest['options'],
+): string {
   const title = typeof toolCall.title === 'string' && toolCall.title.length > 0
     ? toolCall.title
     : ''
@@ -186,7 +196,17 @@ function describePermissionToolCall(toolCall: RequestPermissionRequest['toolCall
   if (kind.length > 0) return kind
   if (paths.length > 0) return paths.join(', ')
   if (inputSummary.length > 0) return truncate(inputSummary)
-  return 'ACP operation'
+  // Fallback: use the permission option labels (e.g. "Allow once", "Reject
+  // always") — at least the user sees what they're being asked to approve.
+  if (options !== undefined && options.length > 0) {
+    const labels = options
+      .map(o => o.name)
+      .filter((n): n is string => typeof n === 'string' && n.length > 0)
+    if (labels.length > 0) return `permission: ${labels.join(' / ')}`
+  }
+  // Last resort: dump the toolCall so the user sees what the agent sent.
+  const dump = tryStringify(toolCall)
+  return dump.length > 0 ? truncate(dump, 200) : 'ACP operation'
 }
 
 /** Resolved spawn spec for the long-lived ACP server process. */
@@ -489,9 +509,12 @@ export class AcpConnection {
     }
     let decision: AcpPermissionDecision
     try {
-      const title = describePermissionToolCall(params.toolCall)
-      this.spec.onWarn?.(`llm-acp: permission request toolCall=${JSON.stringify(params.toolCall)} -> title="${title}"`)
-      decision = await entry.permissionRequester({ title, signal: entry.signal })
+      const title = describePermissionToolCall(params.toolCall, params.options)
+      const optionLabels = params.options
+        .map(o => o.name)
+        .filter((n): n is string => typeof n === 'string' && n.length > 0)
+      this.spec.onWarn?.(`llm-acp: permission request toolCall=${JSON.stringify(params.toolCall)} options=${JSON.stringify(params.options.map(o => ({ kind: o.kind, name: o.name })))} -> title="${title}"`)
+      decision = await entry.permissionRequester({ title, signal: entry.signal, optionLabels })
     } catch (error: unknown) {
       this.spec.onWarn?.(`llm-acp: permission request failed closed: ${error instanceof Error ? error.message : String(error)}`)
       return this.rejectPermission(params)

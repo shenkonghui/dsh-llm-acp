@@ -49,6 +49,10 @@ export type AcpPermissionDecision = 'allow' | 'reject' | 'cancel';
 export interface AcpPermissionRequest {
     title: string;
     signal: AbortSignal;
+    /** Human-readable labels of the permission options the server offered
+     * (e.g. "Allow once", "Reject always"), for display when the toolCall
+     * itself carries no descriptive fields. */
+    optionLabels?: readonly string[];
 }
 /** Interactive permission requester captured for one prompt session. */
 export type AcpPermissionRequester = (request: AcpPermissionRequest) => Promise<AcpPermissionDecision>;

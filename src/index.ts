@@ -438,11 +438,14 @@ export function apply(ctx: Context, config: Config): void {
         }
         const approval = ctx.get('approval')
         if (approval === undefined) return undefined
-        return async ({ title, signal }) => {
+        return async ({ title, signal, optionLabels }) => {
+          const reason = optionLabels !== undefined && optionLabels.length > 0
+            ? `${server.name} requested permission: ${title}. Options: ${optionLabels.join(', ')}.`
+            : `${server.name} requested permission to run "${title}".`
           const outcome = await approval.request({
             agent,
             toolName: `ACP: ${title}`,
-            reason: `${server.name} requested permission to run "${title}".`,
+            reason,
             signal,
           })
           if (outcome === 'allowed-once') return 'allow'
