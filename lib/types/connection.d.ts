@@ -45,6 +45,17 @@ type QueuedUpdate = {
 };
 /** Decision returned by an interactive ACP permission requester. */
 export type AcpPermissionDecision = 'allow' | 'reject' | 'cancel';
+/** One captured ACP protocol interaction, for the protocol inspector view. */
+export interface ProtocolTraceEntry {
+    /** Epoch milliseconds. */
+    time: number;
+    /** Request, response, or notification. */
+    dir: 'send' | 'recv';
+    /** JSON-RPC method name (e.g. `initialize`, `session/new`, `session/update`). */
+    method: string;
+    /** Human-readable summary of the payload. */
+    summary: string;
+}
 /** Permission details forwarded from an ACP server to an interactive requester. */
 export interface AcpPermissionRequest {
     title: string;
@@ -139,6 +150,8 @@ export declare class AcpConnection {
      * Captured so a key-less auth timeout can tell the user where to log in.
      */
     private pendingAuthUrl;
+    /** Ring buffer of recent ACP protocol interactions (max {@link MAX_PROTOCOL_TRACE}). */
+    private readonly protocolTrace;
     constructor(spec: AcpConnectionSpec);
     /** Resolves when the ACP server has completed `initialize`. */
     get ready(): Promise<void>;
@@ -174,6 +187,14 @@ export declare class AcpConnection {
      * link so a headless host can still complete the browser login.
      */
     getPendingAuthUrl(): string | undefined;
+    /**
+     * Recent ACP protocol interactions (ring buffer, max 10 entries). The
+     * protocol inspector view polls this to show what the server is doing.
+     * @returns a snapshot copy of the trace buffer.
+     */
+    getProtocolTrace(): readonly ProtocolTraceEntry[];
+    /** Append one trace entry, evicting the oldest when the buffer is full. */
+    private traceEvent;
     /**
      * Eager `authenticate` round, run during `initialize` only when the server
      * advertises auth methods AND a configured API key resolves. The key rides

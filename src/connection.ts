@@ -95,6 +95,21 @@ type QueuedUpdate =
 /** Decision returned by an interactive ACP permission requester. */
 export type AcpPermissionDecision = 'allow' | 'reject' | 'cancel'
 
+/** One captured ACP protocol interaction, for the protocol inspector view. */
+export interface ProtocolTraceEntry {
+  /** Epoch milliseconds. */
+  time: number
+  /** Request, response, or notification. */
+  dir: 'send' | 'recv'
+  /** JSON-RPC method name (e.g. `initialize`, `session/new`, `session/update`). */
+  method: string
+  /** Human-readable summary of the payload. */
+  summary: string
+}
+
+/** Maximum protocol trace entries retained (ring buffer). */
+const MAX_PROTOCOL_TRACE = 10
+
 /** Permission details forwarded from an ACP server to an interactive requester. */
 export interface AcpPermissionRequest {
   title: string
@@ -284,6 +299,8 @@ export class AcpConnection {
    * Captured so a key-less auth timeout can tell the user where to log in.
    */
   private pendingAuthUrl: string | undefined
+  /** Ring buffer of recent ACP protocol interactions (max {@link MAX_PROTOCOL_TRACE}). */
+  private readonly protocolTrace: ProtocolTraceEntry[] = []
 
   constructor(spec: AcpConnectionSpec) {
     this.spec = spec
@@ -340,6 +357,7 @@ export class AcpConnection {
     spawnFailed.catch(() => { /* observed by the startup race */ })
     let initResult: InitializeResponse
     try {
+      this.traceEvent('send', 'initialize', `protocolVersion=${PROTOCOL_VERSION}`)
       initResult = await Promise.race([
         this.conn.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} }),
         spawnFailed,
@@ -354,6 +372,7 @@ export class AcpConnection {
     this.agentInfo = initResult.agentInfo ?? undefined
     this.protocolVersion = initResult.protocolVersion
     this.authMethods = initResult.authMethods ?? undefined
+    this.traceEvent('recv', 'initialize', `protocol=${initResult.protocolVersion} agent=${initResult.agentInfo?.name ?? '?'} v${initResult.agentInfo?.version ?? '?'} authMethods=${initResult.authMethods?.length ?? 0}`)
     try {
       await this.authenticateWithKey()
     } catch (error: unknown) {
@@ -411,6 +430,21 @@ export class AcpConnection {
   }
 
   /**
+   * Recent ACP protocol interactions (ring buffer, max 10 entries). The
+   * protocol inspector view polls this to show what the server is doing.
+   * @returns a snapshot copy of the trace buffer.
+   */
+  getProtocolTrace(): readonly ProtocolTraceEntry[] {
+    return [...this.protocolTrace]
+  }
+
+  /** Append one trace entry, evicting the oldest when the buffer is full. */
+  private traceEvent(dir: 'send' | 'recv', method: string, summary: string): void {
+    this.protocolTrace.push({ time: Date.now(), dir, method, summary })
+    while (this.protocolTrace.length > MAX_PROTOCOL_TRACE) this.protocolTrace.shift()
+  }
+
+  /**
    * Eager `authenticate` round, run during `initialize` only when the server
    * advertises auth methods AND a configured API key resolves. The key rides
    * as `_meta.api_key` for servers that accept direct key authentication; an
@@ -431,8 +465,11 @@ export class AcpConnection {
     if (apiKey === undefined) return
     const method = pickAuthMethod(methods)
     if (method === undefined) return
+    this.traceEvent('send', 'authenticate', `methodId=${method.id} (with key)`)
     this.authRound = withTimeout(
-      this.conn.authenticate({ methodId: method.id, _meta: { api_key: apiKey } }).then(() => {}),
+      this.conn.authenticate({ methodId: method.id, _meta: { api_key: apiKey } }).then(() => {
+        this.traceEvent('recv', 'authenticate', `methodId=${method.id} ok`)
+      }),
       this.spec.authTimeoutMs,
       'authenticate',
     )
@@ -457,6 +494,7 @@ export class AcpConnection {
     if (method === undefined) return Promise.resolve()
     this.pendingAuthUrl = undefined
     this.authRound = (async (): Promise<void> => {
+      this.traceEvent('send', 'authenticate', `methodId=${method.id} (key-less)`)
       const attempt = this.conn.authenticate({ methodId: method.id })
       const settled = await Promise.race([
         attempt.then(
@@ -469,6 +507,9 @@ export class AcpConnection {
         if (settled.error !== undefined) {
           const message = settled.error instanceof Error ? settled.error.message : String(settled.error)
           this.spec.onWarn?.(`llm-acp: key-less authentication for "${this.spec.command}" failed: ${message}`)
+          this.traceEvent('recv', 'authenticate', `methodId=${method.id} error: ${message}`)
+        } else {
+          this.traceEvent('recv', 'authenticate', `methodId=${method.id} ok`)
         }
         return
       }
@@ -513,6 +554,7 @@ export class AcpConnection {
       const optionLabels = params.options
         .map(o => o.name)
         .filter((n): n is string => typeof n === 'string' && n.length > 0)
+      this.traceEvent('recv', 'session/request_permission', `title="${title}"`)
       this.spec.onWarn?.(`llm-acp: permission request toolCall=${JSON.stringify(params.toolCall)} options=${JSON.stringify(params.options.map(o => ({ kind: o.kind, name: o.name })))} -> title="${title}"`)
       decision = await entry.permissionRequester({ title, signal: entry.signal, optionLabels })
     } catch (error: unknown) {
@@ -538,8 +580,9 @@ export class AcpConnection {
   /** Push an inbound session/update into the owning session's queue. */
   private enqueueUpdate(params: SessionNotification): void {
     const entry = this.queues.get(params.sessionId)
-    if (entry === undefined) return
     const update = params.update
+    this.traceEvent('recv', 'session/update', `${update.sessionUpdate} sessionId=${params.sessionId}`)
+    if (entry === undefined) return
     if (update.sessionUpdate === 'agent_message_chunk') {
       entry.queue.push({ kind: 'text', text: acpContentText(update.content) })
     } else if (update.sessionUpdate === 'agent_thought_chunk') {
@@ -568,6 +611,7 @@ export class AcpConnection {
    * surfaced to keep the user informed during long operations.
    */
   private handleExtNotification(method: string, params: Record<string, unknown>): void {
+    this.traceEvent('recv', method, tryStringify(params).slice(0, 100))
     // Devin sends `_cognition.ai/output` with a `message` field for logging.
     if (method === '_cognition.ai/output') {
       const message = typeof params.message === 'string' ? params.message : ''
@@ -602,7 +646,8 @@ export class AcpConnection {
       }
       return
     }
-    // Unknown extension notifications are silently consumed.
+    // Unknown extension notifications are logged for diagnosis, then consumed.
+    this.spec.onWarn?.(`llm-acp: unhandled extension notification ${method}: ${tryStringify(params).slice(0, 200)}`)
   }
 
   /**
@@ -643,12 +688,14 @@ export class AcpConnection {
    * @returns the remote session id.
    */
   async newSession(): Promise<string> {
+    this.traceEvent('send', 'session/new', `cwd=${this.spec.cwd}`)
     const session = await this.withAuthRetry('session/new', () =>
       this.conn.newSession({ cwd: this.spec.cwd, mcpServers: [] }))
     const returnedId: unknown = Reflect.get(session, 'sessionId')
     if (typeof returnedId !== 'string') {
       throw new Error('llm-acp: ACP server published a session without a string sessionId')
     }
+    this.traceEvent('recv', 'session/new', `sessionId=${returnedId}`)
     return returnedId
   }
 
@@ -811,9 +858,12 @@ export class AcpConnection {
     signal.addEventListener('abort', onAbort, { once: true })
     // An already-aborted signal never fires 'abort' again — settle now.
     if (signal.aborted) onAbort()
+    const promptSummary = prompt.map(b => b.type === 'text' ? b.text.slice(0, 60) : `[${b.type}]`).join(' ')
+    this.traceEvent('send', 'session/prompt', `sessionId=${sessionId} prompt=${promptSummary.slice(0, 80)}`)
     const settled = this.conn.prompt({ sessionId, prompt }).then(
       (result) => {
         const stopReason: StopReason | undefined = Reflect.get(result, 'stopReason')
+        this.traceEvent('recv', 'session/prompt', `stopReason=${stopReason ?? 'end_turn'}`)
         entry.queue.push({ kind: 'done', reason: stopReason ?? 'end_turn' })
         this.signal(entry)
       },

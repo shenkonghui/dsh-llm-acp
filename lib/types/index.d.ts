@@ -15,7 +15,7 @@ import registryData from './registry.json';
 export { AcpAdapter } from './adapter.ts';
 export type { AcpAdapterOptions } from './adapter.ts';
 export { AcpConnection, DEFAULT_AUTH_TIMEOUT_MS, DEFAULT_DISPOSE_EOF_GRACE_MS, DEFAULT_DISPOSE_GRACE_MS, DEFAULT_INIT_TIMEOUT_MS, DEFAULT_SESSION_TIMEOUT_MS, } from './connection.ts';
-export type { AcpConnectionSpec } from './connection.ts';
+export type { AcpConnectionSpec, ProtocolTraceEntry } from './connection.ts';
 export type * from './types.ts';
 export { registryData as acpRegistry };
 export declare const name = "llm-acp";

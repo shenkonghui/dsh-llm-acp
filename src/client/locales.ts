@@ -29,6 +29,9 @@ export type AcpSettingsLocaleKey =
   | 'customIdRequired' | 'customIdExists' | 'customCommandRequired'
   | 'customModels' | 'customModelsHint' | 'noCustomModels'
   | 'addCustomModel' | 'customModelId' | 'customModelName'
+  | 'viewProtocol'
+  | 'protocolTitle' | 'protocolEmpty' | 'protocolNoServers'
+  | 'protocolSend' | 'protocolRecv' | 'protocolRefresh' | 'protocolRefreshing'
 
 /** English copy. */
 export const en: Record<AcpSettingsLocaleKey, string> = {
@@ -118,6 +121,14 @@ export const en: Record<AcpSettingsLocaleKey, string> = {
   addCustomModel: 'Add custom model',
   customModelId: 'Model id',
   customModelName: 'Display name',
+  viewProtocol: 'ACP Protocol',
+  protocolTitle: 'ACP Protocol Interactions',
+  protocolEmpty: 'No protocol interactions yet.',
+  protocolNoServers: 'No ACP servers configured.',
+  protocolSend: 'send',
+  protocolRecv: 'recv',
+  protocolRefresh: 'Refresh',
+  protocolRefreshing: 'Refreshing…',
 }
 
 /** Chinese copy. */
@@ -208,4 +219,12 @@ export const zh: Record<AcpSettingsLocaleKey, string> = {
   addCustomModel: '添加自定义模型',
   customModelId: '模型 ID',
   customModelName: '显示名称',
+  viewProtocol: 'ACP 协议',
+  protocolTitle: 'ACP 协议交互',
+  protocolEmpty: '暂无协议交互。',
+  protocolNoServers: '未配置 ACP 服务。',
+  protocolSend: '发送',
+  protocolRecv: '接收',
+  protocolRefresh: '刷新',
+  protocolRefreshing: '刷新中…',
 }

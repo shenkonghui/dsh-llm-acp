@@ -41,7 +41,7 @@ export {
   DEFAULT_INIT_TIMEOUT_MS,
   DEFAULT_SESSION_TIMEOUT_MS,
 } from './connection.ts'
-export type { AcpConnectionSpec } from './connection.ts'
+export type { AcpConnectionSpec, ProtocolTraceEntry } from './connection.ts'
 export type * from './types.ts'
 export { registryData as acpRegistry }
 
@@ -667,6 +667,18 @@ export function apply(ctx: Context, config: Config): void {
       const url = server?.connection.getPendingAuthUrl()
       if (url === undefined || url.length === 0) return [{ id: 'none', name: '' }]
       return [{ id: 'auth', name: url }]
+    }
+    // A sixth route convention, `acp-trace-<id>`, returns the server's
+    // recent protocol interactions (ring buffer, max 10). The reply reuses
+    // the `LlmDiscoveredModel` wire shape: `id` is `trace`, `name` is a
+    // JSON-encoded array of {time,dir,method,summary}. Consumed by the
+    // protocol inspector conversation view.
+    if (provider.startsWith('acp-trace-')) {
+      const serverId = provider.slice('acp-trace-'.length)
+      const server = active.get(serverId)
+      if (server === undefined) return [{ id: 'none', name: '[]' }]
+      const trace = server.connection.getProtocolTrace()
+      return [{ id: 'trace', name: JSON.stringify(trace) }]
     }
     if (!provider.startsWith('acp-')) return []
     const serverId = provider.slice(4)
