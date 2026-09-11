@@ -32,6 +32,9 @@ export type AcpSettingsLocaleKey =
   | 'viewProtocol'
   | 'protocolTitle' | 'protocolEmpty' | 'protocolNoServers'
   | 'protocolSend' | 'protocolRecv' | 'protocolRefresh' | 'protocolRefreshing'
+  | 'protocolFieldTime' | 'protocolFieldDir' | 'protocolFieldMethod'
+  | 'protocolFieldServer' | 'protocolFieldCount' | 'protocolFieldSummary'
+  | 'protocolRaw'
 
 /** English copy. */
 export const en: Record<AcpSettingsLocaleKey, string> = {
@@ -129,6 +132,13 @@ export const en: Record<AcpSettingsLocaleKey, string> = {
   protocolRecv: 'recv',
   protocolRefresh: 'Refresh',
   protocolRefreshing: 'Refreshing…',
+  protocolFieldTime: 'Time',
+  protocolFieldDir: 'Direction',
+  protocolFieldMethod: 'Method',
+  protocolFieldServer: 'Server',
+  protocolFieldCount: 'Merged',
+  protocolFieldSummary: 'Summary',
+  protocolRaw: 'Raw Content',
 }
 
 /** Chinese copy. */
@@ -227,4 +237,11 @@ export const zh: Record<AcpSettingsLocaleKey, string> = {
   protocolRecv: '接收',
   protocolRefresh: '刷新',
   protocolRefreshing: '刷新中…',
+  protocolFieldTime: '时间',
+  protocolFieldDir: '方向',
+  protocolFieldMethod: '方法',
+  protocolFieldServer: '服务',
+  protocolFieldCount: '合并',
+  protocolFieldSummary: '摘要',
+  protocolRaw: '原始内容',
 }

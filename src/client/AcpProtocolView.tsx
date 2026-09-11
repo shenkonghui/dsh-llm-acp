@@ -21,6 +21,8 @@ interface ProtocolTraceEntry {
   summary: string
   /** How many consecutive interactions this entry represents (default 1). */
   count?: number
+  /** Full payload JSON for the detail pane. */
+  detail?: string
 }
 
 /** One configured ACP server from settings (mirrors the settings section's type). */
@@ -57,6 +59,9 @@ export type AcpProtocolViewProps =
 /** Poll interval for trace data. */
 const POLL_MS = 3_000
 
+/** Maximum entries shown in the list (matches the host ring buffer). */
+const MAX_LIST = 100
+
 /** Format a timestamp as HH:MM:SS.mmm. */
 function formatTime(ms: number): string {
   const d = new Date(ms)
@@ -64,17 +69,28 @@ function formatTime(ms: number): string {
   return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}`
 }
 
+interface TraceRow {
+  server: string
+  entry: ProtocolTraceEntry
+}
+
+/** Stable identity for one row across refreshes. */
+function rowKey(row: TraceRow): string {
+  return `${row.server}:${row.entry.time}:${row.entry.method}`
+}
+
 /**
  * Poll all configured ACP servers for their recent protocol trace entries and
  * render them in a scrollable list. The view refreshes every 3 seconds while
- * visible.
+ * visible. Clicking an entry opens a detail pane with the full payload.
  */
 export function AcpProtocolView({
   api, settingsNs, t,
 }: AcpProtocolViewProps): JSX.Element {
-  const [traces, setTraces] = useState<{ server: string; entry: ProtocolTraceEntry }[]>([])
+  const [traces, setTraces] = useState<TraceRow[]>([])
   const [loading, setLoading] = useState(false)
   const [serverIds, setServerIds] = useState<string[]>([])
+  const [selected, setSelected] = useState<TraceRow | null>(null)
   const mountedRef = useRef(true)
 
   const refresh = useCallback(async (): Promise<void> => {
@@ -90,7 +106,7 @@ export function AcpProtocolView({
       const data = ns?.value as { servers?: Record<string, AcpServerEntry> } | undefined
       const ids = Object.keys(data?.servers ?? {})
       setServerIds(ids)
-      const all: { server: string; entry: ProtocolTraceEntry }[] = []
+      const all: TraceRow[] = []
       await Promise.all(ids.map(async (id) => {
         const res = await api.discoverModels(settingsNs, `acp-trace-${id}`) as AcpRemoteResult<readonly { id: string; name: string }[]>
         if (!res.ok || res.value === undefined) return
@@ -102,7 +118,7 @@ export function AcpProtocolView({
         } catch { /* malformed trace payload */ }
       }))
       all.sort((a, b) => b.entry.time - a.entry.time)
-      if (mountedRef.current) setTraces(all.slice(0, 10))
+      if (mountedRef.current) setTraces(all.slice(0, MAX_LIST))
     } catch { /* network or settings error */ }
     finally {
       if (mountedRef.current) setLoading(false)
@@ -132,30 +148,74 @@ export function AcpProtocolView({
           {loading ? t('protocolRefreshing') : t('protocolRefresh')}
         </button>
       </div>
-      {serverIds.length === 0
-        ? <div className={css.empty}>{t('protocolNoServers')}</div>
-        : traces.length === 0
-          ? <div className={css.empty}>{t('protocolEmpty')}</div>
-          : (
-            <ul className={css.list}>
-              {traces.map(({ server, entry }, i) => (
-                <li key={i} className={css.item}>
-                  <span className={css.time}>{formatTime(entry.time)}</span>
-                  <span className={`${css.dir} ${css[entry.dir]}`}>
-                    {entry.dir === 'send' ? t('protocolSend') : t('protocolRecv')}
-                  </span>
-                  <span className={css.method}>{entry.method}</span>
-                  <span className={css.server}>{server}</span>
-                  <span className={css.summary}>
-                    {entry.summary}
-                    {entry.count !== undefined && entry.count > 1 && (
-                      <span className={css.count}>×{entry.count}</span>
-                    )}
-                  </span>
-                </li>
-              ))}
-            </ul>
-          )}
+      <div className={css.main}>
+        {serverIds.length === 0
+          ? <div className={css.empty}>{t('protocolNoServers')}</div>
+          : traces.length === 0
+            ? <div className={css.empty}>{t('protocolEmpty')}</div>
+            : (
+              <ul className={css.list}>
+                {traces.map((row, i) => (
+                  <li
+                    key={i}
+                    className={`${css.item} ${selected !== null && rowKey(selected) === rowKey(row) ? css.selected : ''}`}
+                    onClick={() => {
+                      setSelected(selected !== null && rowKey(selected) === rowKey(row) ? null : row)
+                    }}
+                  >
+                    <span className={css.time}>{formatTime(row.entry.time)}</span>
+                    <span className={`${css.dir} ${css[row.entry.dir]}`}>
+                      {row.entry.dir === 'send' ? t('protocolSend') : t('protocolRecv')}
+                    </span>
+                    <span className={css.method}>{row.entry.method}</span>
+                    <span className={css.server}>{row.server}</span>
+                    <span className={css.summary}>
+                      {row.entry.summary}
+                      {row.entry.count !== undefined && row.entry.count > 1 && (
+                        <span className={css.count}>×{row.entry.count}</span>
+                      )}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            )}
+        {selected !== null && (
+          <div className={css.detail}>
+            <div className={css.detailHeader}>
+              <span className={css.detailTitle}>{selected.entry.method}</span>
+              <button
+                type="button"
+                className={css.detailClose}
+                onClick={() => { setSelected(null) }}
+              >
+                ×
+              </button>
+            </div>
+            <div className={css.detailBody}>
+              <dl className={css.kv}>
+                <dt>{t('protocolFieldTime')}</dt>
+                <dd>{formatTime(selected.entry.time)}</dd>
+                <dt>{t('protocolFieldDir')}</dt>
+                <dd>{selected.entry.dir === 'send' ? t('protocolSend') : t('protocolRecv')}</dd>
+                <dt>{t('protocolFieldMethod')}</dt>
+                <dd>{selected.entry.method}</dd>
+                <dt>{t('protocolFieldServer')}</dt>
+                <dd>{selected.server}</dd>
+                {selected.entry.count !== undefined && selected.entry.count > 1 && (
+                  <>
+                    <dt>{t('protocolFieldCount')}</dt>
+                    <dd>×{selected.entry.count}</dd>
+                  </>
+                )}
+                <dt>{t('protocolFieldSummary')}</dt>
+                <dd>{selected.entry.summary}</dd>
+              </dl>
+              <div className={css.rawTitle}>{t('protocolRaw')}</div>
+              <pre className={css.raw}>{selected.entry.detail ?? selected.entry.summary}</pre>
+            </div>
+          </div>
+        )}
+      </div>
     </div>
   )
 }

@@ -109,10 +109,15 @@ export interface ProtocolTraceEntry {
   count?: number
   /** Internal merge key; consecutive entries with the same key collapse into one. */
   collapseKey?: string
+  /** Full payload JSON for the detail pane, truncated. */
+  detail?: string
 }
 
 /** Maximum protocol trace entries retained (ring buffer). */
-const MAX_PROTOCOL_TRACE = 10
+const MAX_PROTOCOL_TRACE = 100
+
+/** Cap on one trace entry's serialized detail payload. */
+const MAX_TRACE_DETAIL = 8_192
 
 /** Permission details forwarded from an ACP server to an interactive requester. */
 export interface AcpPermissionRequest {
@@ -361,7 +366,8 @@ export class AcpConnection {
     spawnFailed.catch(() => { /* observed by the startup race */ })
     let initResult: InitializeResponse
     try {
-      this.traceEvent('send', 'initialize', `protocolVersion=${PROTOCOL_VERSION}`)
+      this.traceEvent('send', 'initialize', `protocolVersion=${PROTOCOL_VERSION}`, undefined,
+        { protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
       initResult = await Promise.race([
         this.conn.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} }),
         spawnFailed,
@@ -376,7 +382,7 @@ export class AcpConnection {
     this.agentInfo = initResult.agentInfo ?? undefined
     this.protocolVersion = initResult.protocolVersion
     this.authMethods = initResult.authMethods ?? undefined
-    this.traceEvent('recv', 'initialize', `protocol=${initResult.protocolVersion} agent=${initResult.agentInfo?.name ?? '?'} v${initResult.agentInfo?.version ?? '?'} authMethods=${initResult.authMethods?.length ?? 0}`)
+    this.traceEvent('recv', 'initialize', `protocol=${initResult.protocolVersion} agent=${initResult.agentInfo?.name ?? '?'} v${initResult.agentInfo?.version ?? '?'} authMethods=${initResult.authMethods?.length ?? 0}`, undefined, initResult)
     try {
       await this.authenticateWithKey()
     } catch (error: unknown) {
@@ -444,8 +450,8 @@ export class AcpConnection {
 
   /** Append one trace entry, evicting the oldest when the buffer is full.
    * Consecutive entries sharing `collapseKey` merge into one with a `count`
-   * so per-token stream chunks do not flood the small buffer. */
-  private traceEvent(dir: 'send' | 'recv', method: string, summary: string, collapseKey?: string): void {
+   * so per-token stream chunks do not flood the buffer. */
+  private traceEvent(dir: 'send' | 'recv', method: string, summary: string, collapseKey?: string, detail?: unknown): void {
     const last = this.protocolTrace[this.protocolTrace.length - 1]
     if (collapseKey !== undefined && last !== undefined
       && last.dir === dir && last.method === method && last.collapseKey === collapseKey) {
@@ -453,7 +459,11 @@ export class AcpConnection {
       last.count = (last.count ?? 1) + 1
       return
     }
-    this.protocolTrace.push({ time: Date.now(), dir, method, summary, ...collapseKey === undefined ? {} : { collapseKey } })
+    this.protocolTrace.push({
+      time: Date.now(), dir, method, summary,
+      ...collapseKey === undefined ? {} : { collapseKey },
+      ...detail === undefined ? {} : { detail: tryStringify(detail).slice(0, MAX_TRACE_DETAIL) },
+    })
     while (this.protocolTrace.length > MAX_PROTOCOL_TRACE) this.protocolTrace.shift()
   }
 
@@ -478,10 +488,10 @@ export class AcpConnection {
     if (apiKey === undefined) return
     const method = pickAuthMethod(methods)
     if (method === undefined) return
-    this.traceEvent('send', 'authenticate', `methodId=${method.id} (with key)`)
+    this.traceEvent('send', 'authenticate', `methodId=${method.id} (with key)`, undefined, { methodId: method.id })
     this.authRound = withTimeout(
       this.conn.authenticate({ methodId: method.id, _meta: { api_key: apiKey } }).then(() => {
-        this.traceEvent('recv', 'authenticate', `methodId=${method.id} ok`)
+        this.traceEvent('recv', 'authenticate', `methodId=${method.id} ok`, undefined, { methodId: method.id })
       }),
       this.spec.authTimeoutMs,
       'authenticate',
@@ -507,7 +517,7 @@ export class AcpConnection {
     if (method === undefined) return Promise.resolve()
     this.pendingAuthUrl = undefined
     this.authRound = (async (): Promise<void> => {
-      this.traceEvent('send', 'authenticate', `methodId=${method.id} (key-less)`)
+      this.traceEvent('send', 'authenticate', `methodId=${method.id} (key-less)`, undefined, { methodId: method.id })
       const attempt = this.conn.authenticate({ methodId: method.id })
       const settled = await Promise.race([
         attempt.then(
@@ -520,9 +530,9 @@ export class AcpConnection {
         if (settled.error !== undefined) {
           const message = settled.error instanceof Error ? settled.error.message : String(settled.error)
           this.spec.onWarn?.(`llm-acp: key-less authentication for "${this.spec.command}" failed: ${message}`)
-          this.traceEvent('recv', 'authenticate', `methodId=${method.id} error: ${message}`)
+          this.traceEvent('recv', 'authenticate', `methodId=${method.id} error: ${message}`, undefined, { methodId: method.id, error: message })
         } else {
-          this.traceEvent('recv', 'authenticate', `methodId=${method.id} ok`)
+          this.traceEvent('recv', 'authenticate', `methodId=${method.id} ok`, undefined, { methodId: method.id })
         }
         return
       }
@@ -567,7 +577,7 @@ export class AcpConnection {
       const optionLabels = params.options
         .map(o => o.name)
         .filter((n): n is string => typeof n === 'string' && n.length > 0)
-      this.traceEvent('recv', 'session/request_permission', `title="${title}"`)
+      this.traceEvent('recv', 'session/request_permission', `title="${title}"`, undefined, params)
       this.spec.onWarn?.(`llm-acp: permission request toolCall=${JSON.stringify(params.toolCall)} options=${JSON.stringify(params.options.map(o => ({ kind: o.kind, name: o.name })))} -> title="${title}"`)
       decision = await entry.permissionRequester({ title, signal: entry.signal, optionLabels })
     } catch (error: unknown) {
@@ -596,7 +606,7 @@ export class AcpConnection {
     const update = params.update
     if (entry === undefined) {
       this.traceEvent('recv', 'session/update-dropped', `${update.sessionUpdate} sessionId=${params.sessionId}`,
-        `drop:${update.sessionUpdate}:${params.sessionId}`)
+        `drop:${update.sessionUpdate}:${params.sessionId}`, params)
       this.spec.onWarn?.(`llm-acp: dropped session/update ${update.sessionUpdate} for unqueued session ${params.sessionId}`)
       return
     }
@@ -605,7 +615,7 @@ export class AcpConnection {
       ? ` text=${JSON.stringify(acpContentText(update.content).slice(0, 40))}`
       : ''
     this.traceEvent('recv', 'session/update', `${update.sessionUpdate} sessionId=${params.sessionId}${preview}`,
-      isChunk ? `update:${update.sessionUpdate}:${params.sessionId}` : undefined)
+      isChunk ? `update:${update.sessionUpdate}:${params.sessionId}` : undefined, params)
     if (update.sessionUpdate === 'agent_message_chunk') {
       entry.queue.push({ kind: 'text', text: acpContentText(update.content) })
     } else if (update.sessionUpdate === 'agent_thought_chunk') {
@@ -634,7 +644,7 @@ export class AcpConnection {
    * surfaced to keep the user informed during long operations.
    */
   private handleExtNotification(method: string, params: Record<string, unknown>): void {
-    this.traceEvent('recv', method, tryStringify(params).slice(0, 100))
+    this.traceEvent('recv', method, tryStringify(params).slice(0, 100), undefined, params)
     // Devin sends `_cognition.ai/output` with a `message` field for logging.
     if (method === '_cognition.ai/output') {
       const message = typeof params.message === 'string' ? params.message : ''
@@ -711,14 +721,14 @@ export class AcpConnection {
    * @returns the remote session id.
    */
   async newSession(): Promise<string> {
-    this.traceEvent('send', 'session/new', `cwd=${this.spec.cwd}`)
+    this.traceEvent('send', 'session/new', `cwd=${this.spec.cwd}`, undefined, { cwd: this.spec.cwd, mcpServers: [] })
     const session = await this.withAuthRetry('session/new', () =>
       this.conn.newSession({ cwd: this.spec.cwd, mcpServers: [] }))
     const returnedId: unknown = Reflect.get(session, 'sessionId')
     if (typeof returnedId !== 'string') {
       throw new Error('llm-acp: ACP server published a session without a string sessionId')
     }
-    this.traceEvent('recv', 'session/new', `sessionId=${returnedId}`)
+    this.traceEvent('recv', 'session/new', `sessionId=${returnedId}`, undefined, session)
     return returnedId
   }
 
@@ -882,11 +892,12 @@ export class AcpConnection {
     // An already-aborted signal never fires 'abort' again — settle now.
     if (signal.aborted) onAbort()
     const promptSummary = prompt.map(b => b.type === 'text' ? b.text.slice(0, 60) : `[${b.type}]`).join(' ')
-    this.traceEvent('send', 'session/prompt', `sessionId=${sessionId} prompt=${promptSummary.slice(0, 80)}`)
+    this.traceEvent('send', 'session/prompt', `sessionId=${sessionId} prompt=${promptSummary.slice(0, 80)}`,
+      undefined, { sessionId, prompt })
     const settled = this.conn.prompt({ sessionId, prompt }).then(
       (result) => {
         const stopReason: StopReason | undefined = Reflect.get(result, 'stopReason')
-        this.traceEvent('recv', 'session/prompt', `stopReason=${stopReason ?? 'end_turn'}`)
+        this.traceEvent('recv', 'session/prompt', `stopReason=${stopReason ?? 'end_turn'}`, undefined, result)
         entry.queue.push({ kind: 'done', reason: stopReason ?? 'end_turn' })
         this.signal(entry)
       },
