@@ -7,8 +7,3 @@
 - insert:
     - id: llm-acp
       name: '@deepseek-ai/dsh-llm-acp'
-      config:
-        defaultModelId: glm-5-2
-        defaultModelName: GLM-5.2 High
-        disposeEofGraceMs: 6000
-        disposeGraceMs: 3000

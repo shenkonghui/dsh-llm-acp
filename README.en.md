@@ -82,8 +82,8 @@ Binary entries use the executable basename so a PATH-installed binary is found d
 | Config | Default | Meaning |
 |---|---|---|
 | `emitReasoning` | `true` | Whether `agent_thought_chunk` and extension progress notifications become `reasoning-delta` chunks. |
-| `defaultModelId` | `glm-5-2` | Fallback model id when ACP discovery returns no models. |
-| `defaultModelName` | `GLM-5.2 High` | Fallback model display name. |
+| `defaultModelId` | `devin` | Fallback model id when ACP discovery returns no models. |
+| `defaultModelName` | `Devin (ACP)` | Fallback model display name. |
 | `disposeEofGraceMs` | `6000` | Positive grace after stdin EOF before platform termination. |
 | `disposeGraceMs` | `3000` | Positive POSIX grace after SIGTERM before SIGKILL. |
 | `initTimeoutMs` | `120000` | Bound on the `initialize` handshake (plus any keyed `authenticate` round). |

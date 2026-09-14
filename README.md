@@ -148,8 +148,8 @@ binary 类型使用可执行文件的 basename，这样已安装到 PATH 的二�
 | 配置 | 默认值 | 说明 |
 |---|---|---|
 | `emitReasoning` | `true` | 是否将 `agent_thought_chunk` 和扩展进度通知转换为 `reasoning-delta` chunk。 |
-| `defaultModelId` | `glm-5-2` | ACP 发现未返回模型时的回退模型 ID。 |
-| `defaultModelName` | `GLM-5.2 High` | 回退模型显示名称。 |
+| `defaultModelId` | `devin` | ACP 发现未返回模型时的回退模型 ID。 |
+| `defaultModelName` | `Devin (ACP)` | 回退模型显示名称。 |
 | `disposeEofGraceMs` | `6000` | stdin EOF 后等待平台终止的宽限时间（毫秒）。 |
 | `disposeGraceMs` | `3000` | SIGTERM 后等待 SIGKILL 的 POSIX 宽限时间（毫秒）。 |
 | `initTimeoutMs` | `120000` | `initialize` 握手（含 keyed `authenticate`）的上限（毫秒）。 |
