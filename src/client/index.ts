@@ -23,6 +23,8 @@ import { AcpSettingsSection } from './AcpSettingsSection.tsx'
 import type { AcpSettingsPathOp, AcpSettingsSectionApi, AcpSettingsSectionInjected } from './AcpSettingsSection.tsx'
 import { AcpProtocolView } from './AcpProtocolView.tsx'
 import type { AcpProtocolViewInjected } from './AcpProtocolView.tsx'
+import { AcpAuthBanner } from './AcpAuthBanner.tsx'
+import type { AcpAuthBannerInjected } from './AcpAuthBanner.tsx'
 import { AcpStatusBar } from './AcpStatusBar.tsx'
 import { en, zh, type AcpSettingsLocaleKey } from './locales.ts'
 // Registry data is bundled at build time from the ACP registry repository.
@@ -31,6 +33,7 @@ import registryData from '../registry.json' with { type: 'json' }
 export type { AcpSettingsSectionInjected, AcpSettingsSectionProps } from './AcpSettingsSection.tsx'
 export type { AcpRegistryAgent, AcpServerEntry } from './AcpSettingsSection.tsx'
 export type { AcpProtocolViewInjected, AcpProtocolViewProps } from './AcpProtocolView.tsx'
+export type { AcpAuthBannerInjected, AcpAuthBannerProps } from './AcpAuthBanner.tsx'
 export type { AcpSettingsLocaleKey } from './locales.ts'
 
 /** Dictionary namespace owned by this plugin. */
@@ -108,4 +111,15 @@ export function apply(ctx: ClientContext): void {
     label: () => t('viewProtocol'),
     inject: (): AcpProtocolViewInjected => ({ api: footerApi, settingsNs: LLM_ACP_NS }),
   }, AcpProtocolView))
+
+  // Composer-dock banner: pending interactive-login URLs. While a server waits
+  // on browser sign-in, the failed session call stays pending on the host and
+  // retries automatically once the login completes.
+  ctx.slots.inject('conversation.composer.dock', () => ctx.slots.register({
+    name: 'conversation.composer.dock',
+    id: 'acp-auth',
+    order: 10,
+    locale: NS,
+    inject: (): AcpAuthBannerInjected => ({ api: footerApi, settingsNs: LLM_ACP_NS }),
+  }, AcpAuthBanner))
 }

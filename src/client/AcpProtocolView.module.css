@@ -84,6 +84,10 @@
   background: rgba(22, 119, 255, 0.08);
 }
 
+.dropped {
+  opacity: 0.55;
+}
+
 .time {
   color: var(--dsw-text-secondary, #999);
   flex-shrink: 0;

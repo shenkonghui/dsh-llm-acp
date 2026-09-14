@@ -14,7 +14,7 @@ import z from '@deepseek-ai/schemastery';
 import registryData from './registry.json';
 export { AcpAdapter } from './adapter.ts';
 export type { AcpAdapterOptions } from './adapter.ts';
-export { AcpConnection, DEFAULT_AUTH_TIMEOUT_MS, DEFAULT_DISPOSE_EOF_GRACE_MS, DEFAULT_DISPOSE_GRACE_MS, DEFAULT_INIT_TIMEOUT_MS, DEFAULT_SESSION_TIMEOUT_MS, } from './connection.ts';
+export { AcpConnection, DEFAULT_AUTH_TIMEOUT_MS, DEFAULT_DISPOSE_EOF_GRACE_MS, DEFAULT_DISPOSE_GRACE_MS, DEFAULT_INIT_TIMEOUT_MS, DEFAULT_INTERACTIVE_AUTH_TIMEOUT_MS, DEFAULT_SESSION_TIMEOUT_MS, } from './connection.ts';
 export type { AcpConnectionSpec, ProtocolTraceEntry } from './connection.ts';
 export type * from './types.ts';
 export { registryData as acpRegistry };
@@ -83,6 +83,12 @@ export interface Config {
      * must not exceed `MAX_TIMER_DELAY_MS`.
      */
     authTimeoutMs?: number;
+    /**
+     * Bound (ms) on one key-less interactive `authenticate` round — long enough
+     * for the user to complete a browser login; when the round settles the failed
+     * session call retries automatically. Must not exceed `MAX_TIMER_DELAY_MS`.
+     */
+    interactiveAuthTimeoutMs?: number;
     /**
      * Working directory for child processes. A relative path resolves against the
      * harness launch directory at load. When omitted, the harness process cwd is used.

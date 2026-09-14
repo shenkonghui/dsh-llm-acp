@@ -9,6 +9,7 @@ import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client';
 export type { AcpSettingsSectionInjected, AcpSettingsSectionProps } from './AcpSettingsSection.tsx';
 export type { AcpRegistryAgent, AcpServerEntry } from './AcpSettingsSection.tsx';
 export type { AcpProtocolViewInjected, AcpProtocolViewProps } from './AcpProtocolView.tsx';
+export type { AcpAuthBannerInjected, AcpAuthBannerProps } from './AcpAuthBanner.tsx';
 export type { AcpSettingsLocaleKey } from './locales.ts';
 /** Required services (cordis fiber inject). */
 export declare const inject: string[];

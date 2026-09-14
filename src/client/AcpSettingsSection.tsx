@@ -219,19 +219,29 @@ async function loadServerInfo(
   }
 }
 
-/** Load the pending interactive-auth browser login URL for one server via the
+/** Pending interactive-auth state for one server: the browser login URL when
+ * the method published one, or just the in-flight method id when it did not. */
+interface AuthState {
+  url?: string
+  methodId?: string
+}
+
+/** Load the pending interactive-auth state for one server via the
  * `acp-auth-<id>` discovery route. Returns `undefined` when no login is
  * pending or the host runs a stale build without the route. */
-async function loadAuthUrl(
+async function loadAuthState(
   api: AcpSettingsSectionInjected['api'],
   settingsNs: string,
   serverId: string,
-): Promise<string | undefined> {
+): Promise<AuthState | undefined> {
   try {
     const response = await api.discoverModels(settingsNs, `acp-auth-${serverId}`)
     if (!response.ok) return undefined
     const entry = (response.value ?? [])[0]
-    return entry !== undefined && entry.id === 'auth' && entry.name.length > 0 ? entry.name : undefined
+    if (entry === undefined) return undefined
+    if (entry.id === 'auth' && entry.name.length > 0) return { url: entry.name }
+    if (entry.id === 'pending') return { methodId: entry.name }
+    return undefined
   } catch {
     return undefined
   }
@@ -327,7 +337,7 @@ export function AcpSettingsSection(props: AcpSettingsSectionProps) {
   const [modelSearch, setModelSearch] = useState<Record<string, string>>({})
   const [savingId, setSavingId] = useState<string | undefined>()
   const [serverInfo, setServerInfo] = useState<Record<string, ServerInfo | undefined>>({})
-  const [authUrls, setAuthUrls] = useState<Record<string, string | undefined>>({})
+  const [authStates, setAuthStates] = useState<Record<string, AuthState | undefined>>({})
   const [testServer, setTestServer] = useState<{ id: string; name: string } | undefined>()
   const [testSteps, setTestSteps] = useState<Record<TestStepId, TestStepState>>({
     handshake: { status: 'running' },
@@ -362,8 +372,8 @@ export function AcpSettingsSection(props: AcpSettingsSectionProps) {
             void loadServerInfo(api, settingsNs, id).then(info => {
               setServerInfo(prev => (prev[id] === info ? prev : { ...prev, [id]: info }))
             })
-            void loadAuthUrl(api, settingsNs, id).then(url => {
-              setAuthUrls(prev => (prev[id] === url ? prev : { ...prev, [id]: url }))
+            void loadAuthState(api, settingsNs, id).then(state => {
+              setAuthStates(prev => (prev[id] === state ? prev : { ...prev, [id]: state }))
             })
           }
         }
@@ -518,14 +528,14 @@ export function AcpSettingsSection(props: AcpSettingsSectionProps) {
     }
     // Fetch discovered models and live server info for this provider route.
     setModelsLoading(prev => new Set(prev).add(id))
-    const [models, info, authUrl] = await Promise.all([
+    const [models, info, authState] = await Promise.all([
       loadProviderModels(api, settingsNs, `acp-${id}`),
       loadServerInfo(api, settingsNs, id),
-      loadAuthUrl(api, settingsNs, id),
+      loadAuthState(api, settingsNs, id),
     ])
     setDiscoveredModels(prev => ({ ...prev, [id]: models }))
     setServerInfo(prev => (prev[id] === info ? prev : { ...prev, [id]: info }))
-    setAuthUrls(prev => (prev[id] === authUrl ? prev : { ...prev, [id]: authUrl }))
+    setAuthStates(prev => (prev[id] === authState ? prev : { ...prev, [id]: authState }))
     setModelsLoading(prev => {
       const next = new Set(prev)
       next.delete(id)
@@ -536,14 +546,14 @@ export function AcpSettingsSection(props: AcpSettingsSectionProps) {
   /** Re-fetch the model catalog and live server info for one server. */
   const refreshModels = async (id: string): Promise<void> => {
     setModelsLoading(prev => new Set(prev).add(id))
-    const [models, info, authUrl] = await Promise.all([
+    const [models, info, authState] = await Promise.all([
       loadProviderModels(api, settingsNs, `acp-${id}`),
       loadServerInfo(api, settingsNs, id),
-      loadAuthUrl(api, settingsNs, id),
+      loadAuthState(api, settingsNs, id),
     ])
     setDiscoveredModels(prev => ({ ...prev, [id]: models }))
     setServerInfo(prev => (prev[id] === info ? prev : { ...prev, [id]: info }))
-    setAuthUrls(prev => (prev[id] === authUrl ? prev : { ...prev, [id]: authUrl }))
+    setAuthStates(prev => (prev[id] === authState ? prev : { ...prev, [id]: authState }))
     setModelsLoading(prev => {
       const next = new Set(prev)
       next.delete(id)
@@ -867,20 +877,26 @@ export function AcpSettingsSection(props: AcpSettingsSectionProps) {
                 const info = serverInfo[id]
                 const registryAgent = registry.agents.find(a => a.id === id)
                 const versionLabel = serverVersionLabel(info, registryAgent)
-                const authUrl = authUrls[id]
+                const authState = authStates[id]
                 return (
                   <div key={id} className={css.serverCardBlock}>
-                    {authUrl !== undefined && (
+                    {authState !== undefined && (
                       <div className={css.authBanner}>
-                        <span>{t('authPending')}</span>
-                        <a
-                          href={authUrl}
-                          target="_blank"
-                          rel="noreferrer"
-                          className={css.authLink}
-                        >
-                          {t('authOpen')}
-                        </a>
+                        <span>
+                          {authState.url !== undefined
+                            ? t('authPending')
+                            : `${t('authWaiting')}${authState.methodId !== undefined && authState.methodId.length > 0 ? ` (${authState.methodId})` : ''}`}
+                        </span>
+                        {authState.url !== undefined && (
+                          <a
+                            href={authState.url}
+                            target="_blank"
+                            rel="noreferrer"
+                            className={css.authLink}
+                          >
+                            {t('authOpen')}
+                          </a>
+                        )}
                       </div>
                     )}
                     <div className={css.serverCard}>

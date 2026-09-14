@@ -26,6 +26,10 @@ export declare const DEFAULT_INIT_TIMEOUT_MS = 120000;
 export declare const DEFAULT_SESSION_TIMEOUT_MS = 60000;
 /** Default bound on one `authenticate` round, keyed or key-less. */
 export declare const DEFAULT_AUTH_TIMEOUT_MS = 15000;
+/** Default bound on one key-less interactive `authenticate` round: generous
+ * enough for the user to finish a browser login before the failed session
+ * call retries. */
+export declare const DEFAULT_INTERACTIVE_AUTH_TIMEOUT_MS = 300000;
 /** One queued update delivered to a {@link AcpConnection.promptStream} consumer. */
 type QueuedUpdate = {
     kind: 'text';
@@ -102,15 +106,27 @@ export interface AcpConnectionSpec {
     sessionTimeoutMs: number;
     /** Bound (ms) on one `authenticate` round, keyed or key-less. */
     authTimeoutMs: number;
+    /** Bound (ms) on one key-less interactive `authenticate` round — long enough
+     * for the user to complete a browser login, after which the failed session
+     * call retries automatically. */
+    interactiveAuthTimeoutMs: number;
     /** Spawn function from the subprocess seam (`ctx.subprocess.spawn`). */
     spawn: (spec: SubprocessSpawnSpec) => SubprocessHandle;
     /** Sink for connection-level warnings (wired to `ctx.logger.warn`). */
     onWarn?: (message: string) => void;
     /**
+     * Called when the connection is presumed dead: a prompt went idle without
+     * answering, or `session/new` timed out (serial servers queue requests
+     * behind a dead prompt). The owner uses this hook to rebuild the connection.
+     */
+    onWedged?: ((reason: string) => void) | undefined;
+    /**
      * Notified with the browser login URL when the server publishes it via the
      * `_codebuddy.ai/authUrl` extension notification during an interactive
-     * `authenticate` round. The host decides how to surface it (e.g. open the
-     * system browser); failures must not affect the connection.
+     * `authenticate` round. Fires at most once per connection — later
+     * publishes only refresh the pending URL exposed via
+     * {@link getPendingAuthUrl}. The host decides how to surface it (e.g. open
+     * the system browser); failures must not affect the connection.
      */
     onAuthUrl?: (url: string) => void;
     /**
@@ -156,6 +172,12 @@ export declare class AcpConnection {
      * Captured so a key-less auth timeout can tell the user where to log in.
      */
     private pendingAuthUrl;
+    /** Set once {@link onAuthUrl} has fired — one browser open per connection. */
+    private authUrlNotified;
+    /** Auth method id of the in-flight key-less round, if any. */
+    private interactiveAuthMethodId;
+    private cachedConfigOptions;
+    private configOptionsProbe;
     /** Ring buffer of recent ACP protocol interactions (max {@link MAX_PROTOCOL_TRACE}). */
     private readonly protocolTrace;
     constructor(spec: AcpConnectionSpec);
@@ -194,7 +216,19 @@ export declare class AcpConnection {
      */
     getPendingAuthUrl(): string | undefined;
     /**
-     * Recent ACP protocol interactions (ring buffer, max 10 entries). The
+     * The auth method id of an in-flight key-less interactive round, or
+     * `undefined` when no round is running. Lets callers surface "waiting for
+     * interactive login" even before (or without) an auth URL.
+     */
+    getPendingAuthMethod(): string | undefined;
+    /**
+     * Begin an interactive authenticate round when the server advertises auth
+     * methods — a no-op otherwise. Waits for `initialize` first so the
+     * advertised method list is populated; failures surface through `onWarn`.
+     */
+    requestInteractiveAuth(): void;
+    /**
+     * Recent ACP protocol interactions (ring buffer, {@link MAX_PROTOCOL_TRACE} entries). The
      * protocol inspector view polls this to show what the server is doing.
      * @returns a snapshot copy of the trace buffer.
      */
@@ -309,6 +343,8 @@ export declare class AcpConnection {
      * @returns all config options (models, modes, thought levels, etc.).
      */
     discoverConfigOptions(): Promise<readonly SessionConfigOption[] | undefined>;
+    /** Single config-option probe: one throwaway session, closed immediately. */
+    private probeConfigOptions;
     /** Extract model entries from a config option list (category `model`, type `select`).
      * Handles both flat option lists and grouped option lists per the ACP
      * `SessionConfigSelectOptions` union: a group entry carries its own

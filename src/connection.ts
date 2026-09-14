@@ -27,6 +27,7 @@ import {
   type ContentBlock as AcpContentBlock,
   type Implementation,
   type InitializeResponse,
+  type NewSessionResponse,
   type RequestPermissionRequest,
   type RequestPermissionResponse,
   type SessionCapabilities,
@@ -47,6 +48,15 @@ export const DEFAULT_DISPOSE_EOF_GRACE_MS = 6_000
  * stuck on a dead prompt.
  */
 const CANCEL_SETTLE_GRACE_MS = 5_000
+
+/**
+ * Grace after an `idle` agent phase while a prompt response is still pending.
+ * Some servers (observed: codebuddy) transition to `idle` on an internal model
+ * failure without ever answering `session/prompt`; once this elapses the
+ * pending drain is force-settled as an error so consumers are not stuck on a
+ * dead prompt.
+ */
+const IDLE_SETTLE_GRACE_MS = 10_000
 
 /** Resolve after `ms` milliseconds. */
 const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms))
@@ -83,6 +93,11 @@ export const DEFAULT_SESSION_TIMEOUT_MS = 60_000
 
 /** Default bound on one `authenticate` round, keyed or key-less. */
 export const DEFAULT_AUTH_TIMEOUT_MS = 15_000
+
+/** Default bound on one key-less interactive `authenticate` round: generous
+ * enough for the user to finish a browser login before the failed session
+ * call retries. */
+export const DEFAULT_INTERACTIVE_AUTH_TIMEOUT_MS = 300_000
 
 /** One queued update delivered to a {@link AcpConnection.promptStream} consumer. */
 type QueuedUpdate =
@@ -138,6 +153,10 @@ interface SessionQueue {
   resolve: (() => void) | undefined
   permissionRequester: AcpPermissionRequester | undefined
   signal: AbortSignal
+  /** Set once the `session/prompt` response (or its rejection) has settled. */
+  promptSettled?: boolean
+  /** Armed while the server reports an `idle` agent phase with the prompt still unsettled. */
+  idleTimer?: ReturnType<typeof setTimeout> | undefined
 }
 
 /** Bounded whole-tree exit wait: polls the handle's tree liveness until it exits or `ms` elapses. */
@@ -170,7 +189,38 @@ export async function disposeAcpChild(child: SubprocessHandle, eofGraceMs: numbe
   await child.waitForExit()
 }
 
+/** Whether an RPC failure is the ACP `authRequired` error (code -32000) — the
+ * only failure that earns a lazy authenticate round. Timeout/transport errors
+ * are not auth failures even though they share the same catch site. */
+function isAuthRequiredError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false
+  const code: unknown = Reflect.get(error, 'code')
+  return code === -32000 || /^authentication required/i.test(error.message)
+}
+
+/** Whether an RPC failure came from a `withTimeout` deadline (message shape is `llm-acp: <label> timed out after Nms`). */
+function isTimeoutError(error: unknown): boolean {
+  return error instanceof Error && /timed out after \d+ms$/.test(error.message)
+}
+
 /** Extract text from an ACP content block (non-text blocks contribute nothing). */
+/**
+ * Read an agent-phase extension marker (e.g. `_meta["codebuddy.ai/agentPhase"].phase`)
+ * from a session update. Returns the phase string (`model_streaming`, `idle`, …)
+ * or `undefined` when the update carries none.
+ */
+function acpAgentPhase(update: SessionNotification['update']): string | undefined {
+  const meta: unknown = Reflect.get(update, '_meta')
+  if (meta === null || typeof meta !== 'object') return undefined
+  for (const [key, value] of Object.entries(meta as Record<string, unknown>)) {
+    if (!key.endsWith('agentPhase')) continue
+    if (value === null || typeof value !== 'object') continue
+    const phase: unknown = Reflect.get(value, 'phase')
+    if (typeof phase === 'string') return phase
+  }
+  return undefined
+}
+
 function acpContentText(content: AcpContentBlock): string {
   return content.type === 'text' ? content.text : ''
 }
@@ -253,15 +303,27 @@ export interface AcpConnectionSpec {
   sessionTimeoutMs: number
   /** Bound (ms) on one `authenticate` round, keyed or key-less. */
   authTimeoutMs: number
+  /** Bound (ms) on one key-less interactive `authenticate` round — long enough
+   * for the user to complete a browser login, after which the failed session
+   * call retries automatically. */
+  interactiveAuthTimeoutMs: number
   /** Spawn function from the subprocess seam (`ctx.subprocess.spawn`). */
   spawn: (spec: SubprocessSpawnSpec) => SubprocessHandle
   /** Sink for connection-level warnings (wired to `ctx.logger.warn`). */
   onWarn?: (message: string) => void
   /**
+   * Called when the connection is presumed dead: a prompt went idle without
+   * answering, or `session/new` timed out (serial servers queue requests
+   * behind a dead prompt). The owner uses this hook to rebuild the connection.
+   */
+  onWedged?: ((reason: string) => void) | undefined
+  /**
    * Notified with the browser login URL when the server publishes it via the
    * `_codebuddy.ai/authUrl` extension notification during an interactive
-   * `authenticate` round. The host decides how to surface it (e.g. open the
-   * system browser); failures must not affect the connection.
+   * `authenticate` round. Fires at most once per connection — later
+   * publishes only refresh the pending URL exposed via
+   * {@link getPendingAuthUrl}. The host decides how to surface it (e.g. open
+   * the system browser); failures must not affect the connection.
    */
   onAuthUrl?: (url: string) => void
   /**
@@ -308,6 +370,12 @@ export class AcpConnection {
    * Captured so a key-less auth timeout can tell the user where to log in.
    */
   private pendingAuthUrl: string | undefined
+  /** Set once {@link onAuthUrl} has fired — one browser open per connection. */
+  private authUrlNotified = false
+  /** Auth method id of the in-flight key-less round, if any. */
+  private interactiveAuthMethodId: string | undefined
+  private cachedConfigOptions: readonly SessionConfigOption[] | undefined
+  private configOptionsProbe: Promise<readonly SessionConfigOption[] | undefined> | undefined
   /** Ring buffer of recent ACP protocol interactions (max {@link MAX_PROTOCOL_TRACE}). */
   private readonly protocolTrace: ProtocolTraceEntry[] = []
 
@@ -440,7 +508,29 @@ export class AcpConnection {
   }
 
   /**
-   * Recent ACP protocol interactions (ring buffer, max 10 entries). The
+   * The auth method id of an in-flight key-less interactive round, or
+   * `undefined` when no round is running. Lets callers surface "waiting for
+   * interactive login" even before (or without) an auth URL.
+   */
+  getPendingAuthMethod(): string | undefined {
+    return this.interactiveAuthMethodId
+  }
+
+  /**
+   * Begin an interactive authenticate round when the server advertises auth
+   * methods — a no-op otherwise. Waits for `initialize` first so the
+   * advertised method list is populated; failures surface through `onWarn`.
+   */
+  requestInteractiveAuth(): void {
+    void this.ready
+      .then(() => this.ensureAuthenticated())
+      .catch((error: unknown) => {
+        this.spec.onWarn?.(`llm-acp: interactive auth for "${this.spec.command}" failed: ${error instanceof Error ? error.message : String(error)}`)
+      })
+  }
+
+  /**
+   * Recent ACP protocol interactions (ring buffer, {@link MAX_PROTOCOL_TRACE} entries). The
    * protocol inspector view polls this to show what the server is doing.
    * @returns a snapshot copy of the trace buffer.
    */
@@ -516,31 +606,39 @@ export class AcpConnection {
     const method = this.authMethods?.[0]
     if (method === undefined) return Promise.resolve()
     this.pendingAuthUrl = undefined
+    this.interactiveAuthMethodId = method.id
     this.authRound = (async (): Promise<void> => {
-      this.traceEvent('send', 'authenticate', `methodId=${method.id} (key-less)`, undefined, { methodId: method.id })
-      const attempt = this.conn.authenticate({ methodId: method.id })
-      const settled = await Promise.race([
-        attempt.then(
-          () => ({ done: true as const, error: undefined }),
-          (error: unknown) => ({ done: true as const, error }),
-        ),
-        sleep(this.spec.authTimeoutMs).then(() => ({ done: false as const, error: undefined })),
-      ])
-      if (settled.done) {
-        if (settled.error !== undefined) {
-          const message = settled.error instanceof Error ? settled.error.message : String(settled.error)
-          this.spec.onWarn?.(`llm-acp: key-less authentication for "${this.spec.command}" failed: ${message}`)
-          this.traceEvent('recv', 'authenticate', `methodId=${method.id} error: ${message}`, undefined, { methodId: method.id, error: message })
-        } else {
-          this.traceEvent('recv', 'authenticate', `methodId=${method.id} ok`, undefined, { methodId: method.id })
+      try {
+        this.traceEvent('send', 'authenticate', `methodId=${method.id} (key-less)`, undefined, { methodId: method.id })
+        const attempt = this.conn.authenticate({ methodId: method.id })
+        const settled = await Promise.race([
+          attempt.then(
+            () => ({ done: true as const, error: undefined }),
+            (error: unknown) => ({ done: true as const, error }),
+          ),
+          sleep(this.spec.interactiveAuthTimeoutMs).then(() => ({ done: false as const, error: undefined })),
+        ])
+        if (settled.done) {
+          if (settled.error !== undefined) {
+            const message = settled.error instanceof Error ? settled.error.message : String(settled.error)
+            this.spec.onWarn?.(`llm-acp: key-less authentication for "${this.spec.command}" failed: ${message}`)
+            this.traceEvent('recv', 'authenticate', `methodId=${method.id} error: ${message}`, undefined, { methodId: method.id, error: message })
+          } else {
+            this.pendingAuthUrl = undefined
+            this.traceEvent('recv', 'authenticate', `methodId=${method.id} ok`, undefined, { methodId: method.id })
+          }
+          return
         }
-        return
+        const url = this.pendingAuthUrl
+        this.spec.onWarn?.(
+          `llm-acp: interactive authentication for "${this.spec.command}" is still pending after ${this.spec.interactiveAuthTimeoutMs}ms`
+          + (url !== undefined ? ` — complete the login in a browser: ${url}` : ''),
+        )
+      } finally {
+        // Clear the latch so a later auth failure starts a fresh round.
+        this.authRound = undefined
+        this.interactiveAuthMethodId = undefined
       }
-      const url = this.pendingAuthUrl
-      this.spec.onWarn?.(
-        `llm-acp: interactive authentication for "${this.spec.command}" is still pending after ${this.spec.authTimeoutMs}ms`
-        + (url !== undefined ? ` — complete the login in a browser: ${url}` : ''),
-      )
     })()
     return this.authRound
   }
@@ -556,9 +654,14 @@ export class AcpConnection {
     try {
       return await withTimeout(call(), this.spec.sessionTimeoutMs, label)
     } catch (error: unknown) {
-      if (this.authRound !== undefined || this.authMethods === undefined || this.authMethods.length === 0) throw error
+      // Only an actual auth failure earns an authenticate round; timeouts and
+      // transport errors would otherwise stall the caller behind a key-less
+      // interactive round that cannot help them.
+      if (this.authMethods === undefined || this.authMethods.length === 0 || !isAuthRequiredError(error)) throw error
       const message = error instanceof Error ? error.message : String(error)
       this.spec.onWarn?.(`llm-acp: ${label} failed for "${this.spec.command}" (${message}); running one authenticate round then retrying`)
+      // Concurrent failures share the in-flight round (or a finished one ends
+      // immediately); each caller retries its own operation once afterwards.
       await this.ensureAuthenticated()
       return await withTimeout(call(), this.spec.sessionTimeoutMs, label)
     }
@@ -605,8 +708,16 @@ export class AcpConnection {
     const entry = this.queues.get(params.sessionId)
     const update = params.update
     if (entry === undefined) {
+      // Content updates on an unqueued session lose real output — keep them
+      // per-session in the trace. Session-setup broadcasts (config options,
+      // mode, commands, usage) arrive for every new/discovery session and are
+      // pure noise, so collapse them across sessions into one counted row.
+      const contentDrop = update.sessionUpdate === 'agent_message_chunk'
+        || update.sessionUpdate === 'agent_thought_chunk'
+        || update.sessionUpdate === 'tool_call'
+        || update.sessionUpdate === 'plan'
       this.traceEvent('recv', 'session/update-dropped', `${update.sessionUpdate} sessionId=${params.sessionId}`,
-        `drop:${update.sessionUpdate}:${params.sessionId}`, params)
+        contentDrop ? `drop:${update.sessionUpdate}:${params.sessionId}` : `drop:${update.sessionUpdate}`, params)
       this.spec.onWarn?.(`llm-acp: dropped session/update ${update.sessionUpdate} for unqueued session ${params.sessionId}`)
       return
     }
@@ -634,6 +745,32 @@ export class AcpConnection {
       // Echo of user input; consumed silently.
     }
     // Other update variants are consumed but not surfaced.
+    const phase = acpAgentPhase(update)
+    if (phase === 'idle') {
+      // Agent reports idle while the prompt is still unsettled. Normally the
+      // `session/prompt` response lands a beat later; if it never does (dead
+      // internal model call), the watchdog settles the drain as an error.
+      if (entry.idleTimer === undefined) {
+        entry.idleTimer = setTimeout(() => {
+          entry.idleTimer = undefined
+          if (entry.promptSettled === true) return
+          // Free the server's in-flight prompt: serial servers queue every
+          // later call (including session/new) behind this dead prompt. The
+          // cancel is best-effort — a wedged handler may not reach it — so the
+          // owner also gets onDeadPrompt to rebuild the connection.
+          void this.conn.cancel({ sessionId: params.sessionId }).catch(() => { /* best-effort */ })
+          this.spec.onWedged?.(`prompt went idle without answering (session ${params.sessionId})`)
+          entry.queue.push({
+            kind: 'error',
+            error: new Error(`llm-acp: agent went idle without answering session/prompt for session ${params.sessionId} — the server dropped the turn`),
+          })
+          this.signal(entry)
+        }, IDLE_SETTLE_GRACE_MS)
+      }
+    } else if (phase !== undefined && entry.idleTimer !== undefined) {
+      clearTimeout(entry.idleTimer)
+      entry.idleTimer = undefined
+    }
     this.signal(entry)
   }
 
@@ -675,7 +812,13 @@ export class AcpConnection {
       const authUrl = typeof params.authUrl === 'string' ? params.authUrl : ''
       if (authUrl.length > 0) {
         this.pendingAuthUrl = authUrl
-        this.spec.onAuthUrl?.(authUrl)
+        // Auto-open at most once per connection: later publishes (a repeated
+        // notification or a new round after the authRound latch released)
+        // only refresh the URL the UI polls via `acp-auth-<id>`.
+        if (!this.authUrlNotified) {
+          this.authUrlNotified = true
+          this.spec.onAuthUrl?.(authUrl)
+        }
       }
       return
     }
@@ -722,8 +865,17 @@ export class AcpConnection {
    */
   async newSession(): Promise<string> {
     this.traceEvent('send', 'session/new', `cwd=${this.spec.cwd}`, undefined, { cwd: this.spec.cwd, mcpServers: [] })
-    const session = await this.withAuthRetry('session/new', () =>
-      this.conn.newSession({ cwd: this.spec.cwd, mcpServers: [] }))
+    let session: NewSessionResponse
+    try {
+      session = await this.withAuthRetry('session/new', () =>
+        this.conn.newSession({ cwd: this.spec.cwd, mcpServers: [] }))
+    } catch (error: unknown) {
+      // A timed-out session/new on a serial server means its request queue is
+      // wedged behind a dead prompt — tell the owner to rebuild instead of
+      // leaving every later call to starve the same way.
+      if (isTimeoutError(error)) this.spec.onWedged?.(`session/new timed out after ${this.spec.sessionTimeoutMs}ms`)
+      throw error
+    }
     const returnedId: unknown = Reflect.get(session, 'sessionId')
     if (typeof returnedId !== 'string') {
       throw new Error('llm-acp: ACP server published a session without a string sessionId')
@@ -805,6 +957,17 @@ export class AcpConnection {
    */
   async discoverConfigOptions(): Promise<readonly SessionConfigOption[] | undefined> {
     await this.ready
+    if (this.cachedConfigOptions !== undefined) return this.cachedConfigOptions
+    // Share one in-flight probe so concurrent polls do not each spawn a session.
+    this.configOptionsProbe ??= this.probeConfigOptions()
+    const options = await this.configOptionsProbe
+    this.configOptionsProbe = undefined
+    if (options !== undefined) this.cachedConfigOptions = options
+    return options
+  }
+
+  /** Single config-option probe: one throwaway session, closed immediately. */
+  private async probeConfigOptions(): Promise<readonly SessionConfigOption[] | undefined> {
     const session = await this.withAuthRetry('session/new', () =>
       this.conn.newSession({ cwd: this.spec.cwd, mcpServers: [] }))
     const configOptions: Array<SessionConfigOption> | null | undefined = Reflect.get(session, 'configOptions')
@@ -898,11 +1061,15 @@ export class AcpConnection {
       (result) => {
         const stopReason: StopReason | undefined = Reflect.get(result, 'stopReason')
         this.traceEvent('recv', 'session/prompt', `stopReason=${stopReason ?? 'end_turn'}`, undefined, result)
+        entry.promptSettled = true
+        if (entry.idleTimer !== undefined) { clearTimeout(entry.idleTimer); entry.idleTimer = undefined }
         entry.queue.push({ kind: 'done', reason: stopReason ?? 'end_turn' })
         this.signal(entry)
       },
       (err: unknown) => {
         const error = err instanceof Error ? err : new Error(String(err))
+        entry.promptSettled = true
+        if (entry.idleTimer !== undefined) { clearTimeout(entry.idleTimer); entry.idleTimer = undefined }
         entry.queue.push({ kind: 'error', error })
         this.signal(entry)
       },
@@ -916,6 +1083,7 @@ export class AcpConnection {
     } finally {
       signal.removeEventListener('abort', onAbort)
       if (cancelTimer !== undefined) clearTimeout(cancelTimer)
+      if (entry.idleTimer !== undefined) clearTimeout(entry.idleTimer)
       this.queues.delete(sessionId)
     }
   }

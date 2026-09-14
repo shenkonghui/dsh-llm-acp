@@ -22,7 +22,7 @@ export type AcpSettingsLocaleKey =
   | 'test' | 'testTitle' | 'testSkipped'
   | 'testStep_handshake' | 'testStep_models' | 'testStep_message'
   | 'testHandshakeFail' | 'testNoModels' | 'testNoResponse'
-  | 'authPending' | 'authOpen'
+  | 'authPending' | 'authOpen' | 'authWaiting'
   | 'customAdd' | 'customTitle' | 'customId' | 'customIdHint' | 'customName'
   | 'customCommand' | 'customCommandHint' | 'customArgs' | 'customArgsHint'
   | 'customEnv' | 'customEnvHint' | 'customSave' | 'customSaving'
@@ -102,6 +102,7 @@ export const en: Record<AcpSettingsLocaleKey, string> = {
   testNoResponse: 'No result returned — the host plugin may be running a stale build; restart the harness and retry.',
   authPending: 'This server is waiting for an interactive login.',
   authOpen: 'Open login page',
+  authWaiting: 'Waiting for interactive sign-in',
   customAdd: 'Add custom agent',
   customTitle: 'Add Custom ACP Agent',
   customId: 'Server ID',
@@ -207,6 +208,7 @@ export const zh: Record<AcpSettingsLocaleKey, string> = {
   testNoResponse: '服务未返回结果——宿主端插件可能在运行旧版本，请重启 harness 后重试。',
   authPending: '此服务正在等待交互式登录。',
   authOpen: '打开登录页面',
+  authWaiting: '正在等待交互式登录',
   customAdd: '添加自定义 Agent',
   customTitle: '添加自定义 ACP Agent',
   customId: '服务 ID',

@@ -158,7 +158,7 @@ export function AcpProtocolView({
                 {traces.map((row, i) => (
                   <li
                     key={i}
-                    className={`${css.item} ${selected !== null && rowKey(selected) === rowKey(row) ? css.selected : ''}`}
+                    className={`${css.item} ${row.entry.method.endsWith('-dropped') ? css.dropped : ''} ${selected !== null && rowKey(selected) === rowKey(row) ? css.selected : ''}`}
                     onClick={() => {
                       setSelected(selected !== null && rowKey(selected) === rowKey(row) ? null : row)
                     }}
