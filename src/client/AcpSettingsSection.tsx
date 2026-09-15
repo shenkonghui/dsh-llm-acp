@@ -33,6 +33,9 @@ export interface AcpServerEntry {
   models?: string[]
   customModels?: { id: string; name: string }[]
   modeMap?: Record<string, string>
+  /** Chosen ACP auth method id; `''`/absent means the server picks (only valid
+   * when it advertises a single method). */
+  authMethod?: string
 }
 
 /** Wire view of one registered settings namespace (the fields this section reads). */
@@ -248,6 +251,30 @@ async function loadAuthState(
   }
 }
 
+/**
+ * Load one server's advertised auth methods via the `acp-methods-<id>`
+ * discovery route. Returns an empty catalog when the host runs a stale build
+ * without the route, so the selector degrades to hidden rather than wrong.
+ */
+async function loadAuthMethods(
+  api: AcpSettingsSectionInjected['api'],
+  settingsNs: string,
+  serverId: string,
+): Promise<{ id: string; name: string }[]> {
+  try {
+    const response = await api.discoverModels(settingsNs, `acp-methods-${serverId}`)
+    if (!response.ok) return []
+    const entry = (response.value ?? [])[0]
+    if (entry === undefined || entry.id !== 'methods') return []
+    const parsed = JSON.parse(entry.name) as { methods?: unknown }
+    if (!Array.isArray(parsed.methods)) return []
+    return parsed.methods.filter((m): m is { id: string; name: string } =>
+      typeof m?.id === 'string' && typeof m?.name === 'string')
+  } catch {
+    return []
+  }
+}
+
 /** Compact version label for a server card: live agent version first, then
  * the registry version as a fallback when the server has not reported yet. */
 function serverVersionLabel(
@@ -342,6 +369,8 @@ export function AcpSettingsSection(props: AcpSettingsSectionProps) {
   const [savingId, setSavingId] = useState<string | undefined>()
   const [serverInfo, setServerInfo] = useState<Record<string, ServerInfo | undefined>>({})
   const [authStates, setAuthStates] = useState<Record<string, AuthState | undefined>>({})
+  const [authMethodDrafts, setAuthMethodDrafts] = useState<Record<string, string>>({})
+  const [authMethods, setAuthMethods] = useState<Record<string, { id: string; name: string }[]>>({})
   const [testServer, setTestServer] = useState<{ id: string; name: string } | undefined>()
   const [testSteps, setTestSteps] = useState<Record<TestStepId, TestStepState>>({
     handshake: { status: 'running' },
@@ -536,16 +565,19 @@ export function AcpSettingsSection(props: AcpSettingsSectionProps) {
         ...prev,
         [id]: (server.customModels ?? []).map(m => ({ id: m.id, name: m.name })),
       }))
+      setAuthMethodDrafts(prev => ({ ...prev, [id]: server.authMethod ?? '' }))
     }
     // Fetch discovered models and live server info for this provider route.
     setModelsLoading(prev => new Set(prev).add(id))
-    const [models, info, authState, modes] = await Promise.all([
+    const [models, info, authState, modes, methods] = await Promise.all([
       loadProviderModels(api, settingsNs, `acp-${id}`),
       loadServerInfo(api, settingsNs, id),
       loadAuthState(api, settingsNs, id),
       loadProviderModels(api, settingsNs, `acp-modes-${id}`),
+      loadAuthMethods(api, settingsNs, id),
     ])
     setAcpModes(prev => ({ ...prev, [id]: modes }))
+    setAuthMethods(prev => ({ ...prev, [id]: methods }))
     setDiscoveredModels(prev => ({ ...prev, [id]: models }))
     setServerInfo(prev => (prev[id] === info ? prev : { ...prev, [id]: info }))
     setAuthStates(prev => (prev[id] === authState ? prev : { ...prev, [id]: authState }))
@@ -598,6 +630,10 @@ export function AcpSettingsSection(props: AcpSettingsSectionProps) {
           },
           { op: 'set', path: ['servers', id, 'models'], value: models },
           { op: 'set', path: ['servers', id, 'customModels'], value: customModels },
+          // Batched with the rest rather than written on change: an immediate
+          // write would bump the namespace revision and make this form's own
+          // Save fail as stale, silently dropping every other edit.
+          { op: 'set', path: ['servers', id, 'authMethod'], value: authMethodDrafts[id] ?? '' },
         ],
         revisionRef.current,
       )
@@ -1115,6 +1151,31 @@ export function AcpSettingsSection(props: AcpSettingsSectionProps) {
                             + {t('addModeMap')}
                           </button>
                         </div>
+
+                        {/* Only meaningful when the server offers a choice: a
+                            single method is used automatically, so the row is
+                            hidden rather than shown with one dead option. */}
+                        {(authMethods[id] ?? []).length > 1 && (
+                          <div className={css.detailSection}>
+                            <p className={css.detailHeading}>{t('authMethod')}</p>
+                            <p className={css.detailHint}>{t('authMethodHint')}</p>
+                            <select
+                              className={css.authMethodSelect}
+                              value={authMethodDrafts[id] ?? ''}
+                              onChange={e => {
+                                const value = e.target.value
+                                setAuthMethodDrafts(prev => ({ ...prev, [id]: value }))
+                              }}
+                            >
+                              <option value="">{t('authMethodUnset')}</option>
+                              {(authMethods[id] ?? []).map(method => (
+                                <option key={method.id} value={method.id}>
+                                  {method.name.length > 0 ? `${method.name} (${method.id})` : method.id}
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+                        )}
 
                         <div className={css.detailSection}>
                           <div className={css.modelSelectHeader}>

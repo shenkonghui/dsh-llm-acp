@@ -39,6 +39,9 @@ export interface AcpServerEntry {
         name: string;
     }[];
     modeMap?: Record<string, string>;
+    /** Chosen ACP auth method id; `''`/absent means the server picks (only valid
+     * when it advertises a single method). */
+    authMethod?: string;
 }
 /** Wire view of one registered settings namespace (the fields this section reads). */
 interface AcpNamespaceView {

@@ -25,6 +25,8 @@ export type AcpSettingsLocaleKey =
   | 'testStep_handshake' | 'testStep_models' | 'testStep_message'
   | 'testHandshakeFail' | 'testNoModels' | 'testNoResponse'
   | 'authPending' | 'authOpen' | 'authWaiting'
+  | 'authMethod' | 'authMethodHint' | 'authMethodUnset' | 'authMethodAuto'
+  | 'chooseMethodTitle' | 'chooseMethodIntro' | 'chooseMethodFailed'
   | 'customAdd' | 'customTitle' | 'customId' | 'customIdHint' | 'customName'
   | 'customCommand' | 'customCommandHint' | 'customArgs' | 'customArgsHint'
   | 'customEnv' | 'customEnvHint' | 'customSave' | 'customSaving'
@@ -111,6 +113,13 @@ export const en: Record<AcpSettingsLocaleKey, string> = {
   authPending: 'This server is waiting for an interactive login.',
   authOpen: 'Open login page',
   authWaiting: 'Waiting for interactive sign-in',
+  authMethod: 'Login method',
+  authMethodHint: 'Which method this server logs in with. Only needed when it offers more than one; a single method is used automatically.',
+  authMethodUnset: 'Not selected',
+  authMethodAuto: 'Automatic (single method)',
+  chooseMethodTitle: 'Choose a login method',
+  chooseMethodIntro: 'This ACP server offers several login methods. Pick the one reachable from this machine — they are not interchangeable.',
+  chooseMethodFailed: 'Failed to save the login method.',
   customAdd: 'Add custom agent',
   customTitle: 'Add Custom ACP Agent',
   customId: 'Server ID',
@@ -223,6 +232,13 @@ export const zh: Record<AcpSettingsLocaleKey, string> = {
   authPending: '此服务正在等待交互式登录。',
   authOpen: '打开登录页面',
   authWaiting: '正在等待交互式登录',
+  authMethod: '登录方式',
+  authMethodHint: '该服务用哪种方式登录。仅当它提供多种方式时才需要选择；只有一种时会自动使用。',
+  authMethodUnset: '未选择',
+  authMethodAuto: '自动（仅一种方式）',
+  chooseMethodTitle: '选择登录方式',
+  chooseMethodIntro: '该 ACP 服务提供多种登录方式。请选择本机可达的那一种——它们并不等价。',
+  chooseMethodFailed: '登录方式保存失败。',
   customAdd: '添加自定义 Agent',
   customTitle: '添加自定义 ACP Agent',
   customId: '服务 ID',

@@ -629,3 +629,54 @@
   border-color: var(--dsw-accent, #1677ff);
   outline: none;
 }
+
+/* Auth-method picker: one tappable row per advertised method. */
+.methodList {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.methodButton {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  text-align: left;
+  padding: 8px 10px;
+  border: 1px solid var(--dsw-border, #e0e0e0);
+  border-radius: 6px;
+  background: var(--dsw-bg-primary, #fff);
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.methodButton:hover:not(:disabled) {
+  border-color: var(--dsw-accent, #1677ff);
+}
+
+.methodButton:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.methodName {
+  font-weight: 500;
+}
+
+.methodId {
+  font-size: 12px;
+  color: var(--dsw-text-tertiary, #999);
+  font-family: var(--dsw-font-mono, monospace);
+}
+
+.authMethodSelect {
+  width: 100%;
+  padding: 6px 8px;
+  border: 1px solid var(--dsw-border, #e0e0e0);
+  border-radius: 4px;
+  font-size: 13px;
+  background: var(--dsw-bg-primary, #fff);
+  color: inherit;
+  box-sizing: border-box;
+}

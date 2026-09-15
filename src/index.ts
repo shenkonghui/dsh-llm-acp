@@ -106,6 +106,17 @@ export interface AcpServerConfig {
    * their own default.
    */
   modeMap?: Record<string, string>
+  /**
+   * Which advertised ACP auth method to log in with, e.g. `external`. Only
+   * needed when the server offers a choice: a single advertised method is
+   * used automatically, and a server that logs in from cached credentials or
+   * env credentials never authenticates at all. Methods are not
+   * interchangeable — codebuddy advertises an intranet-only `iOA` alongside a
+   * public `external` — so an unset or unknown value leaves authentication
+   * blocked (and the ACP Servers UI asks) rather than guessing. Changing this
+   * rebuilds the server's connection, which is what actually applies it.
+   */
+  authMethod?: string
 }
 
 /** Plugin config: defaults applied to every spawned ACP server. */
@@ -182,6 +193,7 @@ export const Config: z<Config> = z.object({
       name: z.string().default(''),
     })).default([]),
     modeMap: z.dict(z.string()).default({}),
+    authMethod: z.string().default(''),
   })).default({}),
 })
 
@@ -198,6 +210,7 @@ const SettingsSchema = z.object({
       name: z.string().default(''),
     })).default([]),
     modeMap: z.dict(z.string()).default({}),
+    authMethod: z.string().default(''),
   })).default({}),
 })
 
@@ -362,6 +375,10 @@ function serverFingerprint(server: AcpServerConfig): string {
     models: server.models ?? [],
     customModels: server.customModels ?? [],
     modeMap: server.modeMap ?? {},
+    // Part of the fingerprint because the connection owns the value at
+    // construction: only a rebuild applies a new method, and a rebuild is also
+    // what abandons an authenticate round still hung on the old one.
+    authMethod: server.authMethod ?? '',
   })
 }
 
@@ -474,6 +491,7 @@ export function apply(ctx: Context, config: Config): void {
       spawn: spec => ctx.subprocess.spawn(spec),
       onWarn: message => ctx.logger.warn(message),
       onAuthUrl: openBrowser,
+      authMethod: server.authMethod ?? '',
       // Resolve an API key from the server's configured env. When present,
       // it is passed via _meta.api_key in an eager authenticate round so ACP
       // servers that accept direct key auth skip interactive flows. When
@@ -696,6 +714,15 @@ export function apply(ctx: Context, config: Config): void {
   // flight but no URL was published; `id` `none` otherwise. Only the ACP
   // settings UI and conversation auth banner consume this route.
   const AUTH_PREFIX = 'acp-auth-'
+  // A sixth route convention, `acp-methods-<id>`, reports the server's auth
+  // method catalog for the choice UI. The reply reuses the
+  // `LlmDiscoveredModel` wire shape as a private carrier: `id` is always
+  // `methods` and `name` is a JSON-encoded `AcpAuthMethodState`
+  // (`{methods, selected, needed}`). Kept separate from `acp-auth-<id>`
+  // because that one reports a transient round (a hung round would otherwise
+  // hide the catalog just when the user needs to change the method). Consumed
+  // by the ACP settings UI and the conversation auth banner.
+  const METHODS_PREFIX = 'acp-methods-'
   /** How long to wait for `initialize` before the test probe reports failure. */
   const TEST_INIT_TIMEOUT_MS = 15_000
   /** How long to wait for the probe prompt's terminal update before aborting. */
@@ -812,6 +839,24 @@ export function apply(ctx: Context, config: Config): void {
       const method = server?.connection.getPendingAuthMethod()
       if (method !== undefined) return [{ id: 'pending', name: method }]
       return [{ id: 'none', name: '' }]
+    }
+    if (provider.startsWith(METHODS_PREFIX)) {
+      const serverId = provider.slice(METHODS_PREFIX.length)
+      const server = active.get(serverId)
+      if (server === undefined) {
+        return [{ id: 'methods', name: JSON.stringify({ methods: [], selected: '', needed: false }) }]
+      }
+      // The catalog only exists after `initialize`; bound the wait so the
+      // picker renders "no methods" instead of hanging on a cold `npx` start.
+      try {
+        await Promise.race([
+          server.connection.ready,
+          new Promise((_, reject) => setTimeout(() => reject(new Error('initialize timed out')), 10_000)),
+        ])
+      } catch {
+        // Report whatever is known (usually nothing) rather than failing.
+      }
+      return [{ id: 'methods', name: JSON.stringify(server.connection.authMethodState()) }]
     }
     // A sixth route convention, `acp-trace-<id>`, returns the server's
     // recent protocol interactions (ring buffer, max 10). The reply reuses

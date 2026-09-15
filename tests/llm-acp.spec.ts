@@ -47,6 +47,9 @@ async function setup(mockEnv: SetupEnv = {}, opts: {
   permissionPreset?: PresetName | (() => PresetName)
   sandboxMode?: string
   modeMap?: Record<string, string>
+  authMethod?: string
+  /** Collects host warnings, for asserting on diagnostics. */
+  warnSink?: string[]
   server?: { command: string; args: string[] }
   config?: Record<string, unknown>
 } = {}) {
@@ -73,19 +76,32 @@ async function setup(mockEnv: SetupEnv = {}, opts: {
   await ctx.plugin(LocalSubprocessRuntime)
   // Minimal `settings` seam stub: the plugin's `installSection` call fails on
   // `ctx.settings === undefined`, which aborts `apply` and rolls back every
-  // registered adapter. A static source is enough — tests never edit settings.
+  // registered adapter. The holder stays mutable so a test can act as the
+  // settings UI and drive a reconcile.
+  let holder: { servers: Record<string, unknown> } = { servers: {} }
+  let notifyChange: (() => void) | undefined
   ctx.provide('settings' as never, {
     installSection(
       _owner: unknown,
       _ns: string,
       _schema: unknown,
       entry: unknown,
-      hooks: { setSource: (source: () => unknown) => void },
+      hooks: { setSource: (source: () => unknown) => void; onChange: () => void },
     ) {
-      hooks.setSource(() => entry)
+      holder = entry as { servers: Record<string, unknown> }
+      notifyChange = hooks.onChange
+      hooks.setSource(() => holder)
     },
   } as never)
   const server = opts.server ?? { command: process.execPath, args: [mockServer] }
+  if (opts.warnSink !== undefined) {
+    const sink = opts.warnSink
+    const original = ctx.logger.warn.bind(ctx.logger)
+    ctx.logger.warn = (...args: unknown[]) => {
+      sink.push(args.map(a => (typeof a === 'string' ? a : String(a))).join(' '))
+      original(...(args as [unknown]))
+    }
+  }
   await ctx.plugin(acp, {
     emitReasoning: opts.emitReasoning ?? false,
     env: mockEnv,
@@ -96,10 +112,17 @@ async function setup(mockEnv: SetupEnv = {}, opts: {
         args: server.args,
         name: 'Test ACP',
         modeMap: opts.modeMap ?? {},
+        authMethod: opts.authMethod ?? '',
       },
     },
   })
-  return ctx
+  // Act as the settings UI: replace the stored server map and notify, so the
+  // plugin reconciles exactly as it would after a real write.
+  const applyServers = (servers: Record<string, unknown>): void => {
+    holder.servers = servers
+    notifyChange?.()
+  }
+  return Object.assign(ctx, { applyServers })
 }
 
 /** Collect all StreamChunks from one adapter stream call. */
@@ -107,6 +130,33 @@ async function collect(chunks: AsyncIterable<StreamChunk>): Promise<StreamChunk[
   const out: StreamChunk[] = []
   for await (const chunk of chunks) out.push(chunk)
   return out
+}
+
+/**
+ * A fresh path for the mock to append its `authenticate` calls to. The file is
+ * the observable proof of whether (and with which method) a round ran, which a
+ * behavioural assertion alone cannot distinguish from "optimistically worked".
+ */
+function authLog(): string {
+  return join(mkdtempSync(join(tmpdir(), 'llm-acp-auth-')), 'auth.log')
+}
+
+/** Recorded `authenticate` calls, one `auth=<methodId>[ key]` per line. */
+function authCalls(file: string): string[] {
+  if (!existsSync(file)) return []
+  return readFileSync(file, 'utf8').split('\n').filter(line => line.trim().length > 0)
+}
+
+/** Read the auth-method picker state from the `acp-methods-<id>` route. */
+async function methodState(ctx: Context): Promise<{
+  methods: { id: string; name: string }[]
+  selected: string
+  needed: boolean
+}> {
+  const models = await ctx.llm.discoverModels('llm-acp', { provider: 'acp-methods-test' })
+  const entry = models[0]
+  if (entry === undefined) throw new Error('the acp-methods route returned no entry')
+  return JSON.parse(entry.name) as { methods: { id: string; name: string }[]; selected: string; needed: boolean }
 }
 
 /** Assemble the text blocks from a stream's chunks. */
@@ -231,6 +281,187 @@ describe('dsh-llm-acp', () => {
       const chunks = await collect(stream)
       expect(chunks.filter(c => c.type === 'reasoning-delta')).toHaveLength(0)
       expect(assembledText(chunks)).toBe('answer')
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('reports context occupancy as a usage chunk and advertises the server window as the model context', async () => {
+    const ctx = await setup(
+      { MOCK_TEXT: 'answer', MOCK_USAGE_USED: '64000', MOCK_USAGE_SIZE: '200000' },
+      { server: { command: process.execPath, args: [authMockServer] } },
+    )
+    try {
+      const chunks = await collect(ctx.llm.stream({
+        provider: 'acp-test',
+        model: 'any',
+        messages: [createUserMessage({ content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } })],
+      }))
+      // The server's occupancy is prompt-side only and ACP splits out no
+      // response tokens, so it lands as `inputTokens` with a zero output side.
+      expect(chunks.filter(c => c.type === 'usage')).toEqual([
+        { type: 'usage', usage: { inputTokens: 64_000, outputTokens: 0 } },
+      ])
+      // The adapter contract puts usage before the terminal finish.
+      expect(chunks.findIndex(c => c.type === 'usage'))
+        .toBeLessThan(chunks.findIndex(c => c.type === 'finish'))
+      // Capacity is what the harness pairs with the sample to render a percent.
+      const resolved = await ctx.llm.resolveModelInfo('acp-test', 'any')
+      expect(resolved.context).toEqual({ contextWindow: 200_000 })
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('reports occupancy without a model capacity when the server publishes no window', async () => {
+    const ctx = await setup(
+      { MOCK_TEXT: 'answer', MOCK_USAGE_USED: '512' },
+      { server: { command: process.execPath, args: [authMockServer] } },
+    )
+    try {
+      const chunks = await collect(ctx.llm.stream({
+        provider: 'acp-test',
+        model: 'any',
+        messages: [createUserMessage({ content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } })],
+      }))
+      expect(chunks.filter(c => c.type === 'usage')).toEqual([
+        { type: 'usage', usage: { inputTokens: 512, outputTokens: 0 } },
+      ])
+      // A zero window is not a capacity: advertising one would fail the harness's
+      // context-metadata validation and break every request on this route.
+      const resolved = await ctx.llm.resolveModelInfo('acp-test', 'any')
+      expect(resolved.context).toBeUndefined()
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('advertises no capacity until a sample arrives, then keeps it across sessions', async () => {
+    const ctx = await setup(
+      { MOCK_TEXT: 'answer', MOCK_USAGE_USED: '64000', MOCK_USAGE_SIZE: '200000' },
+      { server: { command: process.execPath, args: [authMockServer] } },
+    )
+    try {
+      // Before any sample the route has no capacity, so the harness records a
+      // capacity-less `request/context` and renders no occupancy at all. This
+      // is the fallback a first turn runs under.
+      expect((await ctx.llm.resolveModelInfo('acp-test', 'any')).context).toBeUndefined()
+
+      const chunks = await collect(ctx.llm.stream({
+        provider: 'acp-test',
+        model: 'any',
+        messages: [createUserMessage({ content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } })],
+      }))
+      expect(chunks.filter(c => c.type === 'usage')).toEqual([
+        { type: 'usage', usage: { inputTokens: 64_000, outputTokens: 0 } },
+      ])
+
+      // That sample is what supplies the capacity, so the NEXT request records
+      // a second `request/context` (the harness re-records whenever it changes)
+      // and both halves of the occupancy display are finally known. The window
+      // is a route property, so it survives the throwaway session that
+      // published it.
+      expect((await ctx.llm.resolveModelInfo('acp-test', 'any')).context).toEqual({ contextWindow: 200_000 })
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('keeps the last known window when a later sample carries an unusable size', async () => {
+    // Three sequential turns: a good window, then a fractional and a negative
+    // one. Each unusable size must be refused WITHOUT evicting the window
+    // already learned — a server that loses track of its window mid-conversation
+    // must not make the display go dark.
+    const ctx = await setup(
+      { MOCK_TEXT: 'answer', MOCK_USAGE_USED: '100,200,300', MOCK_USAGE_SIZE: '200000,1.5,-3' },
+      { server: { command: process.execPath, args: [authMockServer] } },
+    )
+    try {
+      const turn = async (): Promise<number | undefined> => {
+        const chunks = await collect(ctx.llm.stream({
+          provider: 'acp-test',
+          model: 'any',
+          messages: [createUserMessage({ content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } })],
+        }))
+        const usage = chunks.flatMap(c => c.type === 'usage' ? [c.usage.inputTokens] : [])
+        expect(usage).toHaveLength(1)
+        return (await ctx.llm.resolveModelInfo('acp-test', 'any')).context?.contextWindow
+      }
+
+      expect(await turn()).toBe(200_000)
+      expect(await turn()).toBe(200_000)
+      expect(await turn()).toBe(200_000)
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('replaces the window when the server reports a new one', async () => {
+    // The retention above must not turn into over-retention: a legitimate new
+    // capacity (the user switched to a larger model behind the same server) is
+    // adopted, which is what makes the harness re-record `request/context`.
+    const ctx = await setup(
+      { MOCK_TEXT: 'answer', MOCK_USAGE_USED: '100,200', MOCK_USAGE_SIZE: '200000,1000000' },
+      { server: { command: process.execPath, args: [authMockServer] } },
+    )
+    try {
+      const window = async (): Promise<number | undefined> => {
+        await collect(ctx.llm.stream({
+          provider: 'acp-test',
+          model: 'any',
+          messages: [createUserMessage({ content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } })],
+        }))
+        return (await ctx.llm.resolveModelInfo('acp-test', 'any')).context?.contextWindow
+      }
+      expect(await window()).toBe(200_000)
+      expect(await window()).toBe(1_000_000)
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('learns the window from a session-setup sample that no prompt produced', async () => {
+    // Some servers know their occupancy as soon as they open a session. The
+    // probe session the adapter builds to discover models has no consumer
+    // draining it, so the sample must still reach the route's capacity.
+    const ctx = await setup(
+      { MOCK_TEXT: 'answer', MOCK_USAGE_USED: '500', MOCK_USAGE_SIZE: '200000', MOCK_USAGE_ON_SESSION: '1' },
+      { server: { command: process.execPath, args: [authMockServer] } },
+    )
+    try {
+      expect((await ctx.llm.resolveModelInfo('acp-test', 'any')).context).toEqual({ contextWindow: 200_000 })
+
+      const chunks = await collect(ctx.llm.stream({
+        provider: 'acp-test',
+        model: 'any',
+        messages: [createUserMessage({ content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } })],
+      }))
+      expect(chunks.filter(c => c.type === 'usage')).toEqual([
+        { type: 'usage', usage: { inputTokens: 500, outputTokens: 0 } },
+      ])
+      expect((await ctx.llm.resolveModelInfo('acp-test', 'any')).context).toEqual({ contextWindow: 200_000 })
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('omits context accounting for auxiliary calls', async () => {
+    // Compaction and session-title calls render a purpose-built prompt into a
+    // throwaway session; reporting that occupancy would displace the
+    // conversation's own sample in the harness's context-pressure fold.
+    const ctx = await setup(
+      { MOCK_TEXT: 'summary', MOCK_USAGE_USED: '64000', MOCK_USAGE_SIZE: '200000' },
+      { server: { command: process.execPath, args: [authMockServer] } },
+    )
+    try {
+      const chunks = await collect(ctx.llm.stream({
+        provider: 'acp-test',
+        model: 'any',
+        purpose: 'compaction',
+        messages: [createUserMessage({ content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } })],
+      }))
+      expect(chunks.filter(c => c.type === 'usage')).toHaveLength(0)
+      expect(assembledText(chunks)).toBe('summary')
     } finally {
       await ctx.fiber.dispose()
     }
@@ -525,6 +756,238 @@ describe('dsh-llm-acp', () => {
       }))
       expect(assembledText(chunks)).toBe('authed answer')
       expect(finishChunk(chunks).reason.kind).toBe('stop')
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('uses the only advertised auth method without asking', async () => {
+    // A server offering no choice needs no choice UI: the sole method is used
+    // and the picker reports nothing pending.
+    const file = authLog()
+    const ctx = await setup(
+      { MOCK_AUTH_METHODS: 'oauth', MOCK_REQUIRE_AUTH: '1', MOCK_AUTH_FILE: file, MOCK_TEXT: 'only one' },
+      { server: { command: process.execPath, args: [authMockServer] } },
+    )
+    try {
+      const chunks = await collect(ctx.llm.stream({
+        provider: 'acp-test',
+        model: 'any',
+        messages: [createUserMessage({ content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } })],
+      }))
+      expect(assembledText(chunks)).toBe('only one')
+      expect(authCalls(file)).toEqual(['auth=oauth'])
+      const state = await methodState(ctx)
+      expect(state.methods.map(m => m.id)).toEqual(['oauth'])
+      expect(state.needed).toBe(false)
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('blocks instead of guessing when several methods are advertised and none is chosen', async () => {
+    // codebuddy-style: the first advertised method is intranet-only. Guessing
+    // it would hang for the whole interactive-auth window, so an unpicked
+    // choice must fail fast, call nothing, and raise the picker instead.
+    const file = authLog()
+    const warns: string[] = []
+    const ctx = await setup(
+      {
+        MOCK_AUTH_METHODS: 'iOA:Login with iOA,external:Login with Google/Github',
+        MOCK_REQUIRE_AUTH: '1',
+        MOCK_AUTH_FILE: file,
+        MOCK_TEXT: 'never reached',
+      },
+      { server: { command: process.execPath, args: [authMockServer] }, warnSink: warns, config: { sessionTimeoutMs: 2_000 } },
+    )
+    try {
+      const before = await methodState(ctx)
+      expect(before.methods.map(m => m.id)).toEqual(['iOA', 'external'])
+      expect(before.selected).toBe('')
+      // Nothing has been attempted yet, so the user is not nagged merely for
+      // having a multi-method server.
+      expect(before.needed).toBe(false)
+
+      const started = Date.now()
+      const chunks = await collect(ctx.llm.stream({
+        provider: 'acp-test',
+        model: 'any',
+        messages: [createUserMessage({ content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } })],
+      }))
+      expect(finishChunk(chunks).reason.kind).toBe('error')
+      // Far below the 5-minute interactive window: a blocked choice does not
+      // park the turn on a guess.
+      expect(Date.now() - started).toBeLessThan(30_000)
+
+      expect(authCalls(file)).toEqual([])
+      expect((await methodState(ctx)).needed).toBe(true)
+      expect(warns.some(w => w.includes('iOA, external') && w.includes('none is selected'))).toBe(true)
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('uses the selected method when several are advertised', async () => {
+    const file = authLog()
+    const ctx = await setup(
+      {
+        MOCK_AUTH_METHODS: 'iOA:Login with iOA,external:Login with Google/Github',
+        MOCK_REQUIRE_AUTH: '1',
+        MOCK_AUTH_REQUIRE_METHOD: 'external',
+        MOCK_AUTH_FILE: file,
+        MOCK_TEXT: 'picked method',
+      },
+      { server: { command: process.execPath, args: [authMockServer] }, authMethod: 'external' },
+    )
+    try {
+      const chunks = await collect(ctx.llm.stream({
+        provider: 'acp-test',
+        model: 'any',
+        messages: [createUserMessage({ content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } })],
+      }))
+      expect(assembledText(chunks)).toBe('picked method')
+      // Exactly the chosen method, never the first-advertised one.
+      expect(authCalls(file)).toEqual(['auth=external'])
+      const state = await methodState(ctx)
+      expect(state.selected).toBe('external')
+      expect(state.needed).toBe(false)
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('treats a selection the server does not advertise as unresolved in a multi-method catalog', async () => {
+    // A renamed or removed method must not silently fall back to the first
+    // entry — that is the exact guess this feature exists to prevent.
+    const file = authLog()
+    const ctx = await setup(
+      { MOCK_AUTH_METHODS: 'iOA,external', MOCK_REQUIRE_AUTH: '1', MOCK_AUTH_FILE: file },
+      { server: { command: process.execPath, args: [authMockServer] }, authMethod: 'bogus', config: { sessionTimeoutMs: 2_000 } },
+    )
+    try {
+      const chunks = await collect(ctx.llm.stream({
+        provider: 'acp-test',
+        model: 'any',
+        messages: [createUserMessage({ content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } })],
+      }))
+      expect(finishChunk(chunks).reason.kind).toBe('error')
+      expect(authCalls(file)).toEqual([])
+      const state = await methodState(ctx)
+      expect(state.selected).toBe('bogus')
+      expect(state.needed).toBe(true)
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('falls back to the sole advertised method when the selection does not match it', async () => {
+    // With one method there is nothing to choose between, so a stale selection
+    // is not a reason to block authentication.
+    const file = authLog()
+    const ctx = await setup(
+      { MOCK_AUTH_METHODS: 'oauth', MOCK_REQUIRE_AUTH: '1', MOCK_AUTH_FILE: file, MOCK_TEXT: 'fell back' },
+      { server: { command: process.execPath, args: [authMockServer] }, authMethod: 'bogus' },
+    )
+    try {
+      const chunks = await collect(ctx.llm.stream({
+        provider: 'acp-test',
+        model: 'any',
+        messages: [createUserMessage({ content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } })],
+      }))
+      expect(assembledText(chunks)).toBe('fell back')
+      expect(authCalls(file)).toEqual(['auth=oauth'])
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('never authenticates eagerly with a configured API key while the choice is unresolved', async () => {
+    // The eager keyed round used to pick an API-key-shaped method, or the first
+    // one when none matched — codebuddy matches none, so a key silently
+    // selected the intranet method during `initialize`.
+    const file = authLog()
+    const ctx = await setup(
+      {
+        CODEBUDDY_API_KEY: 'secret',
+        MOCK_AUTH_METHODS: 'iOA:Login with iOA,external:Login with Google/Github',
+        MOCK_AUTH_FILE: file,
+        MOCK_TEXT: 'unused',
+      },
+      { server: { command: process.execPath, args: [authMockServer] } },
+    )
+    try {
+      // Resolution awaits `initialize`, so the keyed decision has been made.
+      await ctx.llm.resolveModelInfo('acp-test', 'any')
+      expect(authCalls(file)).toEqual([])
+      expect((await methodState(ctx)).needed).toBe(true)
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('carries the API key on the eagerly authenticated selected method', async () => {
+    const file = authLog()
+    const ctx = await setup(
+      {
+        CODEBUDDY_API_KEY: 'secret',
+        MOCK_AUTH_METHODS: 'iOA,external',
+        MOCK_AUTH_FILE: file,
+        MOCK_TEXT: 'keyed',
+      },
+      { server: { command: process.execPath, args: [authMockServer] }, authMethod: 'external' },
+    )
+    try {
+      await ctx.llm.resolveModelInfo('acp-test', 'any')
+      expect(authCalls(file)).toEqual(['auth=external key'])
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('applies a newly selected method by rebuilding the connection', async () => {
+    // Selecting in the dialog only writes settings; nothing takes effect unless
+    // the server config change rebuilds the connection, so this is the step
+    // that turns the picker into a working login.
+    const file = authLog()
+    const ctx = await setup(
+      {
+        MOCK_AUTH_METHODS: 'iOA:Login with iOA,external:Login with Google/Github',
+        MOCK_REQUIRE_AUTH: '1',
+        MOCK_AUTH_REQUIRE_METHOD: 'external',
+        MOCK_AUTH_FILE: file,
+        MOCK_TEXT: 'after rebuild',
+      },
+      { server: { command: process.execPath, args: [authMockServer] }, config: { sessionTimeoutMs: 2_000 } },
+    )
+    try {
+      // Blocked while unselected.
+      const blocked = await collect(ctx.llm.stream({
+        provider: 'acp-test',
+        model: 'any',
+        messages: [createUserMessage({ content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } })],
+      }))
+      expect(finishChunk(blocked).reason.kind).toBe('error')
+      expect(authCalls(file)).toEqual([])
+
+      ctx.applyServers({
+        test: {
+          command: process.execPath,
+          args: [authMockServer],
+          name: 'Test ACP',
+          authMethod: 'external',
+        },
+      })
+
+      const chunks = await collect(ctx.llm.stream({
+        provider: 'acp-test',
+        model: 'any',
+        messages: [createUserMessage({ content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } })],
+      }))
+      expect(assembledText(chunks)).toBe('after rebuild')
+      expect(authCalls(file)).toEqual(['auth=external'])
+      const state = await methodState(ctx)
+      expect(state.selected).toBe('external')
+      expect(state.needed).toBe(false)
     } finally {
       await ctx.fiber.dispose()
     }

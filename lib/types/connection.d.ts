@@ -8,9 +8,12 @@
  * API key resolves, and otherwise only after a `session/new`/`session/load`
  * failure — servers that accept env credentials or a cached login never see
  * an `authenticate` call, so a healthy server never triggers a browser login
- * it did not need. Every handshake and session operation is bounded by its
- * configured timeout so a wedged server fails fast instead of hanging the
- * harness.
+ * it did not need. When a server advertises several auth methods, the round
+ * waits for the operator's `authMethod` selection instead of guessing:
+ * methods differ in reachability (codebuddy's intranet-only `iOA` versus its
+ * public `external`), so a guess can hang for the whole interactive window.
+ * Every handshake and session operation is bounded by its configured timeout
+ * so a wedged server fails fast instead of hanging the harness.
  *
  * @module @deepseek-ai/dsh-llm-acp/connection
  */
@@ -30,8 +33,7 @@ export declare const DEFAULT_AUTH_TIMEOUT_MS = 15000;
  * enough for the user to finish a browser login before the failed session
  * call retries. */
 export declare const DEFAULT_INTERACTIVE_AUTH_TIMEOUT_MS = 300000;
-/** One queued update delivered to a {@link AcpConnection.promptStream} consumer. */
-type QueuedUpdate = {
+/** One queued update delivered to a {@link AcpConnection.promptStream} consumer. */ type QueuedUpdate = {
     kind: 'text';
     text: string;
 } | {
@@ -41,6 +43,9 @@ type QueuedUpdate = {
     kind: 'progress';
     text: string;
 } | {
+    kind: 'usage';
+    used: number;
+} | {
     kind: 'done';
     reason: StopReason;
 } | {
@@ -49,6 +54,21 @@ type QueuedUpdate = {
 };
 /** Decision returned by an interactive ACP permission requester. */
 export type AcpPermissionDecision = 'allow' | 'reject' | 'cancel';
+/**
+ * Auth-method picker state: what the server advertises, what the operator
+ * selected, and whether a blocked attempt has made a choice necessary.
+ */
+export interface AcpAuthMethodState {
+    /** Methods advertised in the `initialize` response; empty before it. */
+    methods: readonly {
+        id: string;
+        name: string;
+    }[];
+    /** The configured method id, `''` when the operator has not chosen yet. */
+    selected: string;
+    /** Whether authentication is currently blocked until a method is chosen. */
+    needed: boolean;
+}
 /** One captured ACP protocol interaction, for the protocol inspector view. */
 export interface ProtocolTraceEntry {
     /** Epoch milliseconds. */
@@ -135,6 +155,15 @@ export interface AcpConnectionSpec {
      * (the server will reject `session/new` if it requires auth).
      */
     resolveAuthApiKey?: () => Promise<string | undefined>;
+    /**
+     * The auth method this server should authenticate with, matching one of the
+     * ids it advertises in `initialize`. The operator picks it in the ACP
+     * Servers settings (`authMethod`) when the server offers more than one; a
+     * server that offers exactly one needs no selection. Ownership of this value
+     * is configuration, so a change rebuilds the connection rather than being
+     * read per round — see the fingerprint in the owning plugin.
+     */
+    authMethod?: string;
 }
 /**
  * One long-lived ACP client connection backed by a single child server
@@ -176,8 +205,29 @@ export declare class AcpConnection {
     private authUrlNotified;
     /** Auth method id of the in-flight key-less round, if any. */
     private interactiveAuthMethodId;
+    /**
+     * Set once an authentication attempt has been **blocked** because the server
+     * advertises several methods and none is selected. Latched only by an actual
+     * blocked attempt, never merely by the shape of the method list: a server
+     * whose cached login still works must not ask the user to choose.
+     */
+    private authChoiceBlocked;
+    /**
+     * Fingerprint of the last "choose an auth method" warning, so a repeated
+     * blocked attempt does not repeat the same line on every turn. Cleared when
+     * the condition changes (a different selection, or a different method list).
+     */
+    private authChoiceWarnedKey;
     private cachedConfigOptions;
     private configOptionsProbe;
+    /**
+     * Total context window in tokens as reported by the newest `usage_update`
+     * sample, across every session on this connection. The capacity belongs to
+     * the model behind the server rather than to one session, so it survives the
+     * session that published it (including the throwaway discovery probe
+     * session) and is exposed to the adapter as this route's model context.
+     */
+    private reportedContextWindow;
     /** Ring buffer of recent ACP protocol interactions (max {@link MAX_PROTOCOL_TRACE}). */
     private readonly protocolTrace;
     constructor(spec: AcpConnectionSpec);
@@ -216,11 +266,28 @@ export declare class AcpConnection {
      */
     getPendingAuthUrl(): string | undefined;
     /**
+     * Total context window (tokens) the server reported in its newest
+     * `usage_update` sample, or `undefined` before it reports one. A server
+     * counts this as the capacity of the model behind it, so it is exempt from
+     * session lifecycle: it outlives the session that published it and is read
+     * by the adapter as the route's model context capacity.
+     */
+    getContextWindow(): number | undefined;
+    /**
      * The auth method id of an in-flight key-less interactive round, or
      * `undefined` when no round is running. Lets callers surface "waiting for
      * interactive login" even before (or without) an auth URL.
      */
     getPendingAuthMethod(): string | undefined;
+    /**
+     * The advertised auth methods plus the operator's selection, for the ACP
+     * Servers picker. `needed` is true only once an authentication attempt was
+     * actually blocked for want of a selection — a server that offers several
+     * methods but logs in from a cached credential must not be nagged.
+     * @returns the method catalog (empty before `initialize`), the configured
+     *   method id (`''` when unset), and whether the user must choose.
+     */
+    authMethodState(): AcpAuthMethodState;
     /**
      * Begin an interactive authenticate round when the server advertises auth
      * methods — a no-op otherwise. Waits for `initialize` first so the
@@ -240,14 +307,17 @@ export declare class AcpConnection {
     /**
      * Eager `authenticate` round, run during `initialize` only when the server
      * advertises auth methods AND a configured API key resolves. The key rides
-     * as `_meta.api_key` for servers that accept direct key authentication; an
-     * API-key-shaped method is preferred over an interactive OAuth one when
-     * several are advertised. Without a key no `authenticate` call is made:
-     * servers that accept env credentials or a cached login go straight to
-     * `session/new`, and servers that truly require an interactive round reach
-     * it lazily through {@link ensureAuthenticated} on the first failed
-     * `session/new` — so a well-configured server never triggers a browser
-     * login it did not need.
+     * as `_meta.api_key` for servers that accept direct key authentication.
+     * Without a key no `authenticate` call is made: servers that accept env
+     * credentials or a cached login go straight to `session/new`, and servers
+     * that truly require an interactive round reach it lazily through
+     * {@link ensureAuthenticated} on the first failed `session/new` — so a
+     * well-configured server never triggers a browser login it did not need.
+     *
+     * The method is resolved by {@link resolveAuthMethod} like the lazy path, so
+     * a server offering several methods is never guessed at here either: an
+     * unresolved choice leaves this a no-op and `initialize` succeeds, keeping
+     * the connection usable for model discovery and the method picker.
      */
     private authenticateWithKey;
     /**
@@ -259,8 +329,23 @@ export declare class AcpConnection {
      * the connection stays usable, and a browser login URL published via the
      * `_codebuddy.ai/authUrl` extension notification is surfaced in the
      * warning so the user can complete an interactive login.
+     *
+     * A server offering several methods with none selected **starts no round at
+     * all**: guessing picks a flow the operator did not choose (codebuddy's
+     * intranet-only `iOA` hangs an off-network host for the whole interactive
+     * window), so the choice is deferred to the UI and the caller is told no
+     * round ran.
+     * @returns whether an `authenticate` round actually ran.
      */
     private ensureAuthenticated;
+    /**
+     * Latch the "the server offers several auth methods and none is selected"
+     * state and warn once per distinct condition. Called only from an attempt
+     * that was actually blocked, so a server whose cached login still works
+     * never reaches it; the warning repeats only when the selection or the
+     * advertised method list changes, so a failing turn does not spam the log.
+     */
+    private noteAuthChoiceBlocked;
     /**
      * Run one session operation bounded by `sessionTimeoutMs`. On failure —
      * once, and only while no `authenticate` round has run yet and the server
@@ -269,12 +354,22 @@ export declare class AcpConnection {
      * cached login never see an `authenticate` call at all.
      */
     private withAuthRetry;
+    /** Why the connection cannot authenticate on its own, for an error message. */
+    private authChoiceRejection;
     /** Resolve one ACP permission request through its owning session. */
     private requestPermission;
     /** Select an advertised rejection option, or cancel when none is available. */
     private rejectPermission;
     /** Push an inbound session/update into the owning session's queue. */
     private enqueueUpdate;
+    /**
+     * Arm or clear the idle watchdog from an update's `agentPhase` marker. Every
+     * update kind is inspected, not just content: a server may attach the marker
+     * to a non-content update (a usage sample, a mode change), and an `idle`
+     * phase there means the same thing. Unknown sessions are no-ops — the
+     * watchdog guards a prompt drain, so it only exists alongside one.
+     */
+    private trackAgentPhase;
     /**
      * Handle extension notifications from ACP servers that use non-standard
      * protocols (e.g. Devin's `_cognition.ai/*` notifications). These are

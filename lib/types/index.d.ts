@@ -59,6 +59,17 @@ export interface AcpServerConfig {
      * their own default.
      */
     modeMap?: Record<string, string>;
+    /**
+     * Which advertised ACP auth method to log in with, e.g. `external`. Only
+     * needed when the server offers a choice: a single advertised method is
+     * used automatically, and a server that logs in from cached credentials or
+     * env credentials never authenticates at all. Methods are not
+     * interchangeable — codebuddy advertises an intranet-only `iOA` alongside a
+     * public `external` — so an unset or unknown value leaves authentication
+     * blocked (and the ACP Servers UI asks) rather than guessing. Changing this
+     * rebuilds the server's connection, which is what actually applies it.
+     */
+    authMethod?: string;
 }
 /** Plugin config: defaults applied to every spawned ACP server. */
 export interface Config {

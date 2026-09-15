@@ -8,9 +8,12 @@
  * API key resolves, and otherwise only after a `session/new`/`session/load`
  * failure — servers that accept env credentials or a cached login never see
  * an `authenticate` call, so a healthy server never triggers a browser login
- * it did not need. Every handshake and session operation is bounded by its
- * configured timeout so a wedged server fails fast instead of hanging the
- * harness.
+ * it did not need. When a server advertises several auth methods, the round
+ * waits for the operator's `authMethod` selection instead of guessing:
+ * methods differ in reachability (codebuddy's intranet-only `iOA` versus its
+ * public `external`), so a guess can hang for the whole interactive window.
+ * Every handshake and session operation is bounded by its configured timeout
+ * so a wedged server fails fast instead of hanging the harness.
  *
  * @module @deepseek-ai/dsh-llm-acp/connection
  */
@@ -73,13 +76,26 @@ function withTimeout<T>(operation: Promise<T>, ms: number, label: string): Promi
 }
 
 /**
- * Prefer an API-key-shaped auth method when several are advertised: the
- * first advertised method is often an interactive OAuth flow, which a keyed
- * `authenticate` call must not select.
+ * Resolve which advertised auth method a round should use.
+ *
+ * A server that advertises exactly one method has no choice to offer, so that
+ * method is used silently. Several methods are only ever run when the operator
+ * picked one: guessing would silently select an unusable flow (codebuddy
+ * advertises an intranet-only `iOA` first, which on an off-network host hangs
+ * until the round times out), so an unpicked or unknown selection resolves to
+ * `undefined` and the caller defers to the user instead.
+ * @param methods - methods advertised in the `initialize` response.
+ * @param configured - the operator's `authMethod` selection, `''` when unset.
+ * @returns the method to authenticate with, plus how it was resolved.
  */
-function pickAuthMethod(methods: readonly AuthMethod[]): AuthMethod | undefined {
-  const keyed = methods.find(m => /api[-_]?key|token|credential/i.test(`${m.id} ${m.name}`))
-  return keyed ?? methods[0]
+function resolveAuthMethod(
+  methods: readonly AuthMethod[],
+  configured: string,
+): { method: AuthMethod | undefined; matched: 'configured' | 'only' | 'unresolved' } {
+  const picked = configured.length > 0 ? methods.find(m => m.id === configured) : undefined
+  if (picked !== undefined) return { method: picked, matched: 'configured' }
+  if (methods.length === 1) return { method: methods[0], matched: 'only' }
+  return { method: undefined, matched: 'unresolved' }
 }
 
 /** Default POSIX grace between SIGTERM and SIGKILL on dispose. */
@@ -99,16 +115,29 @@ export const DEFAULT_AUTH_TIMEOUT_MS = 15_000
  * call retries. */
 export const DEFAULT_INTERACTIVE_AUTH_TIMEOUT_MS = 300_000
 
-/** One queued update delivered to a {@link AcpConnection.promptStream} consumer. */
-type QueuedUpdate =
+/** One queued update delivered to a {@link AcpConnection.promptStream} consumer. */type QueuedUpdate =
   | { kind: 'text'; text: string }
   | { kind: 'reasoning'; text: string }
   | { kind: 'progress'; text: string }
+  | { kind: 'usage'; used: number }
   | { kind: 'done'; reason: StopReason }
   | { kind: 'error'; error: Error }
 
 /** Decision returned by an interactive ACP permission requester. */
 export type AcpPermissionDecision = 'allow' | 'reject' | 'cancel'
+
+/**
+ * Auth-method picker state: what the server advertises, what the operator
+ * selected, and whether a blocked attempt has made a choice necessary.
+ */
+export interface AcpAuthMethodState {
+  /** Methods advertised in the `initialize` response; empty before it. */
+  methods: readonly { id: string; name: string }[]
+  /** The configured method id, `''` when the operator has not chosen yet. */
+  selected: string
+  /** Whether authentication is currently blocked until a method is chosen. */
+  needed: boolean
+}
 
 /** One captured ACP protocol interaction, for the protocol inspector view. */
 export interface ProtocolTraceEntry {
@@ -228,6 +257,16 @@ function acpAgentPhase(update: SessionNotification['update']): string | undefine
 
 function acpContentText(content: AcpContentBlock): string {
   return content.type === 'text' ? content.text : ''
+}
+
+/**
+ * Accept a wire-reported token count only when it is a finite non-negative
+ * integer. `usage_update` numbers come from an external process and feed
+ * harness projections whose schemas demand exactly that shape, so a fractional
+ * or negative value is dropped at this boundary instead of corrupting a fold.
+ */
+function acpTokenCount(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0 ? value : undefined
 }
 
 /** Truncate a string to a display-friendly length for permission prompts. */
@@ -350,6 +389,15 @@ export interface AcpConnectionSpec {
    * (the server will reject `session/new` if it requires auth).
    */
   resolveAuthApiKey?: () => Promise<string | undefined>
+  /**
+   * The auth method this server should authenticate with, matching one of the
+   * ids it advertises in `initialize`. The operator picks it in the ACP
+   * Servers settings (`authMethod`) when the server offers more than one; a
+   * server that offers exactly one needs no selection. Ownership of this value
+   * is configuration, so a change rebuilds the connection rather than being
+   * read per round — see the fingerprint in the owning plugin.
+   */
+  authMethod?: string
 }
 
 /**
@@ -392,8 +440,29 @@ export class AcpConnection {
   private authUrlNotified = false
   /** Auth method id of the in-flight key-less round, if any. */
   private interactiveAuthMethodId: string | undefined
+  /**
+   * Set once an authentication attempt has been **blocked** because the server
+   * advertises several methods and none is selected. Latched only by an actual
+   * blocked attempt, never merely by the shape of the method list: a server
+   * whose cached login still works must not ask the user to choose.
+   */
+  private authChoiceBlocked = false
+  /**
+   * Fingerprint of the last "choose an auth method" warning, so a repeated
+   * blocked attempt does not repeat the same line on every turn. Cleared when
+   * the condition changes (a different selection, or a different method list).
+   */
+  private authChoiceWarnedKey: string | undefined
   private cachedConfigOptions: readonly SessionConfigOption[] | undefined
   private configOptionsProbe: Promise<readonly SessionConfigOption[] | undefined> | undefined
+  /**
+   * Total context window in tokens as reported by the newest `usage_update`
+   * sample, across every session on this connection. The capacity belongs to
+   * the model behind the server rather than to one session, so it survives the
+   * session that published it (including the throwaway discovery probe
+   * session) and is exposed to the adapter as this route's model context.
+   */
+  private reportedContextWindow: number | undefined
   /** Ring buffer of recent ACP protocol interactions (max {@link MAX_PROTOCOL_TRACE}). */
   private readonly protocolTrace: ProtocolTraceEntry[] = []
 
@@ -526,12 +595,39 @@ export class AcpConnection {
   }
 
   /**
+   * Total context window (tokens) the server reported in its newest
+   * `usage_update` sample, or `undefined` before it reports one. A server
+   * counts this as the capacity of the model behind it, so it is exempt from
+   * session lifecycle: it outlives the session that published it and is read
+   * by the adapter as the route's model context capacity.
+   */
+  getContextWindow(): number | undefined {
+    return this.reportedContextWindow
+  }
+
+  /**
    * The auth method id of an in-flight key-less interactive round, or
    * `undefined` when no round is running. Lets callers surface "waiting for
    * interactive login" even before (or without) an auth URL.
    */
   getPendingAuthMethod(): string | undefined {
     return this.interactiveAuthMethodId
+  }
+
+  /**
+   * The advertised auth methods plus the operator's selection, for the ACP
+   * Servers picker. `needed` is true only once an authentication attempt was
+   * actually blocked for want of a selection — a server that offers several
+   * methods but logs in from a cached credential must not be nagged.
+   * @returns the method catalog (empty before `initialize`), the configured
+   *   method id (`''` when unset), and whether the user must choose.
+   */
+  authMethodState(): AcpAuthMethodState {
+    return {
+      methods: (this.authMethods ?? []).map(m => ({ id: m.id, name: m.name })),
+      selected: this.spec.authMethod ?? '',
+      needed: this.authChoiceBlocked,
+    }
   }
 
   /**
@@ -578,14 +674,17 @@ export class AcpConnection {
   /**
    * Eager `authenticate` round, run during `initialize` only when the server
    * advertises auth methods AND a configured API key resolves. The key rides
-   * as `_meta.api_key` for servers that accept direct key authentication; an
-   * API-key-shaped method is preferred over an interactive OAuth one when
-   * several are advertised. Without a key no `authenticate` call is made:
-   * servers that accept env credentials or a cached login go straight to
-   * `session/new`, and servers that truly require an interactive round reach
-   * it lazily through {@link ensureAuthenticated} on the first failed
-   * `session/new` — so a well-configured server never triggers a browser
-   * login it did not need.
+   * as `_meta.api_key` for servers that accept direct key authentication.
+   * Without a key no `authenticate` call is made: servers that accept env
+   * credentials or a cached login go straight to `session/new`, and servers
+   * that truly require an interactive round reach it lazily through
+   * {@link ensureAuthenticated} on the first failed `session/new` — so a
+   * well-configured server never triggers a browser login it did not need.
+   *
+   * The method is resolved by {@link resolveAuthMethod} like the lazy path, so
+   * a server offering several methods is never guessed at here either: an
+   * unresolved choice leaves this a no-op and `initialize` succeeds, keeping
+   * the connection usable for model discovery and the method picker.
    */
   private async authenticateWithKey(): Promise<void> {
     const methods = this.authMethods
@@ -594,8 +693,13 @@ export class AcpConnection {
       ? await this.spec.resolveAuthApiKey().catch(() => undefined)
       : undefined
     if (apiKey === undefined) return
-    const method = pickAuthMethod(methods)
-    if (method === undefined) return
+    const { method } = resolveAuthMethod(methods, this.spec.authMethod ?? '')
+    if (method === undefined) {
+      // Several methods and no valid selection: do not pick one for the user.
+      // `initialize` must still succeed so the picker can be populated.
+      this.noteAuthChoiceBlocked()
+      return
+    }
     this.traceEvent('send', 'authenticate', `methodId=${method.id} (with key)`, undefined, { methodId: method.id })
     this.authRound = withTimeout(
       this.conn.authenticate({ methodId: method.id, _meta: { api_key: apiKey } }).then(() => {
@@ -616,13 +720,27 @@ export class AcpConnection {
    * the connection stays usable, and a browser login URL published via the
    * `_codebuddy.ai/authUrl` extension notification is surfaced in the
    * warning so the user can complete an interactive login.
+   *
+   * A server offering several methods with none selected **starts no round at
+   * all**: guessing picks a flow the operator did not choose (codebuddy's
+   * intranet-only `iOA` hangs an off-network host for the whole interactive
+   * window), so the choice is deferred to the UI and the caller is told no
+   * round ran.
+   * @returns whether an `authenticate` round actually ran.
    */
-  private ensureAuthenticated(): Promise<void> {
-    if (this.authRound !== undefined) return this.authRound
-    // Key-less auth uses the first advertised method — the server's default,
-    // which is the method its cached-credential and interactive flows share.
-    const method = this.authMethods?.[0]
-    if (method === undefined) return Promise.resolve()
+  private async ensureAuthenticated(): Promise<{ ran: boolean }> {
+    const methods = this.authMethods
+    const { method } = resolveAuthMethod(methods ?? [], this.spec.authMethod ?? '')
+    if (method === undefined) {
+      if (methods !== undefined && methods.length > 0) this.noteAuthChoiceBlocked()
+      return { ran: false }
+    }
+    this.authChoiceBlocked = false
+    this.authChoiceWarnedKey = undefined
+    if (this.authRound !== undefined) {
+      await this.authRound
+      return { ran: true }
+    }
     this.pendingAuthUrl = undefined
     this.interactiveAuthMethodId = method.id
     this.authRound = (async (): Promise<void> => {
@@ -658,7 +776,29 @@ export class AcpConnection {
         this.interactiveAuthMethodId = undefined
       }
     })()
-    return this.authRound
+    await this.authRound
+    return { ran: true }
+  }
+
+  /**
+   * Latch the "the server offers several auth methods and none is selected"
+   * state and warn once per distinct condition. Called only from an attempt
+   * that was actually blocked, so a server whose cached login still works
+   * never reaches it; the warning repeats only when the selection or the
+   * advertised method list changes, so a failing turn does not spam the log.
+   */
+  private noteAuthChoiceBlocked(): void {
+    this.authChoiceBlocked = true
+    const advertised = (this.authMethods ?? []).map(m => m.id).join(', ')
+    const configured = this.spec.authMethod ?? ''
+    const key = `${configured}|${advertised}`
+    if (this.authChoiceWarnedKey === key) return
+    this.authChoiceWarnedKey = key
+    this.spec.onWarn?.(
+      `llm-acp: "${this.spec.command}" requires authentication and advertises ${this.authMethods?.length ?? 0} methods [${advertised}]`
+      + (configured.length > 0 ? `, but the configured authMethod "${configured}" is not one of them` : ', but none is selected')
+      + ' — pick one in Settings → ACP Servers (authMethod)',
+    )
   }
 
   /**
@@ -677,12 +817,37 @@ export class AcpConnection {
       // interactive round that cannot help them.
       if (this.authMethods === undefined || this.authMethods.length === 0 || !isAuthRequiredError(error)) throw error
       const message = error instanceof Error ? error.message : String(error)
-      this.spec.onWarn?.(`llm-acp: ${label} failed for "${this.spec.command}" (${message}); running one authenticate round then retrying`)
       // Concurrent failures share the in-flight round (or a finished one ends
       // immediately); each caller retries its own operation once afterwards.
-      await this.ensureAuthenticated()
+      const { ran } = await this.ensureAuthenticated()
+      if (!ran) {
+        // Nothing authenticated, so the retry would fail identically — and
+        // `withTimeout` would burn a whole sessionTimeoutMs proving it. Fail
+        // now with the actionable reason (the blocked choice is already
+        // latched for the UI) instead of claiming a round that never ran.
+        throw new Error(
+          `llm-acp: ${label} requires authentication for "${this.spec.command}", but ${
+            this.authChoiceRejection()
+          }`,
+        )
+      }
+      this.spec.onWarn?.(`llm-acp: ${label} failed for "${this.spec.command}" (${message}); ran one authenticate round, retrying`)
       return await withTimeout(call(), this.spec.sessionTimeoutMs, label)
     }
+  }
+
+  /** Why the connection cannot authenticate on its own, for an error message. */
+  private authChoiceRejection(): string {
+    const methods = this.authMethods ?? []
+    const configured = this.spec.authMethod ?? ''
+    const advertised = methods.map(m => m.id).join(', ')
+    return methods.length > 1
+      ? `it advertises ${methods.length} auth methods [${advertised}] and ${
+          configured.length > 0
+            ? `the configured authMethod "${configured}" is not one of them`
+            : 'none is selected'
+        } — pick one in Settings → ACP Servers (authMethod)`
+      : 'no usable auth method was advertised'
   }
 
   /** Resolve one ACP permission request through its owning session. */
@@ -723,13 +888,33 @@ export class AcpConnection {
 
   /** Push an inbound session/update into the owning session's queue. */
   private enqueueUpdate(params: SessionNotification): void {
-    const entry = this.queues.get(params.sessionId)
     const update = params.update
+    if (update.sessionUpdate === 'usage_update') {
+      // Context accounting, not conversation content: the sample is remembered
+      // (its window is the route's capacity) independently of whether a
+      // consumer is draining this session, so a sample published by the
+      // throwaway discovery probe session still teaches the connection its
+      // context window.
+      const used = acpTokenCount(update.used)
+      const size = acpTokenCount(update.size)
+      this.traceEvent('recv', 'session/update',
+        `usage_update sessionId=${params.sessionId} used=${String(update.used)} size=${String(update.size)}`,
+        `update:usage_update:${params.sessionId}`, params)
+      if (size !== undefined && size > 0) this.reportedContextWindow = size
+      const owner = this.queues.get(params.sessionId)
+      if (owner !== undefined && used !== undefined) {
+        owner.queue.push({ kind: 'usage', used })
+        this.signal(owner)
+      }
+      this.trackAgentPhase(params.sessionId, update)
+      return
+    }
+    const entry = this.queues.get(params.sessionId)
     if (entry === undefined) {
       // Content updates on an unqueued session lose real output — keep them
       // per-session in the trace. Session-setup broadcasts (config options,
-      // mode, commands, usage) arrive for every new/discovery session and are
-      // pure noise, so collapse them across sessions into one counted row.
+      // mode, commands) arrive for every new/discovery session and are pure
+      // noise, so collapse them across sessions into one counted row.
       const contentDrop = update.sessionUpdate === 'agent_message_chunk'
         || update.sessionUpdate === 'agent_thought_chunk'
         || update.sessionUpdate === 'tool_call'
@@ -763,6 +948,20 @@ export class AcpConnection {
       // Echo of user input; consumed silently.
     }
     // Other update variants are consumed but not surfaced.
+    this.trackAgentPhase(params.sessionId, update)
+    this.signal(entry)
+  }
+
+  /**
+   * Arm or clear the idle watchdog from an update's `agentPhase` marker. Every
+   * update kind is inspected, not just content: a server may attach the marker
+   * to a non-content update (a usage sample, a mode change), and an `idle`
+   * phase there means the same thing. Unknown sessions are no-ops — the
+   * watchdog guards a prompt drain, so it only exists alongside one.
+   */
+  private trackAgentPhase(sessionId: string, update: SessionNotification['update']): void {
+    const entry = this.queues.get(sessionId)
+    if (entry === undefined) return
     const phase = acpAgentPhase(update)
     if (phase === 'idle') {
       // Agent reports idle while the prompt is still unsettled. Normally the
@@ -776,11 +975,11 @@ export class AcpConnection {
           // later call (including session/new) behind this dead prompt. The
           // cancel is best-effort — a wedged handler may not reach it — so the
           // owner also gets onDeadPrompt to rebuild the connection.
-          void this.conn.cancel({ sessionId: params.sessionId }).catch(() => { /* best-effort */ })
-          this.spec.onWedged?.(`prompt went idle without answering (session ${params.sessionId})`)
+          void this.conn.cancel({ sessionId }).catch(() => { /* best-effort */ })
+          this.spec.onWedged?.(`prompt went idle without answering (session ${sessionId})`)
           entry.queue.push({
             kind: 'error',
-            error: new Error(`llm-acp: agent went idle without answering session/prompt for session ${params.sessionId} — the server dropped the turn`),
+            error: new Error(`llm-acp: agent went idle without answering session/prompt for session ${sessionId} — the server dropped the turn`),
           })
           this.signal(entry)
         }, IDLE_SETTLE_GRACE_MS)
@@ -789,7 +988,6 @@ export class AcpConnection {
       clearTimeout(entry.idleTimer)
       entry.idleTimer = undefined
     }
-    this.signal(entry)
   }
 
   /**
@@ -978,8 +1176,16 @@ export class AcpConnection {
     if (this.cachedConfigOptions !== undefined) return this.cachedConfigOptions
     // Share one in-flight probe so concurrent polls do not each spawn a session.
     this.configOptionsProbe ??= this.probeConfigOptions()
-    const options = await this.configOptionsProbe
-    this.configOptionsProbe = undefined
+    let options: readonly SessionConfigOption[] | undefined
+    try {
+      options = await this.configOptionsProbe
+    } finally {
+      // Release the shared probe even when it rejected: leaving a rejected
+      // promise cached would poison every later discovery with the same
+      // one-off failure (the picker and Settings model list would stay empty
+      // for the life of the connection).
+      this.configOptionsProbe = undefined
+    }
     if (options !== undefined) this.cachedConfigOptions = options
     return options
   }

@@ -82,7 +82,8 @@ dsh harness 启动
        │    ├─ resolveNpxShortcut()：npx -y <pkg> 若 bin 已在 PATH 则直接用 bin
        │    ├─ new AcpConnection()：spawn 长生命周期子进程（stdin/stdout JSON-RPC）
        │    │    └─ initialize() 握手 → 仅配置了 API key 时才 authenticate()
-       │    │       （无 key 直接走 env/缓存登录；session/new 失败才惰性补一次 authenticate）
+       │    │       （无 key 直接走 env/缓存登录；session/new 失败才惰性补一次 authenticate；
+       │    │         广告多种方式且未选 authMethod 时不猜、不起轮，交给 UI 选择）
        │    ├─ new AcpAdapter()：构造时 discoverModels() 探测模型目录
        │    └─ ctx.llm.registerAdapter(['acp-<server-id>'], adapter)
        └─ reconcileDirectory()：向设置页注册可配置 provider 目录
@@ -104,6 +105,7 @@ harness 请求模型
        │    ├─ agent_message_chunk  → text-delta chunk
        │    ├─ agent_thought_chunk  → reasoning-delta（emitReasoning 开启时）
        │    ├─ 扩展进度通知          → reasoning-delta
+       │    ├─ usage_update         → usage chunk（上下文字数占用）
        │    └─ stopReason 终态      → finish chunk（end_turn→stop 等）
        └─ 收尾：复用 session 记入 sessionMap 供下轮复用；一次性 session 关闭
 ```
@@ -164,7 +166,10 @@ binary 类型使用可执行文件的 basename，这样已安装到 PATH 的二�
 2. 将 harness 的 `messages` 和 `system` prompt 渲染为一条 ACP 文本块。
 3. 发送 `session/prompt`，将流式 `agent_message_chunk` 更新作为 `text-delta` chunk 传输。
 4. 当 `emitReasoning` 开启时，`agent_thought_chunk` 更新转换为 `reasoning-delta` chunk。
-5. `session/prompt` 响应的终态 `stopReason` 转换为 `finish` chunk。
+5. `usage_update` 通知转换为 `usage` chunk（`inputTokens` 为服务器上报的上下文字数），同时把它的 `size` 记为该路由的 `context.contextWindow`。
+6. `session/prompt` 响应的终态 `stopReason` 转换为 `finish` chunk。
+
+`usage` chunk 只对会话主线请求输出；compaction / session-title 这类辅助调用渲染的是自己的临时 prompt，其占用会顶掉真实样本，因此不上报。
 
 工具调用增量不会被输出。ACP 服务器内部执行自己的工具。`session/request_permission` 复用当前会话的权限预设：`danger-full-access` 自动允许，其他预设通过 harness 一次性审批请求处理；审批不可用、失败或 ACP 未提供 `allow_once` 时拒绝执行。
 
@@ -191,12 +196,19 @@ pnpm build    # tsc -b && tsdown
 
 - **不支持 harness 工具生态** — ACP 服务器执行自己的工具；harness 的 `GenerateOptions.tools` 被忽略。
 - **无 session 复用** — 每次 `stream()` 调用创建新的 ACP session 并重新发送完整对话。
-- **无 token 用量** — ACP v1 不提供 token 计数；适配器不输出 `usage` chunk。
+- **上下文用量只报占用、不报输出** — ACP 的 `usage_update` 只给出「当前上下文字数」(`used`) 与「上下文窗口」(`size`)，没有本轮回输出的 token 数；适配器据此输出 `usage` chunk（`inputTokens = used`、`outputTokens = 0`）并在 `resolveModel` 上广告 `context.contextWindow`，因此输入框旁的上下文占用环会亮起，而累计输出 token 统计恒为 0。该占用描述的是 **ACP 服务器自己的上下文**（它自己的系统提示、工具集与收到的对话），不是 harness 侧的 prompt 投影。窗口的回退规则：
+
+  - 服务器尚未上报样本时不广告容量 —— 首个请求的占用环不渲染（harness 也不会凭空造出 0%），样本到达后的下一个请求才补上；
+  - `session/new` 阶段就上报的样本同样生效，即使该 session（如模型发现用的探测 session）没有 prompt 在消费它；
+  - 后续样本给出无效窗口（非正整数）时保留上一个已知值，不把已经亮起的占用环打灭；
+  - 给出新的有效窗口时替换 —— 切到窗口更大的模型会立即反映；
+  - 切换到另一条尚未上报的 provider 路由时，harness 会清掉旧容量，而不是复用上一个 server 的窗口。
 - **系统提示在消息体内** — ACP `session/new` 没有 system 槽位，harness 的 system prompt 被拼接到用户消息文本前。
 - **全量历史重发** — 适配器将整个 `messages` 数组渲染为一条用户消息。
 - **ACP v1（SDK 0.25.1）** — 适配器使用 `@agentclientprotocol/sdk` 0.25.1，其 `session/prompt` 响应携带终态 `stopReason`（v1 契约）。
 - **扩展协议处理** — Devin 的 `_cognition.ai/*` 通知被静默消费（进度文本在 `emitReasoning` 开启时作为 reasoning 输出）；其他非标准 ACP 扩展被吞掉以避免 SDK 错误日志。
 - **认证惰性化** — 未配置 API key 时不主动调用 `authenticate`：依赖 env 凭证或 CLI 缓存登录的 server 直接 `session/new` 成功；仅当 `session/new`/`session/load` 失败才执行一次有界（`authTimeoutMs`）的 `authenticate` 并重试。交互式浏览器登录只在确实需要时触发，URL 同时经警告日志与设置页 `acp-auth-<id>` 路由暴露。
+- **多登录方式需选择，不猜** — 服务器广告多种认证方式时（如 codebuddy 的 `iOA`(仅内网可达) / `external` / `internal` / `selfhosted`），插件不再默认取第一个：未选择就不发起 `authenticate`，改为快速失败并在会话下方弹出选择框（`acp-methods-<id>` 路由提供方法目录），选择写入 `servers.<id>.authMethod` 并在「设置 → ACP 服务」里可随时更改。**只有一种方式时自动使用，无需选择**；配置了未被广告的 id 且存在多种方式时同样视为未选择（不回退到第一个）。选择变更会重建该 server 的连接——这既应用了新方式，也顺带丢弃仍挂在上一个方式上的 `authenticate` 轮。带 API key 的预认证轮走同一套解析，因此 key 不再会让插件替你选中第一个方式。
 
 ## 许可证
 

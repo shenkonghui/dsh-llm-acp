@@ -7,8 +7,9 @@
  * full conversation as a single user message, and closes it after.
  *
  * `agent_message_chunk` / `agent_thought_chunk` updates are translated into
- * harness `StreamChunk`s. Tool-call deltas are never emitted: the ACP server
- * executes its own tools internally.
+ * harness `StreamChunk`s; `usage_update` becomes a `usage` chunk carrying the
+ * server's context occupancy on the prompt side. Tool-call deltas are never
+ * emitted: the ACP server executes its own tools internally.
  *
  * @module @deepseek-ai/dsh-llm-acp/adapter
  */
@@ -97,7 +98,8 @@ export declare class AcpAdapter extends LlmAdapter {
      * the full conversation and closed after the prompt.
      *
      * Yields `text-delta` (and optionally `reasoning-delta`) chunks as the ACP
-     * server streams assistant output, then a terminal `finish` chunk.
+     * server streams assistant output, a `usage` chunk whenever the server
+     * reports context occupancy, then a terminal `finish` chunk.
      */
     stream(options: GenerateOptions): AsyncIterable<StreamChunk>;
     /** Create a fresh ACP session, throwing `LlmError` on failure. */
