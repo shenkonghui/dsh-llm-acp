@@ -50,6 +50,14 @@ export interface AcpAdapterOptions {
   customModels?: readonly { id: string; name: string }[] | undefined
   /** Capture an interactive permission requester from the current agent turn. */
   permissionRequester?: (() => AcpPermissionRequester | undefined) | undefined
+  /**
+   * Resolve the ACP session mode to apply before this stream's prompt (e.g.
+   * `bypass`), read from the calling session's current permission state.
+   * Called once per stream; `undefined` leaves the server mode untouched.
+   */
+  resolveSessionMode?: (() => string | undefined) | undefined
+  /** Host sink for best-effort operation failures (session mode, etc.). */
+  onWarn?: (message: string) => void
 }
 
 /** Extract the concatenated text of a harness message (non-text blocks contribute nothing). */
@@ -154,6 +162,8 @@ export class AcpAdapter extends LlmAdapter {
   private readonly modelsReady: Promise<void>
   /** Reused ACP sessions keyed by dsh session id (only when `loadSession` is supported). */
   private readonly sessionMap = new Map<string, ReusedSession>()
+  /** Last session-mode value applied per ACP session id, to skip redundant writes. */
+  private readonly appliedMode = new Map<string, string>()
 
   constructor(private readonly config: AcpAdapterOptions) {
     super()
@@ -294,6 +304,23 @@ export class AcpAdapter extends LlmAdapter {
         await this.config.connection.setSessionModel(sessionId, options.model)
       } catch {
         // Model selection is best-effort; continue with the server default.
+      }
+    }
+
+    // Apply the configured session-mode mapping (e.g. full-access dsh session
+    // → ACP `bypass` mode). Read per stream so a mid-session preset switch
+    // reaches the next prompt; skipped when the mode is already applied.
+    const targetMode = this.config.resolveSessionMode?.()
+    if (targetMode !== undefined && this.appliedMode.get(sessionId) !== targetMode) {
+      try {
+        await this.config.connection.setSessionMode(sessionId, targetMode)
+        this.appliedMode.set(sessionId, targetMode)
+      } catch (error: unknown) {
+        // Best-effort: a server without mode support keeps its own default.
+        this.appliedMode.set(sessionId, targetMode)
+        this.config.onWarn?.(
+          `llm-acp: failed to set ACP session mode "${targetMode}": ${error instanceof Error ? error.message : String(error)}`,
+        )
       }
     }
 

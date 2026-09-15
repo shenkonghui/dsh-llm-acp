@@ -345,11 +345,23 @@ export declare class AcpConnection {
     discoverConfigOptions(): Promise<readonly SessionConfigOption[] | undefined>;
     /** Single config-option probe: one throwaway session, closed immediately. */
     private probeConfigOptions;
-    /** Extract model entries from a config option list (category `model`, type `select`).
-     * Handles both flat option lists and grouped option lists per the ACP
-     * `SessionConfigSelectOptions` union: a group entry carries its own
-     * `options` array of leaf values, so flatten one level before collecting. */
+    /**
+     * List the session modes this server advertises via the `mode` config
+     * option (category `mode`, type `select`), e.g. Devin's
+     * `accept-edits`/`bypass`. `undefined` when the server publishes no mode
+     * selector or the config-option probe is unsupported.
+     */
+    discoverModes(): Promise<{
+        id: string;
+        name: string;
+    }[] | undefined>;
+    /** Extract model entries from a config option list (category `model`, type `select`). */
     private extractModels;
+    /** Collect the leaf `{value, name}` pairs of one select config option by
+     * category. Handles both flat option lists and grouped option lists per the
+     * ACP `SessionConfigSelectOptions` union: a group entry carries its own
+     * `options` array of leaf values, so flatten one level before collecting. */
+    private extractSelectValues;
     /**
      * Set the model for one ACP session via `session/set_config_option`. Best-effort:
      * if the server rejects the config id or value, the error surfaces from the
@@ -358,6 +370,15 @@ export declare class AcpConnection {
      * @param modelId - the model value id to select.
      */
     setSessionModel(sessionId: string, modelId: string): Promise<void>;
+    /**
+     * Switch the ACP session's mode (e.g. `bypass` on agents that publish a
+     * `mode` config option). Prefers the unified `session/set_config_option`
+     * write and falls back to the legacy `session/set_mode` when the config
+     * option is unknown to the server.
+     * @param sessionId - the remote session id from {@link AcpConnection.newSession}.
+     * @param modeId - the mode value id to select.
+     */
+    setSessionMode(sessionId: string, modeId: string): Promise<void>;
     /**
      * Send one user message to `sessionId` and yield streamed assistant updates
      * until the prompt call settles. The SDK v1 contract delivers the terminal

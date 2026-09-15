@@ -51,6 +51,14 @@ export interface AcpAdapterOptions {
     }[] | undefined;
     /** Capture an interactive permission requester from the current agent turn. */
     permissionRequester?: (() => AcpPermissionRequester | undefined) | undefined;
+    /**
+     * Resolve the ACP session mode to apply before this stream's prompt (e.g.
+     * `bypass`), read from the calling session's current permission state.
+     * Called once per stream; `undefined` leaves the server mode untouched.
+     */
+    resolveSessionMode?: (() => string | undefined) | undefined;
+    /** Host sink for best-effort operation failures (session mode, etc.). */
+    onWarn?: (message: string) => void;
 }
 /**
  * The ACP-backed LLM adapter. One instance serves every model name under its
@@ -67,6 +75,8 @@ export declare class AcpAdapter extends LlmAdapter {
     private readonly modelsReady;
     /** Reused ACP sessions keyed by dsh session id (only when `loadSession` is supported). */
     private readonly sessionMap;
+    /** Last session-mode value applied per ACP session id, to skip redundant writes. */
+    private readonly appliedMode;
     constructor(config: AcpAdapterOptions);
     /** Probe the ACP server for its model catalog and cache the result. */
     private discoverModels;

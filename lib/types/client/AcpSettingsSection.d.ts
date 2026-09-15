@@ -38,6 +38,7 @@ export interface AcpServerEntry {
         id: string;
         name: string;
     }[];
+    modeMap?: Record<string, string>;
 }
 /** Wire view of one registered settings namespace (the fields this section reads). */
 interface AcpNamespaceView {

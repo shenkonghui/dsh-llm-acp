@@ -14,6 +14,9 @@ import { describe, expect, it } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import Loader from '@deepseek-ai/cordis-plugin-loader'
 import { fileURLToPath } from 'node:url'
+import { existsSync, mkdtempSync, readFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import AgentRuntime, { type Agent } from '@deepseek-ai/dsh-agent'
 import { BlockAssembler, createUserMessage, type StreamChunk } from '@deepseek-ai/dsh-llm'
 import LlmRuntime from '@deepseek-ai/dsh-llm'
@@ -29,15 +32,21 @@ interface SetupEnv {
   [key: string]: string
 }
 
+type PresetName = 'read-only' | 'workspace-write' | 'danger-full-access'
+
 /**
  * Mount the ACP LLM adapter pointed at the mock server, scripted by `mockEnv`.
  * `emitReasoning` selects whether thought chunks become reasoning-delta.
  * `server` overrides the spawned fixture (default: the shared mock server);
  * `config` merges extra plugin config (e.g. shorter timeouts).
+ * `permissionPreset` accepts a getter so a test can switch the session preset
+ * while a prompt is in flight.
  */
 async function setup(mockEnv: SetupEnv = {}, opts: {
   emitReasoning?: boolean
-  permissionPreset?: 'read-only' | 'workspace-write' | 'danger-full-access'
+  permissionPreset?: PresetName | (() => PresetName)
+  sandboxMode?: string
+  modeMap?: Record<string, string>
   server?: { command: string; args: string[] }
   config?: Record<string, unknown>
 } = {}) {
@@ -47,10 +56,17 @@ async function setup(mockEnv: SetupEnv = {}, opts: {
   await ctx.plugin(ApprovalService)
   if (opts.permissionPreset !== undefined) {
     const preset = opts.permissionPreset
+    const current = typeof preset === 'function' ? preset : () => preset
     ctx.provide('permissionPresets' as never, {
-      names: [preset],
-      current: () => preset,
-      resolve: () => ({ sandbox: preset, approval: preset === 'danger-full-access' ? 'never' : 'ask' }),
+      names: ['read-only', 'workspace-write', 'danger-full-access'],
+      current,
+      resolve: (name: string) => ({ sandbox: name, approval: name === 'danger-full-access' ? 'never' : 'ask' }),
+    } as never)
+  }
+  if (opts.sandboxMode !== undefined) {
+    const mode = opts.sandboxMode
+    ctx.provide('sandboxPolicy' as never, {
+      resolve: () => ({ mode }),
     } as never)
   }
   await ctx.plugin(LlmRuntime)
@@ -79,6 +95,7 @@ async function setup(mockEnv: SetupEnv = {}, opts: {
         command: server.command,
         args: server.args,
         name: 'Test ACP',
+        modeMap: opts.modeMap ?? {},
       },
     },
   })
@@ -110,10 +127,11 @@ function finishChunk(chunks: StreamChunk[]): Extract<StreamChunk, { type: 'finis
 }
 
 /** Minimal initiating agent with an open turn for the approval service audit pair. */
-function fakeAgent(): Agent {
+function fakeAgent(extraEvents: Array<{ type: string; data?: Record<string, unknown> }> = []): Agent {
   const events: Array<{ type: string; data?: Record<string, unknown> }> = [
     { type: 'turn/start' },
     { type: 'user/message' },
+    ...extraEvents,
   ]
   return {
     session: {
@@ -240,7 +258,7 @@ describe('dsh-llm-acp', () => {
       expect(assembledText(chunks)).toBe('approved')
       expect(received).toEqual([{
         toolName: 'ACP: mock side effect',
-        reason: 'Test ACP requested permission to run "mock side effect".',
+        reason: 'Test ACP requested permission: mock side effect. Options: Allow, Reject.',
       }])
     } finally {
       await ctx.fiber.dispose()
@@ -258,13 +276,196 @@ describe('dsh-llm-acp', () => {
       return Promise.resolve<ApprovalOutcome>('rejected')
     })
     try {
-      const chunks = await ctx.agents.withInitiator(fakeAgent(), () => collect(ctx.llm.stream({
+      // A preset switch writes `approval/policy` + `sandbox/mode` session
+      // events; the auto-allow check reads those knobs, not the preset name.
+      const agent = fakeAgent([{ type: 'approval/policy', data: { policy: 'never' } }])
+      const chunks = await ctx.agents.withInitiator(agent, () => collect(ctx.llm.stream({
         provider: 'acp-test',
         model: 'any',
         messages: [createUserMessage({ content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } })],
       })))
       expect(assembledText(chunks)).toBe('full access')
       expect(requested).toBe(false)
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('re-reads the preset per permission request: a mid-turn switch to danger-full-access auto-allows', async () => {
+    // The requester is captured once per stream, but the preset must be
+    // evaluated at request time — under approval policy "never" the approval
+    // seam auto-rejects, so a stale capture would deny the rest of the turn.
+    let preset: PresetName = 'workspace-write'
+    const ctx = await setup(
+      { MOCK_PERMISSIONS: '2', MOCK_TEXT: 'mid-turn switch' },
+      { permissionPreset: () => preset, server: { command: process.execPath, args: [authMockServer] } },
+    )
+    const agent = fakeAgent()
+    let asked = 0
+    ctx.on('approval/request', () => {
+      asked += 1
+      preset = 'danger-full-access'
+      agent.session.append('approval/policy', { policy: 'never' })
+      return Promise.resolve<ApprovalOutcome>('allowed-once')
+    })
+    try {
+      const chunks = await ctx.agents.withInitiator(agent, () => collect(ctx.llm.stream({
+        provider: 'acp-test',
+        model: 'any',
+        messages: [createUserMessage({ content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } })],
+      })))
+      expect(assembledText(chunks)).toBe('mid-turn switch')
+      expect(asked).toBe(1)
+      const events = (agent.session as unknown as { events: Array<{ type: string; data?: { reason?: string } }> }).events
+      const auditAsks = events.filter(e => e.type === 'approval/asked')
+      expect(auditAsks).toHaveLength(2)
+      expect(auditAsks.some(e => e.data?.reason?.includes('Auto-allowed'))).toBe(true)
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('auto-allows a delegated child session whose knobs say full access without a named preset', async () => {
+    // Delegation seeds `sandbox/mode` + `approval/policy` events on the child
+    // session directly; no `permission/preset` event exists, so a preset-name
+    // match derives `custom` and would deny every ACP permission request.
+    const ctx = await setup(
+      { MOCK_PERMISSION: '1', MOCK_TEXT: 'delegated full access' },
+      { sandboxMode: 'danger-full-access' },
+    )
+    let requested = false
+    ctx.on('approval/request', () => {
+      requested = true
+      return Promise.resolve<ApprovalOutcome>('rejected')
+    })
+    try {
+      const agent = fakeAgent([{ type: 'approval/policy', data: { policy: 'never' } }])
+      const chunks = await ctx.agents.withInitiator(agent, () => collect(ctx.llm.stream({
+        provider: 'acp-test',
+        model: 'any',
+        messages: [createUserMessage({ content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } })],
+      })))
+      expect(assembledText(chunks)).toBe('delegated full access')
+      expect(requested).toBe(false)
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('applies the configured modeMap to the ACP session before prompting', async () => {
+    const modeFile = join(mkdtempSync(join(tmpdir(), 'llm-acp-mode-')), 'modes.txt')
+    const ctx = await setup(
+      { MOCK_MODE_FILE: modeFile, MOCK_TEXT: 'mode set' },
+      {
+        permissionPreset: 'danger-full-access',
+        modeMap: { 'danger-full-access': 'bypass' },
+        server: { command: process.execPath, args: [authMockServer] },
+      },
+    )
+    try {
+      const chunks = await ctx.agents.withInitiator(fakeAgent(), () => collect(ctx.llm.stream({
+        provider: 'acp-test',
+        model: 'any',
+        messages: [createUserMessage({ content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } })],
+      })))
+      expect(assembledText(chunks)).toBe('mode set')
+      expect(readFileSync(modeFile, 'utf8')).toContain('mode=bypass\n')
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('falls back to session/set_mode when the config option is unsupported', async () => {
+    const modeFile = join(mkdtempSync(join(tmpdir(), 'llm-acp-mode-')), 'modes.txt')
+    const ctx = await setup(
+      { MOCK_MODE_FILE: modeFile, MOCK_FAIL_CONFIG: '1', MOCK_TEXT: 'mode set' },
+      {
+        permissionPreset: 'danger-full-access',
+        modeMap: { 'danger-full-access': 'bypass' },
+        server: { command: process.execPath, args: [authMockServer] },
+      },
+    )
+    try {
+      const chunks = await ctx.agents.withInitiator(fakeAgent(), () => collect(ctx.llm.stream({
+        provider: 'acp-test',
+        model: 'any',
+        messages: [createUserMessage({ content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } })],
+      })))
+      expect(assembledText(chunks)).toBe('mode set')
+      expect(readFileSync(modeFile, 'utf8')).toBe('mode=bypass\n')
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('leaves the ACP session mode untouched when no mapping matches', async () => {
+    const modeFile = join(mkdtempSync(join(tmpdir(), 'llm-acp-mode-')), 'modes.txt')
+    const ctx = await setup(
+      { MOCK_MODE_FILE: modeFile, MOCK_TEXT: 'unmapped' },
+      {
+        permissionPreset: 'read-only',
+        modeMap: { 'danger-full-access': 'bypass' },
+        server: { command: process.execPath, args: [authMockServer] },
+      },
+    )
+    try {
+      const chunks = await ctx.agents.withInitiator(fakeAgent(), () => collect(ctx.llm.stream({
+        provider: 'acp-test',
+        model: 'any',
+        messages: [createUserMessage({ content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } })],
+      })))
+      expect(assembledText(chunks)).toBe('unmapped')
+      const lines = existsSync(modeFile) ? readFileSync(modeFile, 'utf8').split('\n') : []
+      expect(lines.filter(l => l.startsWith('mode='))).toEqual([])
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('maps a delegated child session to the ACP mode via its sandbox knob', async () => {
+    // Delegation seeds `sandbox/mode` on the child session but no preset event,
+    // so `permissionPresets.current` derives `custom`; the sandbox-mode
+    // fallback in the modeMap lookup must still resolve the mapping.
+    const modeFile = join(mkdtempSync(join(tmpdir(), 'llm-acp-mode-')), 'modes.txt')
+    const ctx = await setup(
+      { MOCK_MODE_FILE: modeFile, MOCK_TEXT: 'mode set' },
+      {
+        sandboxMode: 'danger-full-access',
+        modeMap: { 'danger-full-access': 'bypass' },
+        server: { command: process.execPath, args: [authMockServer] },
+      },
+    )
+    try {
+      const chunks = await ctx.agents.withInitiator(fakeAgent(), () => collect(ctx.llm.stream({
+        provider: 'acp-test',
+        model: 'any',
+        messages: [createUserMessage({ content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } })],
+      })))
+      expect(assembledText(chunks)).toBe('mode set')
+      expect(readFileSync(modeFile, 'utf8')).toContain('mode=bypass\n')
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('lists the server-advertised session modes via the acp-modes route', async () => {
+    const ctx = await setup(
+      { MOCK_MODES: '1' },
+      { server: { command: process.execPath, args: [authMockServer] } },
+    )
+    try {
+      const modes = await ctx.llm.discoverModels('llm-acp', { provider: 'acp-modes-test' })
+      expect(modes.map(m => m.id)).toEqual(['ask', 'bypass'])
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('lists dsh permission presets via the acp-dsh-presets route', async () => {
+    const ctx = await setup({}, { permissionPreset: 'workspace-write' })
+    try {
+      const presets = await ctx.llm.discoverModels('llm-acp', { provider: 'acp-dsh-presets' })
+      expect(presets.map(m => m.id)).toEqual(['read-only', 'workspace-write', 'danger-full-access'])
     } finally {
       await ctx.fiber.dispose()
     }

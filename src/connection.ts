@@ -195,7 +195,12 @@ export async function disposeAcpChild(child: SubprocessHandle, eofGraceMs: numbe
 function isAuthRequiredError(error: unknown): boolean {
   if (!(error instanceof Error)) return false
   const code: unknown = Reflect.get(error, 'code')
-  return code === -32000 || /^authentication required/i.test(error.message)
+  if (code === -32000 || /^authentication required/i.test(error.message)) return true
+  // A server that throws a plain Error gets wrapped as -32603 Internal error
+  // with the original message preserved under `data.details`.
+  const data: unknown = Reflect.get(error, 'data')
+  const details: unknown = data === null || typeof data !== 'object' ? undefined : Reflect.get(data, 'details')
+  return typeof details === 'string' && /^authentication required/i.test(details)
 }
 
 /** Whether an RPC failure came from a `withTimeout` deadline (message shape is `llm-acp: <label> timed out after Nms`). */
@@ -244,8 +249,10 @@ function tryStringify(value: unknown): string {
  * `kind`, `locations` (file paths), and `rawInput` so the user sees what
  * they are approving instead of a generic "ACP operation".
  * When all tool-call fields are empty (some agents send only a
- * `toolCallId`), the permission `options` labels are used as a fallback
- * so the user at least sees what the agent is asking them to approve. */
+ * `toolCallId`), the subject is extracted from the permission `options`
+ * labels — which often embed it in backticks ("Yes, allow `git` commands
+ * (this session)") — since the full label list is forwarded separately as
+ * `optionLabels` for the prompt body. */
 function describePermissionToolCall(
   toolCall: RequestPermissionRequest['toolCall'],
   options?: RequestPermissionRequest['options'],
@@ -270,13 +277,24 @@ function describePermissionToolCall(
   if (kind.length > 0) return kind
   if (paths.length > 0) return paths.join(', ')
   if (inputSummary.length > 0) return truncate(inputSummary)
-  // Fallback: use the permission option labels (e.g. "Allow once", "Reject
-  // always") — at least the user sees what they're being asked to approve.
+  // Fallback: the toolCall carried no descriptive fields. Option labels often
+  // embed the subject in backticks ("Yes, allow `git` commands (this
+  // session)") — surface that subject; the full label list still reaches the
+  // prompt via optionLabels.
   if (options !== undefined && options.length > 0) {
-    const labels = options
-      .map(o => o.name)
-      .filter((n): n is string => typeof n === 'string' && n.length > 0)
-    if (labels.length > 0) return `permission: ${labels.join(' / ')}`
+    for (const option of options) {
+      const name = option.name
+      if (typeof name !== 'string' || name.length === 0) continue
+      const quoted = /`([^`]+)`/.exec(name)
+      const subject = quoted?.[1] ?? name
+        .replace(/^yes,?\s*(?:always\s+)?allow\s+/i, '')
+        .replace(/\s*\((?:this session|in all projects)\)\s*$/i, '')
+        .trim()
+      if (subject.length > 0 && !/^(?:allow|reject)$/i.test(subject)) {
+        return `permission: ${truncate(subject)}`
+      }
+    }
+    return 'permission request'
   }
   // Last resort: dump the toolCall so the user sees what the agent sent.
   const dump = tryStringify(toolCall)
@@ -979,27 +997,47 @@ export class AcpConnection {
     return configOptions
   }
 
-  /** Extract model entries from a config option list (category `model`, type `select`).
-   * Handles both flat option lists and grouped option lists per the ACP
-   * `SessionConfigSelectOptions` union: a group entry carries its own
-   * `options` array of leaf values, so flatten one level before collecting. */
+  /**
+   * List the session modes this server advertises via the `mode` config
+   * option (category `mode`, type `select`), e.g. Devin's
+   * `accept-edits`/`bypass`. `undefined` when the server publishes no mode
+   * selector or the config-option probe is unsupported.
+   */
+  async discoverModes(): Promise<{ id: string; name: string }[] | undefined> {
+    const options = await this.discoverConfigOptions()
+    if (options === undefined) return undefined
+    return this.extractSelectValues(options, 'mode')
+  }
+
+  /** Extract model entries from a config option list (category `model`, type `select`). */
   private extractModels(options: readonly SessionConfigOption[]): { id: string; name: string }[] | undefined {
-    const modelOption = options.find(opt => opt.category === 'model' && opt.type === 'select')
-    if (modelOption === undefined || modelOption.type !== 'select') return undefined
-    const selectOptions = Array.isArray(modelOption.options) ? modelOption.options : []
-    const models: { id: string; name: string }[] = []
+    return this.extractSelectValues(options, 'model')
+  }
+
+  /** Collect the leaf `{value, name}` pairs of one select config option by
+   * category. Handles both flat option lists and grouped option lists per the
+   * ACP `SessionConfigSelectOptions` union: a group entry carries its own
+   * `options` array of leaf values, so flatten one level before collecting. */
+  private extractSelectValues(
+    options: readonly SessionConfigOption[],
+    category: string,
+  ): { id: string; name: string }[] | undefined {
+    const selectOption = options.find(opt => opt.category === category && opt.type === 'select')
+    if (selectOption === undefined || selectOption.type !== 'select') return undefined
+    const selectOptions = Array.isArray(selectOption.options) ? selectOption.options : []
+    const entries: { id: string; name: string }[] = []
     for (const opt of selectOptions) {
       if ('value' in opt && typeof opt.value === 'string' && typeof opt.name === 'string') {
-        models.push({ id: opt.value, name: opt.name })
+        entries.push({ id: opt.value, name: opt.name })
       } else if ('group' in opt && Array.isArray(opt.options)) {
         for (const leaf of opt.options) {
           if ('value' in leaf && typeof leaf.value === 'string' && typeof leaf.name === 'string') {
-            models.push({ id: leaf.value, name: leaf.name })
+            entries.push({ id: leaf.value, name: leaf.name })
           }
         }
       }
     }
-    return models.length > 0 ? models : undefined
+    return entries.length > 0 ? entries : undefined
   }
 
   /**
@@ -1015,6 +1053,30 @@ export class AcpConnection {
       this.spec.sessionTimeoutMs,
       'session/set_config_option',
     )
+  }
+
+  /**
+   * Switch the ACP session's mode (e.g. `bypass` on agents that publish a
+   * `mode` config option). Prefers the unified `session/set_config_option`
+   * write and falls back to the legacy `session/set_mode` when the config
+   * option is unknown to the server.
+   * @param sessionId - the remote session id from {@link AcpConnection.newSession}.
+   * @param modeId - the mode value id to select.
+   */
+  async setSessionMode(sessionId: string, modeId: string): Promise<void> {
+    try {
+      await withTimeout(
+        this.conn.setSessionConfigOption({ sessionId, configId: 'mode', value: modeId }),
+        this.spec.sessionTimeoutMs,
+        'session/set_config_option',
+      )
+    } catch {
+      await withTimeout(
+        this.conn.setSessionMode({ sessionId, modeId }),
+        this.spec.sessionTimeoutMs,
+        'session/set_mode',
+      )
+    }
   }
 
   /**

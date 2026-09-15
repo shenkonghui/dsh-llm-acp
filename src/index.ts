@@ -11,11 +11,13 @@
  */
 
 import { isAbsolute, resolve } from 'node:path'
+import { homedir } from 'node:os'
 import { accessSync, constants, statSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type {} from '@deepseek-ai/dsh-agent'
-import type {} from '@deepseek-ai/dsh-user-approval'
+import type { ApprovalRequestId } from '@deepseek-ai/dsh-user-approval'
 import { MAX_TIMER_DELAY_MS } from '@deepseek-ai/dsh-timeout'
 import type {} from '@deepseek-ai/dsh-settings'
 import type { AdapterRegistrationHandle, DirectoryRegistrationHandle, LlmConfigurableProvider, LlmDiscoveredModel, LlmModelDiscoveryRequest } from '@deepseek-ai/dsh-llm'
@@ -95,6 +97,15 @@ export interface AcpServerConfig {
    * model override its display name; custom models with unique ids are added.
    */
   customModels?: { id: string; name: string }[]
+  /**
+   * Map a dsh permission preset name (or sandbox mode value) to the ACP
+   * session mode applied to this server's sessions, e.g.
+   * `{ "danger-full-access": "bypass" }`. Read per prompt so a mid-turn
+   * preset switch reaches the next stream. Unmapped states leave the
+   * server's mode untouched; servers without a `mode` config option keep
+   * their own default.
+   */
+  modeMap?: Record<string, string>
 }
 
 /** Plugin config: defaults applied to every spawned ACP server. */
@@ -170,6 +181,7 @@ export const Config: z<Config> = z.object({
       id: z.string().required(),
       name: z.string().default(''),
     })).default([]),
+    modeMap: z.dict(z.string()).default({}),
   })).default({}),
 })
 
@@ -185,6 +197,7 @@ const SettingsSchema = z.object({
       id: z.string().required(),
       name: z.string().default(''),
     })).default([]),
+    modeMap: z.dict(z.string()).default({}),
   })).default({}),
 })
 
@@ -227,12 +240,26 @@ function npmBinName(pkg: string): string | undefined {
   return core
 }
 
-/** Locate an executable in PATH; returns the absolute path or `undefined`.
+/** User-level install dirs probed after the process PATH. GUI and service
+ * launches inherit a minimal PATH that misses `~/.local/bin` (devin, pipx,
+ * uv) and the Homebrew prefix, even though a login shell finds them. */
+const EXTRA_BIN_DIRS: readonly string[] =
+  process.platform === 'win32'
+    ? []
+    : [
+        resolve(homedir(), '.local/bin'),
+        '/opt/homebrew/bin',
+        '/usr/local/bin',
+        resolve(homedir(), 'bin'),
+      ]
+
+/** Locate an executable in PATH plus {@link EXTRA_BIN_DIRS}; returns the
+ * absolute path or `undefined`.
  * ponytail: ceiling — scans PATH on every probe; called once per server spawn. */
 function whichBin(bin: string): string | undefined {
   const sep = process.platform === 'win32' ? ';' : ':'
   const exts = process.platform === 'win32' ? ['.exe', '.cmd', '.bat', ''] : ['']
-  for (const dir of (process.env.PATH ?? '').split(sep)) {
+  for (const dir of (process.env.PATH ?? '').split(sep).concat(EXTRA_BIN_DIRS)) {
     if (dir.length === 0) continue
     for (const ext of exts) {
       const p = resolve(dir, bin + ext)
@@ -243,6 +270,15 @@ function whichBin(bin: string): string | undefined {
     }
   }
   return undefined
+}
+
+/** Resolve a bare command name to its absolute path so the spawn does not
+ * depend on the process PATH. Names already carrying a path separator (or
+ * absent from every probed dir) pass through unchanged — the spawn error
+ * then reports the configured name. */
+function resolveCommandPath(command: string): string {
+  if (command.includes('/') || command.includes('\\')) return command
+  return whichBin(command) ?? command
 }
 
 /**
@@ -278,6 +314,30 @@ interface PermissionPresetReader {
   resolve(name: string): { sandbox: string; approval: string }
 }
 
+/** Session sandbox reader: the effective mode including the deployment default. */
+interface SandboxPolicyReader {
+  resolve(request: { session: Session }): { mode: string }
+}
+
+/** Append the `approval/asked` + `approval/decided` audit pair for an ACP
+ * permission request auto-allowed by the session's unrestricted permission
+ * state (sandbox `danger-full-access` with approval policy `never`). That
+ * shortcut bypasses `approval.request` (whose `never` policy would reject),
+ * so without this the session log records no trace of the grant. */
+function auditAutoAllowedPermission(session: Session, serverName: string, title: string): void {
+  try {
+    const id = randomUUID() as ApprovalRequestId
+    session.append('approval/asked', {
+      id,
+      toolName: `ACP: ${title}`,
+      reason: `${serverName} requested permission: ${title}. Auto-allowed by session sandbox danger-full-access with approval policy never.`,
+    })
+    session.append('approval/decided', { id, outcome: 'allowed-once' })
+  } catch {
+    // Audit-only: a session that cannot append must not block the grant.
+  }
+}
+
 /** One active ACP server: connection, adapter registration, and provider route. */
 interface ActiveServer {
   connection: AcpConnection
@@ -301,6 +361,7 @@ function serverFingerprint(server: AcpServerConfig): string {
     env: server.env ?? {},
     models: server.models ?? [],
     customModels: server.customModels ?? [],
+    modeMap: server.modeMap ?? {},
   })
 }
 
@@ -394,7 +455,11 @@ export function apply(ctx: Context, config: Config): void {
     // When a registry agent is distributed via `npx -y <pkg>`, prefer the
     // package's bin directly when it is already in PATH — avoids an npm fetch
     // and startup latency for agents the user has installed globally.
-    const { command: spawnCommand, args: spawnArgs } = resolveNpxShortcut(server.command, server.args)
+    const { command: npxCommand, args: spawnArgs } = resolveNpxShortcut(server.command, server.args)
+    // A bare command name resolves against the process PATH at spawn time;
+    // GUI/service launches often miss user bin dirs, so probe the augmented
+    // PATH and store the absolute path before spawning.
+    const spawnCommand = resolveCommandPath(npxCommand)
     const connection = new AcpConnection({
       command: spawnCommand,
       args: spawnArgs,
@@ -457,28 +522,57 @@ export function apply(ctx: Context, config: Config): void {
       defaultModel: { id: resolved.defaultModelId, name: resolved.defaultModelName },
       enabledModels: server.models,
       customModels: server.customModels,
+      onWarn: message => ctx.logger.warn(message),
+      // Map the calling dsh session's permission state to this server's ACP
+      // session mode (e.g. danger-full-access → bypass). Read per stream so a
+      // preset switch applies to the next prompt; preset name is looked up
+      // first, then the effective sandbox mode so delegated children carrying
+      // only knob events still match.
+      resolveSessionMode: () => {
+        const modeMap = server.modeMap
+        if (modeMap === undefined || Object.keys(modeMap).length === 0) return undefined
+        const agent = ctx.get('agents')?.currentInitiator()
+        const session = agent?.session as Session | undefined
+        if (session === undefined) return undefined
+        const permissionPresets = ctx.get('permissionPresets' as never) as PermissionPresetReader | undefined
+        const sandboxPolicy = ctx.get('sandboxPolicy' as never) as SandboxPolicyReader | undefined
+        const preset = permissionPresets?.current(session)
+        const sandbox = sandboxPolicy?.resolve({ session }).mode
+        return (preset !== undefined ? modeMap[preset] : undefined)
+          ?? (sandbox !== undefined ? modeMap[sandbox] : undefined)
+      },
       permissionRequester: () => {
         const agents = ctx.get('agents')
         const agent = agents?.currentInitiator()
         if (agent === undefined) return undefined
         const permissionPresets = ctx.get('permissionPresets' as never) as PermissionPresetReader | undefined
-        if (permissionPresets !== undefined) {
-          // permissionPresets.current(session) reads the session projection
-          // internally via sessionProjections.stateOf(session, ...), which
-          // calls session.snapshotEvents() itself. Pass the session object,
-          // not a pre-snapshotted events array.
-          const sessionLike = agent.session as Session
-          const current = permissionPresets.current(sessionLike)
-          if (permissionPresets.names.includes(current)) {
-            const preset = permissionPresets.resolve(current)
-            if (preset.sandbox === 'danger-full-access' && preset.approval === 'never') {
-              return async () => 'allow'
-            }
-          }
-        }
+        const sandboxPolicy = ctx.get('sandboxPolicy' as never) as SandboxPolicyReader | undefined
         const approval = ctx.get('approval')
-        if (approval === undefined) return undefined
+        if (approval === undefined && sandboxPolicy === undefined && permissionPresets === undefined) return undefined
+        const sessionLike = agent.session as Session
         return async ({ title, signal, optionLabels }) => {
+          // Read the effective permission knobs per request, not once at
+          // stream start: a mid-turn switch to danger-full-access must reach
+          // the in-flight prompt. Under approval policy `never` the approval
+          // seam auto-rejects instead of asking, so routing the request
+          // through it would deny everything the agent tries. Knobs are read
+          // directly rather than matching a preset name: delegation seeds
+          // child sessions with `sandbox/mode` + `approval/policy` events and
+          // unnamed combinations derive `custom`, which a name match misses.
+          // The preset reader stays as fallback for a deployment without the
+          // sandbox-policy seam.
+          let preset: { sandbox: string; approval: string } | undefined
+          if (permissionPresets !== undefined) {
+            const current = permissionPresets.current(sessionLike)
+            if (permissionPresets.names.includes(current)) preset = permissionPresets.resolve(current)
+          }
+          const sandbox = sandboxPolicy?.resolve({ session: sessionLike }).mode ?? preset?.sandbox
+          const policy = approval?.overrideOf(sessionLike) ?? approval?.config.policy ?? preset?.approval
+          if (sandbox === 'danger-full-access' && policy === 'never') {
+            auditAutoAllowedPermission(sessionLike, server.name, title)
+            return 'allow'
+          }
+          if (approval === undefined) return 'reject'
           const reason = optionLabels !== undefined && optionLabels.length > 0
             ? `${server.name} requested permission: ${title}. Options: ${optionLabels.join(', ')}.`
             : `${server.name} requested permission to run "${title}".`
@@ -490,6 +584,11 @@ export function apply(ctx: Context, config: Config): void {
           })
           if (outcome === 'allowed-once') return 'allow'
           if (outcome === 'cancelled') return 'cancel'
+          if (outcome === 'unavailable') {
+            ctx.logger.warn(`llm-acp: permission request for "${title}" denied: no approval answerer on this session (unattended sessions auto-deny); run the session under a preset whose approval policy needs no answerer`)
+          } else if (outcome === 'rejected' && policy === 'never') {
+            ctx.logger.warn(`llm-acp: permission request for "${title}" auto-rejected by approval policy "never" (effective sandbox: ${sandbox ?? 'unknown'}); full-access sessions pair approval "never" with sandbox "danger-full-access"`)
+          }
           return 'reject'
         }
       },
@@ -725,6 +824,36 @@ export function apply(ctx: Context, config: Config): void {
       if (server === undefined) return [{ id: 'none', name: '[]' }]
       const trace = server.connection.getProtocolTrace()
       return [{ id: 'trace', name: JSON.stringify(trace) }]
+    }
+    // A seventh route convention, `acp-modes-<id>`, lists the session modes
+    // the server advertises via its `mode` config option (e.g. Devin's
+    // `bypass`). The reply reuses the `LlmDiscoveredModel` wire shape: `id` is
+    // the mode value, `name` its display label. Only the ACP settings UI
+    // consumes this route — it populates the modeMap editor's ACP-side select.
+    if (provider.startsWith('acp-modes-')) {
+      const serverId = provider.slice('acp-modes-'.length)
+      const server = active.get(serverId)
+      if (server === undefined) return []
+      try {
+        const modes = await Promise.race([
+          server.connection.discoverModes(),
+          new Promise<undefined>(resolve => setTimeout(() => resolve(undefined), 10_000)),
+        ])
+        return (modes ?? []).map(m => ({ id: m.id, name: m.name }))
+      } catch {
+        return []
+      }
+    }
+    // An eighth route convention, `acp-dsh-presets`, lists the dsh permission
+    // preset names plus sandbox mode values usable as modeMap keys. Falls back
+    // to the three standard sandbox modes when no preset service is mounted.
+    // Only the ACP settings UI consumes this route.
+    if (provider === 'acp-dsh-presets') {
+      const presets = ctx.get('permissionPresets' as never) as PermissionPresetReader | undefined
+      const names = presets !== undefined && presets.names.length > 0
+        ? [...presets.names]
+        : ['read-only', 'workspace-write', 'danger-full-access']
+      return names.map(name => ({ id: name, name }))
     }
     if (!provider.startsWith('acp-')) return []
     const serverId = provider.slice(4)

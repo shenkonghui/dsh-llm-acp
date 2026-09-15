@@ -32,6 +32,7 @@ export interface AcpServerEntry {
   env?: Record<string, string>
   models?: string[]
   customModels?: { id: string; name: string }[]
+  modeMap?: Record<string, string>
 }
 
 /** Wire view of one registered settings namespace (the fields this section reads). */
@@ -330,6 +331,9 @@ export function AcpSettingsSection(props: AcpSettingsSectionProps) {
   const [error, setError] = useState<string | undefined>()
   const [expandedId, setExpandedId] = useState<string | undefined>()
   const [envDrafts, setEnvDrafts] = useState<Record<string, EnvDraftRow[]>>({})
+  const [modeDrafts, setModeDrafts] = useState<Record<string, EnvDraftRow[]>>({})
+  const [dshPresets, setDshPresets] = useState<string[]>([])
+  const [acpModes, setAcpModes] = useState<Record<string, DiscoveredModel[]>>({})
   const [modelDrafts, setModelDrafts] = useState<Record<string, string[]>>({})
   const [customModelDrafts, setCustomModelDrafts] = useState<Record<string, CustomModelDraftRow[]>>({})
   const [discoveredModels, setDiscoveredModels] = useState<Record<string, DiscoveredModel[]>>({})
@@ -385,7 +389,13 @@ export function AcpSettingsSection(props: AcpSettingsSectionProps) {
     setLoading(false)
   }
 
-  useEffect(() => { void loadServers() }, [])
+  useEffect(() => {
+    void loadServers()
+    // The dsh-side modeMap keys are the permission preset names (or sandbox
+    // mode values); load once — they do not change with server selection.
+    void loadProviderModels(api, settingsNs, 'acp-dsh-presets')
+      .then(list => { setDshPresets(list.map(m => m.id)) })
+  }, [])
 
   /** Add a registry agent as a configured server. For `npx -y <pkg>` agents,
    * probe the host PATH first and store the local bin directly when present,
@@ -520,6 +530,7 @@ export function AcpSettingsSection(props: AcpSettingsSectionProps) {
     setExpandedId(id)
     if (server !== undefined) {
       setEnvDrafts(prev => ({ ...prev, [id]: envToDrafts(server.env) }))
+      setModeDrafts(prev => ({ ...prev, [id]: envToDrafts(server.modeMap) }))
       setModelDrafts(prev => ({ ...prev, [id]: server.models ?? [] }))
       setCustomModelDrafts(prev => ({
         ...prev,
@@ -528,11 +539,13 @@ export function AcpSettingsSection(props: AcpSettingsSectionProps) {
     }
     // Fetch discovered models and live server info for this provider route.
     setModelsLoading(prev => new Set(prev).add(id))
-    const [models, info, authState] = await Promise.all([
+    const [models, info, authState, modes] = await Promise.all([
       loadProviderModels(api, settingsNs, `acp-${id}`),
       loadServerInfo(api, settingsNs, id),
       loadAuthState(api, settingsNs, id),
+      loadProviderModels(api, settingsNs, `acp-modes-${id}`),
     ])
+    setAcpModes(prev => ({ ...prev, [id]: modes }))
     setDiscoveredModels(prev => ({ ...prev, [id]: models }))
     setServerInfo(prev => (prev[id] === info ? prev : { ...prev, [id]: info }))
     setAuthStates(prev => (prev[id] === authState ? prev : { ...prev, [id]: authState }))
@@ -575,6 +588,14 @@ export function AcpSettingsSection(props: AcpSettingsSectionProps) {
         settingsNs,
         [
           { op: 'set', path: ['servers', id, 'env'], value: env },
+          // Mode rows use selects with an empty placeholder — a mapping needs
+          // both sides picked, so drop rows whose ACP mode is still unset.
+          {
+            op: 'set', path: ['servers', id, 'modeMap'],
+            value: Object.fromEntries(
+              Object.entries(draftsToEnv(modeDrafts[id] ?? [])).filter(([, v]) => v !== ''),
+            ),
+          },
           { op: 'set', path: ['servers', id, 'models'], value: models },
           { op: 'set', path: ['servers', id, 'customModels'], value: customModels },
         ],
@@ -719,6 +740,34 @@ export function AcpSettingsSection(props: AcpSettingsSectionProps) {
   /** Remove one env draft row. */
   const removeEnvRow = (serverId: string, index: number): void => {
     setEnvDrafts(prev => {
+      const rows = [...(prev[serverId] ?? [])]
+      rows.splice(index, 1)
+      return { ...prev, [serverId]: rows }
+    })
+  }
+
+  /** Update one modeMap draft row. */
+  const updateModeRow = (serverId: string, index: number, patch: Partial<EnvDraftRow>): void => {
+    setModeDrafts(prev => {
+      const rows = [...(prev[serverId] ?? [])]
+      const row = rows[index]
+      if (row === undefined) return prev
+      rows[index] = { ...row, ...patch }
+      return { ...prev, [serverId]: rows }
+    })
+  }
+
+  /** Add an empty modeMap draft row. */
+  const addModeRow = (serverId: string): void => {
+    setModeDrafts(prev => ({
+      ...prev,
+      [serverId]: [...(prev[serverId] ?? []), { key: '', value: '' }],
+    }))
+  }
+
+  /** Remove one modeMap draft row. */
+  const removeModeRow = (serverId: string, index: number): void => {
+    setModeDrafts(prev => {
       const rows = [...(prev[serverId] ?? [])]
       rows.splice(index, 1)
       return { ...prev, [serverId]: rows }
@@ -871,6 +920,7 @@ export function AcpSettingsSection(props: AcpSettingsSectionProps) {
               {serverList.map(([id, server]) => {
                 const isExpanded = expandedId === id
                 const rows = envDrafts[id] ?? []
+                const modeRows = modeDrafts[id] ?? []
                 const selectedModels = modelDrafts[id] ?? []
                 const models = discoveredModels[id] ?? []
                 const isLoadingModels = modelsLoading.has(id)
@@ -1005,6 +1055,64 @@ export function AcpSettingsSection(props: AcpSettingsSectionProps) {
                             onClick={() => { addEnvRow(id) }}
                           >
                             + {t('addEnvVar')}
+                          </button>
+                        </div>
+
+                        <div className={css.detailSection}>
+                          <p className={css.detailHeading}>{t('modeMap')}</p>
+                          <p className={css.detailHint}>{t('modeMapHint')}</p>
+                          {modeRows.length === 0 ? (
+                            <p className={css.emptyInline}>{t('noModeMap')}</p>
+                          ) : (
+                            <div className={css.envList}>
+                              {modeRows.map((row, index) => {
+                                const serverModes = acpModes[id] ?? []
+                                return (
+                                  <div key={index} className={css.envRow}>
+                                    <select
+                                      className={css.envKey}
+                                      value={row.key}
+                                      onChange={e => { updateModeRow(id, index, { key: e.target.value }) }}
+                                    >
+                                      <option value="">{t('modeMapKey')}</option>
+                                      {dshPresets.map(name => (
+                                        <option key={name} value={name}>{name}</option>
+                                      ))}
+                                      {row.key !== '' && !dshPresets.includes(row.key) && (
+                                        <option value={row.key}>{row.key}</option>
+                                      )}
+                                    </select>
+                                    <select
+                                      className={css.envValue}
+                                      value={row.value}
+                                      onChange={e => { updateModeRow(id, index, { value: e.target.value }) }}
+                                    >
+                                      <option value="">{t('modeMapValue')}</option>
+                                      {serverModes.map(m => (
+                                        <option key={m.id} value={m.id}>{m.name} ({m.id})</option>
+                                      ))}
+                                      {row.value !== '' && !serverModes.some(m => m.id === row.value) && (
+                                        <option value={row.value}>{row.value}</option>
+                                      )}
+                                    </select>
+                                    <button
+                                      type="button"
+                                      className={css.envRemove}
+                                      onClick={() => { removeModeRow(id, index) }}
+                                    >
+                                      ×
+                                    </button>
+                                  </div>
+                                )
+                              })}
+                            </div>
+                          )}
+                          <button
+                            type="button"
+                            className={css.addEnvButton}
+                            onClick={() => { addModeRow(id) }}
+                          >
+                            + {t('addModeMap')}
                           </button>
                         </div>
 

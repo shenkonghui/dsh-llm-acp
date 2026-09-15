@@ -33,6 +33,7 @@ interface AcpServerEntry {
   env?: Record<string, string>
   models?: string[]
   customModels?: { id: string; name: string }[]
+  modeMap?: Record<string, string>
 }
 
 /** Wire view of one registered settings namespace. */

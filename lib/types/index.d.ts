@@ -50,6 +50,15 @@ export interface AcpServerConfig {
         id: string;
         name: string;
     }[];
+    /**
+     * Map a dsh permission preset name (or sandbox mode value) to the ACP
+     * session mode applied to this server's sessions, e.g.
+     * `{ "danger-full-access": "bypass" }`. Read per prompt so a mid-turn
+     * preset switch reaches the next stream. Unmapped states leave the
+     * server's mode untouched; servers without a `mode` config option keep
+     * their own default.
+     */
+    modeMap?: Record<string, string>;
 }
 /** Plugin config: defaults applied to every spawned ACP server. */
 export interface Config {
