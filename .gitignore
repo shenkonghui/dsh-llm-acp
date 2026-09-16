@@ -11,3 +11,5 @@ node_modules/
 *-scratch.js.map
 *.bak
 .workbuddy/
+.workbuddy/
+.dsh-llm-acp/

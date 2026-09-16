@@ -59,7 +59,7 @@ llm-acp:
 
 `apply(ctx, config)` 从 `llm-acp` 设置命名空间读取已配置的服务器列表。对每个服务器，启动一个长生命周期的子进程，通过 stdin/stdout 建立 ACP `ClientSideConnection`，并在 `ctx.llm` 上注册路由为 `acp-<server-id>` 的 `AcpAdapter`。
 
-当 ACP agent 声明 `loadSession` 能力时，适配器自动启用 session 复用：同一 dsh 会话的后续轮次通过 `session/load` 恢复已有 ACP session，仅发送增量用户消息而非全量历史。不支持 `loadSession` 时降级为每轮新建 session + 全量发送。模型调用通过 ACP `session/prompt` 发送，流式 `agent_message_chunk` 更新转换为 harness 的 `StreamChunk`。
+适配器自动启用 session 复用：同一 dsh 会话的后续轮次复用连接上仍然活跃的 ACP session，仅发送增量用户消息而非全量历史（ACP agent 为每个 session 维护自己的上下文与对话历史，`session/load` 仅用于跨客户端重启的恢复）。无复用映射（首轮、一次性调用）或历史变短（compaction）时新建 session 并全量发送。模型调用通过 ACP `session/prompt` 发送，流式 `agent_message_chunk` 更新转换为 harness 的 `StreamChunk`。
 
 ### 客户端 — 设置界面
 
@@ -82,20 +82,22 @@ binary 类型使用可执行文件的 basename，这样已安装到 PATH 的二�
 | 配置 | 默认值 | 说明 |
 |---|---|---|
 | `permission` | `allow` | 自动应答 `session/request_permission`：`reject` 拒绝所有请求，`allow` 选择第一个 `allow_once`/`allow_always` 选项。 |
-| `emitReasoning` | `true` | 是否将 `agent_thought_chunk` 和扩展进度通知转换为 `reasoning-delta` chunk。 |
+| `emitReasoning` | `true` | 是否将 `agent_thought_chunk` 转换为 `reasoning-delta` chunk。 |
+| `emitToolCalls` | `true` | 会话内 ACP 工具调用固定落为 `tool/call`/`tool/result` 会话事件（工具卡片）；无会话上下文时（如设置页探测）才退化为 `[tool: <title>]` reasoning 文本。此项只控制这段回退文本，不影响任何执行与记录。 |
+| `emitProgress` | `false` | 是否把扩展进度通知（如 `_cognition.ai/output` 的 MCP 连接日志）呈现为 reasoning 文本。属服务端噪声，故默认关闭。 |
 | `defaultModelId` | `devin` | ACP 发现未返回模型时的回退模型 ID。 |
 | `defaultModelName` | `Devin (ACP)` | 回退模型显示名称。 |
 | `disposeEofGraceMs` | `6000` | stdin EOF 后等待平台终止的宽限时间（毫秒）。 |
 | `disposeGraceMs` | `3000` | SIGTERM 后等待 SIGKILL 的 POSIX 宽限时间（毫秒）。 |
 | `initTimeoutMs` | `120000` | `initialize` 握手（含 keyed `authenticate`）的上限（毫秒）。 |
-| `sessionTimeoutMs` | `60000` | `session/new`、`session/load`、`session/list`、`session/set_config_option` 的上限（毫秒）。 |
+| `sessionTimeoutMs` | `60000` | `session/new`、`session/list`、`session/set_config_option` 的上限（毫秒）。 |
 | `authTimeoutMs` | `15000` | 单次 `authenticate` 调用的上限（毫秒）。 |
 
 ## 协议契约
 
 每次 `stream()` 调用：
 
-1. **Session 获取**：当 agent 支持 `session/load` 且请求携带 dsh `sessionId` 时，复用已有 ACP session（`session/load`）；否则创建新的 ACP `session/new`。
+1. **Session 获取**：请求携带 dsh `sessionId` 且已有复用映射（历史未变短）时，复用同一 ACP session；否则创建新的 ACP `session/new`。历史变短（compaction）也走新建。
 2. **消息发送**：复用 session 时仅发送增量用户消息（跳过已发送的历史和 assistant 响应）；新建 session 时将 harness 的 `messages` 和 `system` prompt 渲染为一条 ACP 文本块。
 3. 发送 `session/prompt`，将流式 `agent_message_chunk` 更新作为 `text-delta` chunk 传输。
 4. 当 `emitReasoning` 开启时，`agent_thought_chunk` 更新转换为 `reasoning-delta` chunk。
@@ -103,7 +105,13 @@ binary 类型使用可执行文件的 basename，这样已安装到 PATH 的二�
 6. `session/prompt` 响应的终态 `stopReason` 转换为 `finish` chunk。
 7. **Session 生命周期**：复用的 session 在 prompt 完成后保持活跃（供后续轮次使用）；一次性 session 在 prompt 完成后关闭。
 
-工具调用增量不会被输出。ACP 服务器内部执行自己的工具。`usage` chunk 只对会话主线请求输出；compaction / session-title 这类辅助调用渲染的是自己的临时 prompt，其占用会顶掉真实样本，因此不上报。
+工具调用**不作为 tool-call 块输出**。这是必须而非省略：harness 的 `agent-loop` 会把 assistant message 里的 `tool-call` 块交给 `executeToolCalls` 真正执行，而 ACP 服务器的工具已在它自己进程里跑完，再发一遍会导致重复执行或 unknown tool。因此 ACP 的 `tool_call`/`tool_call_update` 通知被直接落成会话事件 `tool/call` + `tool/result`（与 `executeToolCalls` 写入的同一对事件），会话 UI 据此渲染工具调用卡片；`failed` 状态生成 `isError` 的 error 结果，prompt 结束仍未收尾的调用补一条空结果。卡片行族按 ACP 的 `tool_call.kind` 映射到原生工具名（`read`→`read`、`edit`→`edit`、`execute`→`bash`、`search`→`grep`、`fetch`→`web_fetch`），以复用原生的图标、本地化标题和可点击文件路径；没有原生等价的 kind（或服务器未给 kind）保留服务器 title，落通用卡片。无 `rawInput` 的调用 `arguments` 记为 `{}`，避免卡片摘要退化为 callId。没有会话上下文时（模型发现、设置页探测）回退为 `[tool: <title>]` reasoning 活动提示（由 `emitToolCalls` 控制）。ACP 服务器内部执行自己的工具。`usage` chunk 只对会话主线请求输出；compaction / session-title 这类辅助调用渲染的是自己的临时 prompt，其占用会顶掉真实样本，因此不上报。
+
+一个已知的卡片顺序差异：ACP 工具调用发生在模型流期间，其会话事件的 seq 小于流结束后才落盘的 assistant message，而会话 UI 按 seq 排序，因此落定/重放视图中该步的工具卡片显示在该步文本上方——原生 dsh 中工具在消息落盘后才执行，卡片恒在文本下方；流式切换到落定视图时卡片会有一次自下而上的视觉重排。这是会话事件 seq 单调分配的固有结果，插件侧无法调整，接受现状。
+
+### 协议调试转储
+
+设置环境变量 `DSH_LLM_ACP_DEBUG_DIR=<目录>` 后，每条连接会把自身全部 ACP 交互以 JSONL 追加写入该目录下的 `acp-<命令名>-<时间戳>-<pid>.jsonl`，用于离线排查流量与延迟（例如 `session/prompt` 的实际负载、`session/update-dropped` 的来源）。每行一条事件，携带各自的到达时间与未截断的 detail，不做内存缓冲那样的折叠；文件在首个事件到达时才创建，目录不存在时自动建立。写入失败只告警一次并关闭转储，不影响连接。未设置该变量时不产生任何文件。
 
 ### 停止原因映射
 
@@ -136,15 +144,16 @@ pnpm build    # tsc -b && tsdown
 - 切换到另一条尚未上报的 provider 路由时，harness 会清掉旧容量，而不是复用上一个 server 的窗口。
 - **系统提示在消息体内** — ACP `session/new` 没有 system 槽位，harness 的 system prompt 被拼接到用户消息文本前。
 - **ACP v1（SDK 0.25.1）** — 适配器使用 `@agentclientprotocol/sdk` 0.25.1，其 `session/prompt` 响应携带终态 `stopReason`（v1 契约）。
-- **扩展协议处理** — Devin 的 `_cognition.ai/*` 通知被静默消费（进度文本在 `emitReasoning` 开启时作为 reasoning 输出）；其他非标准 ACP 扩展被吞掉以避免 SDK 错误日志。
-- **认证惰性化** — 未配置 API key 时不主动调用 `authenticate`：依赖 env 凭证或 CLI 缓存登录的 server 直接 `session/new` 成功；仅当 `session/new`/`session/load` 失败才执行一次有界（`authTimeoutMs`）的 `authenticate` 并重试。交互式浏览器登录只在确实需要时触发，URL 同时经警告日志与设置页 `acp-auth-<id>` 路由暴露。
+- **扩展协议处理** — Devin 的 `_cognition.ai/*` 通知被静默消费（`_cognition.ai/output` 的进度文本在 `emitProgress` 开启时作为 reasoning 输出）；其他非标准 ACP 扩展被吞掉以避免 SDK 错误日志。
+- **认证惰性化** — 未配置 API key 时不主动调用 `authenticate`：依赖 env 凭证或 CLI 缓存登录的 server 直接 `session/new` 成功；仅当 `session/new` 失败才执行一次有界（`authTimeoutMs`）的 `authenticate` 并重试。交互式浏览器登录只在确实需要时触发，URL 同时经警告日志与设置页 `acp-auth-<id>` 路由暴露。
 - **多登录方式需选择，不猜** — 服务器广告多种认证方式时（如 codebuddy 的 `iOA`(仅内网可达) / `external` / `internal` / `selfhosted`），插件不再默认取第一个：未选择就不发起 `authenticate`，改为快速失败并在会话下方弹出选择框（`acp-methods-<id>` 路由提供方法目录），选择写入 `servers.<id>.authMethod`，也可在「设置 → ACP 服务」里更改。只有一种方式时自动使用；配置了未被广告的 id 且存在多种方式时同样视为未选择。选择变更会重建该 server 的连接，从而应用新方式并丢弃仍挂在旧方式上的 `authenticate` 轮。带 API key 的预认证轮走同一套解析，key 不再会让插件替你选中第一个方式。
+- **子代理活动可识别、可按权限映射呈现，但不能拦截** — 识别依据是工具调用的 `_meta`（`cognition.ai/inferenceToolName === "run_subagent"`，档位在该调用的 `rawInput.profile`），不是可读标题；子代理内部的调用带 `cognition.ai/subagent_context.parentAgentId`，它自身的结束是一个没有对应 `tool_call` 的 `tool_call_update`。是否呈现由 `servers.<id>.subagentMap` 决定（dsh 权限预设名或 sandbox 模式 → `notice` / `silent`，默认 `notice`），使需要审批的会话被告知扇出、全权委托的会话保持安静。它只是提示（走 reasoning 通道），不构成审批，也无法阻止服务器继续派生子代理。
 
 ## ACP 标准能力支持
 
 适配器通过 ACP 协议的能力协商机制（`initialize` 响应中的 `agentCapabilities`）自动检测并使用以下标准能力：
 
-- **Session 复用（`session/load`）** — 当 ACP agent 声明 `loadSession` 能力时，同一 dsh 会话的后续轮次复用已有 ACP session，仅发送增量用户消息，避免全量历史重发。不支持 `loadSession` 时自动降级为每轮新建 session + 全量发送。
+- **Session 复用** — 同一 dsh 会话的后续轮次复用连接上仍然活跃的 ACP session，仅发送增量用户消息，避免全量历史重发（不依赖也不调用 `session/load`；该方法是跨客户端重启的恢复机制，对活跃 session 调用会触发全量历史回放）。无复用映射或历史变短（compaction）时自动新建 session + 全量发送。
 - **Session 列表（`session/list`）** — `AcpConnection.listSessions()` 在 agent 支持 `session/list` 时返回已有会话列表。
 - **Session 删除（`session/delete`）** — `AcpConnection.deleteSession()` 在 agent 支持 `session/delete` 时删除指定会话。
 - **完整配置选项发现** — `AcpConnection.discoverConfigOptions()` 返回 ACP server 的全部 `configOptions`（模型、模式、思考级别等），不仅限于模型列表。

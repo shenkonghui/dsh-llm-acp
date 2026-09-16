@@ -81,27 +81,35 @@ Binary entries use the executable basename so a PATH-installed binary is found d
 
 | Config | Default | Meaning |
 |---|---|---|
-| `emitReasoning` | `true` | Whether `agent_thought_chunk` and extension progress notifications become `reasoning-delta` chunks. |
+| `emitReasoning` | `true` | Whether `agent_thought_chunk` updates become `reasoning-delta` chunks. |
+| `emitToolCalls` | `true` | Inside a session, ACP-observed tool calls are always recorded as `tool/call`/`tool/result` session events (tool cards); without a session context (e.g. settings-page probes) they degrade to `[tool: <title>]` reasoning text. This option controls that fallback text only, never execution or recording. |
+| `emitProgress` | `false` | Whether extension progress notifications (e.g. `_cognition.ai/output` MCP connection lines) become reasoning text. Server chatter, so off by default. |
 | `defaultModelId` | `devin` | Fallback model id when ACP discovery returns no models. |
 | `defaultModelName` | `Devin (ACP)` | Fallback model display name. |
 | `disposeEofGraceMs` | `6000` | Positive grace after stdin EOF before platform termination. |
 | `disposeGraceMs` | `3000` | Positive POSIX grace after SIGTERM before SIGKILL. |
 | `initTimeoutMs` | `120000` | Bound on the `initialize` handshake (plus any keyed `authenticate` round). |
-| `sessionTimeoutMs` | `60000` | Bound on `session/new`, `session/load`, `session/list`, and `session/set_config_option`. |
+| `sessionTimeoutMs` | `60000` | Bound on `session/new`, `session/list`, and `session/set_config_option`. |
 | `authTimeoutMs` | `15000` | Bound on one `authenticate` round. |
 
 ## Protocol contract
 
 Each `stream()` call:
 
-1. Creates a fresh ACP `session/new` with the configured `cwd`.
-2. Renders the harness `messages` plus `system` prompt into one ACP text block.
+1. **Session acquisition**: when the request carries a dsh `sessionId` and a reuse mapping exists (history not shrunken), the same ACP session is reused; otherwise a fresh ACP `session/new` is created with the configured `cwd`. A shrunken history (compaction) also creates fresh.
+2. **Message sending**: on a reused session only the new user messages are sent (already-sent history and assistant responses are skipped); on a fresh session the harness `messages` plus `system` prompt are rendered into one ACP text block.
 3. Sends `session/prompt` and streams `agent_message_chunk` updates as `text-delta` chunks.
 4. When `emitReasoning` is on, `agent_thought_chunk` updates become `reasoning-delta` chunks.
 5. A `usage_update` notification becomes a `usage` chunk (`inputTokens` is the server-reported context occupancy) and its `size` is remembered as the route's `context.contextWindow`.
 6. The terminal `session/prompt` response `stopReason` becomes the `finish` chunk.
 
-Tool-call deltas are never emitted. The ACP server executes its own tools internally. A `usage` chunk is reported for conversation calls only: an auxiliary call (compaction, session-title) renders a purpose-built prompt whose occupancy would displace the real sample. `session/request_permission` follows the current session permission preset: `danger-full-access` allows automatically, while other presets use a one-shot harness approval request. Unavailable or failing approval and ACP requests without `allow_once` fail closed.
+Tool calls are **never emitted as tool-call blocks**. That is a requirement rather than an omission: the harness's agent loop hands `tool-call` blocks from the assistant message to `executeToolCalls`, but an ACP server has already run its own tools, so re-emitting them would make the harness execute them again against its own tool registry — double execution or an unknown-tool failure. Instead, ACP `tool_call`/`tool_call_update` notifications are written as `tool/call` + `tool/result` session events — the same pair `executeToolCalls` writes, tagged with the open step's turn/step — which the conversation UI renders as tool cards. The result cites its call via `sourceEventSeqs`; a `failed` status produces an `isError` result carrying an error identity, and a call still open when the prompt ends is closed with an empty result so the log never holds a dangling call. The card's row family follows the ACP `tool_call.kind`, mapped onto native tool names (`read`→`read`, `edit`→`edit`, `execute`→`bash`, `search`→`grep`, `fetch`→`web_fetch`) so the call reuses the native icon, localized title, and openable file path; kinds without a native equivalent (or a missing kind) keep the server-provided title on the generic card. A call without `rawInput` records `{}` as its arguments so the summary does not fall back to the opaque callId. Without a session context (model discovery, settings-page probes) the fallback is `[tool: <title>]` reasoning text, gated by `emitToolCalls`. The ACP server executes its own tools internally. A `usage` chunk is reported for conversation calls only: an auxiliary call (compaction, session-title) renders a purpose-built prompt whose occupancy would displace the real sample. `session/request_permission` follows the current session permission preset: `danger-full-access` allows automatically, while other presets use a one-shot harness approval request. Unavailable or failing approval and ACP requests without `allow_once` fail closed.
+
+One known card-ordering difference: ACP tool calls run during the model stream, so their session events carry smaller seqs than the assistant message that lands when the stream ends; the conversation UI orders by seq, so in the settled/replayed view the step's tool cards appear above its text — in native dsh tools run after the message lands and always sit below it, and the cards reflow from below to above once at the streaming-to-settled transition. This follows from the monotonic seq assignment and is not fixable plugin-side; it is accepted as-is.
+
+### Protocol dump
+
+With `DSH_LLM_ACP_DEBUG_DIR=<dir>` set, every connection appends all of its ACP interactions as JSONL to `acp-<command>-<timestamp>-<pid>.jsonl` in that directory, for offline diagnosis of traffic and latency (for example the actual `session/prompt` payload, or where `session/update-dropped` entries come from). One event per line, each with its own arrival time and untruncated detail, without the in-memory buffer's collapsing; the file is created on the first event and its directory is created if absent. A write failure warns once and disables the dump without affecting the connection. With the variable unset no file is written.
 
 ### Stop-reason mapping
 
@@ -133,11 +141,21 @@ Built artifacts are committed to the repository, so `pnpm install` alone is suff
 - A later sample with a new usable window replaces it, so switching to a larger model shows up immediately.
 - Switching to another provider route that has not reported yet makes the harness clear the old capacity rather than reuse the previous server's window.
 - **System prompt is in-band** — ACP `session/new` has no system slot, so the harness system prompt is prepended to the user message text.
-- **Full-history re-send without `session/load`** — when the agent does not advertise `loadSession`, the adapter renders the entire `messages` array into one user message per call.
+- **Full-history render on fresh sessions only** — only when no reuse mapping exists (first turn, one-shot calls) or the history shrank (compaction) does the adapter render the entire `messages` array into one user message; reused turns send only the delta.
 - **ACP v1 (SDK 0.25.1)** — the adapter uses `@agentclientprotocol/sdk` 0.25.1, whose `session/prompt` response carries the terminal `stopReason` (v1 contract).
-- **Extension protocol handling** — Devin's `_cognition.ai/*` notifications are consumed silently (progress text surfaced as reasoning when `emitReasoning` is on); other non-standard ACP extensions are swallowed to prevent SDK error logs.
-- **Lazy authentication** — with no configured API key, `authenticate` is not called up front: servers accepting env credentials or a cached login go straight to `session/new`. Only a failed `session/new`/`session/load` triggers one bounded (`authTimeoutMs`) `authenticate` round plus a retry, so an interactive browser login only fires when genuinely required; the URL is surfaced via the warning log and the `acp-auth-<id>` settings route.
+- **Extension protocol handling** — Devin's `_cognition.ai/*` notifications are consumed silently (`_cognition.ai/output` progress text is surfaced as reasoning when `emitProgress` is on); other non-standard ACP extensions are swallowed to prevent SDK error logs.
+- **Lazy authentication** — with no configured API key, `authenticate` is not called up front: servers accepting env credentials or a cached login go straight to `session/new`. Only a failed `session/new` triggers one bounded (`authTimeoutMs`) `authenticate` round plus a retry, so an interactive browser login only fires when genuinely required; the URL is surfaced via the warning log and the `acp-auth-<id>` settings route.
 - **Several login methods require a choice, never a guess** — when a server advertises more than one method (codebuddy offers `iOA`, reachable only from its intranet, alongside the public `external`), the adapter no longer takes the first: with nothing selected it starts no `authenticate` round, fails fast, and the conversation raises a picker fed by the `acp-methods-<id>` route. The pick is stored in `servers.<id>.authMethod` and can be changed later under Settings → ACP Servers. **A single advertised method is used automatically**, and a selection the server does not advertise counts as unselected (never a fallback to the first). Changing the selection rebuilds that server's connection, which applies the new method and abandons an `authenticate` round still hung on the old one. The eager keyed round resolves through the same rule, so a configured API key no longer picks a method on your behalf.
+- **Subagent activity is detectable and can be mapped from permissions, but not intercepted** — a server spawns its subagents inside its own process, where the harness has no hook (ACP is server-initiated and the adapter never forwards tool inputs/outputs). What it can do is detect and report, keyed on a tool call's `_meta` rather than its human-readable title:
+
+  | Fact | Structure | Value |
+  |---|---|---|
+  | Subagent spawned | `tool_call._meta["cognition.ai/inferenceToolName"]` | `run_subagent` |
+  | Profile / short label | that call's `rawInput` | `profile` / `title` (`kind` is unset, so it cannot classify) |
+  | Calls made inside it | those calls' `_meta["cognition.ai/subagent_context"]` | `parentAgentId` |
+  | The subagent finished | a `tool_call_update` with **no** matching `tool_call`, whose `toolCallId` is that `parentAgentId` | `status: completed` |
+
+  Whether it is surfaced is decided by `servers.<id>.subagentMap` (dsh permission preset name or sandbox mode → `notice` / `silent`, `notice` by default): a supervised session is told a fan-out happened while a fully delegated one stays quiet — a subagent bills as its own session with its own context window, which is the only thing worth interrupting for. It is a **notice** only (rendered on the reasoning channel and gated by `subagentMap` alone), never an approval, and it cannot stop the server from spawning more.
 
 ## License
 

@@ -5,7 +5,7 @@
  * streamed assistant text/reasoning chunks plus a terminal stop reason.
  *
  * Authentication is lazy: `authenticate` runs eagerly only when a configured
- * API key resolves, and otherwise only after a `session/new`/`session/load`
+ * API key resolves, and otherwise only after a `session/new`
  * failure — servers that accept env credentials or a cached login never see
  * an `authenticate` call, so a healthy server never triggers a browser login
  * it did not need. When a server advertises several auth methods, the round
@@ -18,13 +18,14 @@
  * @module @deepseek-ai/dsh-llm-acp/connection
  */
 
+import { appendFileSync, mkdirSync } from 'node:fs'
+import { basename, join } from 'node:path'
 import { Readable as NodeReadable, Writable as NodeWritable } from 'node:stream'
 import {
   ClientSideConnection,
   ndJsonStream,
   PROTOCOL_VERSION,
   type Agent as AcpAgent,
-  type AgentCapabilities,
   type AuthMethod,
   type Client,
   type ContentBlock as AcpContentBlock,
@@ -104,7 +105,7 @@ export const DEFAULT_DISPOSE_GRACE_MS = 3_000
 /** Default bound on the `initialize` handshake plus any keyed `authenticate` round. */
 export const DEFAULT_INIT_TIMEOUT_MS = 120_000
 
-/** Default bound on `session/new`, `session/load`, and `session/set_config_option`. */
+/** Default bound on `session/new`, `session/list`, and `session/set_config_option`. */
 export const DEFAULT_SESSION_TIMEOUT_MS = 60_000
 
 /** Default bound on one `authenticate` round, keyed or key-less. */
@@ -115,16 +116,37 @@ export const DEFAULT_AUTH_TIMEOUT_MS = 15_000
  * call retries. */
 export const DEFAULT_INTERACTIVE_AUTH_TIMEOUT_MS = 300_000
 
-/** One queued update delivered to a {@link AcpConnection.promptStream} consumer. */type QueuedUpdate =
+/** One queued update delivered to a {@link AcpConnection.promptStream} consumer. */
+type QueuedUpdate =
   | { kind: 'text'; text: string }
   | { kind: 'reasoning'; text: string }
   | { kind: 'progress'; text: string }
+  /**
+   * A tool call the ACP server started: `id` correlates with a later
+   * `tool-end`, `name` is the server-provided display title, `args` is the
+   * serialized `rawInput` (`{}` when the server sent none), `subagent` marks a
+   * call made inside a subagent, and `toolKind` is the ACP tool kind
+   * (read/edit/execute/…) — `''` when the server omitted it. The host maps
+   * `toolKind` onto a native harness tool name so the call renders with the
+   * matching row family instead of the generic one.
+   */
+  | { kind: 'tool'; id: string; name: string; args: string; subagent: boolean; toolKind: string }
+  /** A tool call reached a terminal status (`completed`/`failed`). */
+  | { kind: 'tool-end'; id: string; status: 'completed' | 'failed'; output: string }
+  /** Agent-side event the caller chose to surface (see `AcpSubagentNotice`). */
+  | { kind: 'notice'; text: string }
   | { kind: 'usage'; used: number }
   | { kind: 'done'; reason: StopReason }
   | { kind: 'error'; error: Error }
 
 /** Decision returned by an interactive ACP permission requester. */
 export type AcpPermissionDecision = 'allow' | 'reject' | 'cancel'
+
+/**
+ * Whether ACP-side subagent activity is surfaced for the calling session.
+ * `notice` notes it in the stream, `silent` consumes it.
+ */
+export type AcpSubagentNotice = 'notice' | 'silent'
 
 /**
  * Auth-method picker state: what the server advertises, what the operator
@@ -181,6 +203,13 @@ interface SessionQueue {
   queue: QueuedUpdate[]
   resolve: (() => void) | undefined
   permissionRequester: AcpPermissionRequester | undefined
+  /**
+   * Whether subagent activity is surfaced for this prompt, resolved by the
+   * caller before the prompt started. It rides the queue because
+   * `enqueueUpdate` runs on the transport's own async context: a value read
+   * from the host's session state there would not see the calling agent at all.
+   */
+  subagentNotice: AcpSubagentNotice
   signal: AbortSignal
   /** Set once the `session/prompt` response (or its rejection) has settled. */
   promptSettled?: boolean
@@ -260,6 +289,31 @@ function acpContentText(content: AcpContentBlock): string {
 }
 
 /**
+ * Extract display text from a terminal `tool_call`/`tool_call_update` payload:
+ * text content blocks first, then `rawOutput` as a fallback. Diff entries
+ * contribute their path; terminal entries contribute their id. Returns `''`
+ * when the update carries no readable output.
+ */
+function acpToolOutput(update: SessionNotification['update']): string {
+  if (update.sessionUpdate !== 'tool_call' && update.sessionUpdate !== 'tool_call_update') return ''
+  const parts: string[] = []
+  for (const item of update.content ?? []) {
+    if (item.type === 'content') {
+      if (item.content.type === 'text') parts.push(item.content.text)
+    } else if (item.type === 'diff') {
+      parts.push(item.path)
+    } else if (item.type === 'terminal') {
+      parts.push(`[terminal ${item.terminalId}]`)
+    }
+  }
+  if (parts.length > 0) return parts.join('\n')
+  if (update.rawOutput !== undefined && update.rawOutput !== null) {
+    return typeof update.rawOutput === 'string' ? update.rawOutput : tryStringify(update.rawOutput)
+  }
+  return ''
+}
+
+/**
  * Accept a wire-reported token count only when it is a finite non-negative
  * integer. `usage_update` numbers come from an external process and feed
  * harness projections whose schemas demand exactly that shape, so a fractional
@@ -267,6 +321,62 @@ function acpContentText(content: AcpContentBlock): string {
  */
 function acpTokenCount(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isInteger(value) && value >= 0 ? value : undefined
+}
+
+/**
+ * `_meta` key naming the inference tool behind an ACP tool call. Devin attaches
+ * it to every tool call it publishes, which is what makes subagent detection a
+ * field lookup rather than a guess at the human-readable `title`.
+ */
+const ACP_INFERENCE_TOOL_META = 'cognition.ai/inferenceToolName'
+/** {@link ACP_INFERENCE_TOOL_META} value of the tool that spawns a subagent. */
+const ACP_RUN_SUBAGENT_TOOL = 'run_subagent'
+/** `_meta` key Devin attaches to a subagent's OWN tool calls, naming its parent. */
+const ACP_SUBAGENT_CONTEXT_META = 'cognition.ai/subagent_context'
+
+/** Read a non-empty string field out of an untrusted JSON object. */
+function stringField(value: unknown, key: string): string | undefined {
+  if (typeof value !== 'object' || value === null) return undefined
+  const field = Reflect.get(value, key)
+  return typeof field === 'string' && field.length > 0 ? field : undefined
+}
+
+/**
+ * The subagent a `tool_call` spawns, or `undefined` for an ordinary tool.
+ *
+ * Observed from a real Devin session:
+ * `{ title: 'Ran explore subagent …', kind: undefined,
+ *    rawInput: { title, task, profile: 'subagent_explore' },
+ *    _meta: { 'cognition.ai/inferenceToolName': 'run_subagent' } }`
+ * so identity comes from `_meta`, while the profile and a short label come from
+ * `rawInput`. `kind` is unset for this tool, so it cannot be used to classify.
+ */
+function acpSubagentSpawn(
+  update: SessionNotification['update'],
+): { profile: string; label: string } | undefined {
+  if (update.sessionUpdate !== 'tool_call') return undefined
+  if (stringField(update._meta, ACP_INFERENCE_TOOL_META) !== ACP_RUN_SUBAGENT_TOOL) return undefined
+  const input = update.rawInput
+  const label = stringField(input, 'title') ?? update.title
+  return { profile: stringField(input, 'profile') ?? '', label }
+}
+
+/**
+ * Id of the subagent a tool call was executed by, when it was executed by one.
+ * A subagent's own calls carry `_meta['cognition.ai/subagent_context']` naming
+ * their parent, which is how calls made *inside* a subagent are told apart from
+ * the main agent's.
+ */
+function acpSubagentParent(update: SessionNotification['update']): string | undefined {
+  if (update.sessionUpdate !== 'tool_call' && update.sessionUpdate !== 'tool_call_update') return undefined
+  return stringField(update._meta?.[ACP_SUBAGENT_CONTEXT_META], 'parentAgentId')
+}
+
+/** Render one subagent spawn as a single stream note. */
+function subagentSpawnNote(spawn: { profile: string; label: string }): string {
+  return spawn.profile.length > 0
+    ? `[subagent: ${spawn.profile} — ${spawn.label}]`
+    : `[subagent: ${spawn.label}]`
 }
 
 /** Truncate a string to a display-friendly length for permission prompts. */
@@ -356,7 +466,7 @@ export interface AcpConnectionSpec {
   disposeGraceMs: number
   /** Bound (ms) on the `initialize` handshake plus any keyed `authenticate` round. */
   initTimeoutMs: number
-  /** Bound (ms) on `session/new`, `session/load`, and `session/set_config_option`. */
+  /** Bound (ms) on `session/new`, `session/list`, and `session/set_config_option`. */
   sessionTimeoutMs: number
   /** Bound (ms) on one `authenticate` round, keyed or key-less. */
   authTimeoutMs: number
@@ -398,6 +508,14 @@ export interface AcpConnectionSpec {
    * read per round — see the fingerprint in the owning plugin.
    */
   authMethod?: string
+  /**
+   * Directory receiving a JSONL dump of every protocol trace event, one line
+   * per event, written before the in-memory buffer's collapsing and eviction
+   * (so per-chunk arrival times survive). Unset disables the dump. Intended
+   * for offline protocol debugging; a write failure warns once and turns the
+   * dump off without affecting the connection.
+   */
+  debugTraceDir?: string | undefined
 }
 
 /**
@@ -413,10 +531,12 @@ export class AcpConnection {
   private readonly readyPromise: Promise<void>
   private disposed = false
   private disposal: Promise<void> | undefined
-  /** Capabilities advertised by the agent in its `initialize` response. */
-  private agentCapabilities: AgentCapabilities | undefined
   /** Session lifecycle capabilities advertised by the agent. */
   private sessionCapabilities: SessionCapabilities | undefined
+  /** Whether the agent advertised the `loadSession` capability at initialize. */
+  private loadSessionAdvertised = false
+  /** Sessions with a `session/load` in flight; their replayed history updates are dropped silently. */
+  private readonly loadingSessions = new Set<string>()
   /** Agent name/version published in the `initialize` response (`agentInfo`). */
   private agentInfo: Implementation | undefined
   /** Negotiated ACP protocol version from the `initialize` response. */
@@ -426,7 +546,7 @@ export class AcpConnection {
   /**
    * The connection's single `authenticate` round — the eager keyed attempt
    * during `initialize`, or the lazy key-less attempt started on the first
-   * `session/new`/`session/load` failure. Set at most once; a second round
+   * `session/new` failure. Set at most once; a second round
    * cannot succeed where the first did not.
    */
   private authRound: Promise<void> | undefined
@@ -453,6 +573,14 @@ export class AcpConnection {
    * the condition changes (a different selection, or a different method list).
    */
   private authChoiceWarnedKey: string | undefined
+  /**
+   * Agent ids of subagents seen on this connection, learned from the
+   * `subagent_context` marker on the calls they make. A subagent's own
+   * lifecycle arrives as bare `tool_call_update`s naming that id with no
+   * preceding `tool_call`, so this set is what tells such an update apart from
+   * one for a tool call that was never announced.
+   */
+  private readonly subagentIds = new Set<string>()
   private cachedConfigOptions: readonly SessionConfigOption[] | undefined
   private configOptionsProbe: Promise<readonly SessionConfigOption[] | undefined> | undefined
   /**
@@ -465,6 +593,10 @@ export class AcpConnection {
   private reportedContextWindow: number | undefined
   /** Ring buffer of recent ACP protocol interactions (max {@link MAX_PROTOCOL_TRACE}). */
   private readonly protocolTrace: ProtocolTraceEntry[] = []
+  /** Dump file resolved on the first trace event when {@link AcpConnectionSpec.debugTraceDir} is set. */
+  private debugTraceFile: string | undefined
+  /** Set once the dump is unusable, so a failed directory or write is not retried per event. */
+  private debugTraceOff = false
 
   constructor(spec: AcpConnectionSpec) {
     this.spec = spec
@@ -532,8 +664,8 @@ export class AcpConnection {
         `ACP server "${this.spec.command}" failed to initialize: ${error instanceof Error ? error.message : String(error)}`,
       )
     }
-    this.agentCapabilities = initResult.agentCapabilities
     this.sessionCapabilities = initResult.agentCapabilities?.sessionCapabilities
+    this.loadSessionAdvertised = initResult.agentCapabilities?.loadSession != null
     this.agentInfo = initResult.agentInfo ?? undefined
     this.protocolVersion = initResult.protocolVersion
     this.authMethods = initResult.authMethods ?? undefined
@@ -547,11 +679,6 @@ export class AcpConnection {
     }
   }
 
-  /** Whether the agent advertises `session/load` (session reuse). */
-  get supportsLoadSession(): boolean {
-    return this.agentCapabilities?.loadSession === true
-  }
-
   /** Whether the agent advertises `session/list` via sessionCapabilities. */
   get supportsListSessions(): boolean {
     return this.sessionCapabilities?.list != null && this.sessionCapabilities.list !== null
@@ -560,6 +687,39 @@ export class AcpConnection {
   /** Whether the agent advertises `session/delete` via sessionCapabilities. */
   get supportsDeleteSession(): boolean {
     return this.sessionCapabilities?.delete != null && this.sessionCapabilities.delete !== null
+  }
+
+  /** Whether the agent advertises the `loadSession` capability. */
+  get canLoadSession(): boolean {
+    return this.loadSessionAdvertised
+  }
+
+  /**
+   * Attach this connection to a session created by an earlier connection
+   * (typically a previous harness run whose child process is gone). The agent
+   * restores its conversation history and replays it as `session/update`
+   * notifications; while the load is in flight those replays are dropped
+   * silently — the adapter's own history is authoritative and the next prompt
+   * sends only the delta. Returns `false` when the agent does not advertise
+   * `loadSession` or the load fails (unknown/deleted session), so the caller
+   * falls back to a fresh session.
+   * @param sessionId - the remote session id to reattach to.
+   */
+  async loadSession(sessionId: string): Promise<boolean> {
+    if (!this.loadSessionAdvertised) return false
+    this.loadingSessions.add(sessionId)
+    try {
+      await withTimeout(
+        this.conn.loadSession({ sessionId, cwd: this.spec.cwd, mcpServers: [] }),
+        this.spec.sessionTimeoutMs,
+        'session/load',
+      )
+      return true
+    } catch {
+      return false
+    } finally {
+      this.loadingSessions.delete(sessionId)
+    }
   }
 
   /**
@@ -652,10 +812,44 @@ export class AcpConnection {
     return [...this.protocolTrace]
   }
 
+  /**
+   * Append one event to the debug dump ({@link AcpConnectionSpec.debugTraceDir}),
+   * opening the file on first use so an idle connection creates nothing. The
+   * line carries the untruncated detail because the dump exists to be read
+   * offline, where the in-memory buffer's caps only get in the way. Writes are
+   * synchronous so a line is on disk even if the process dies mid-stream — a
+   * cost accepted only because the dump is opt-in. A failed open or write
+   * disables the dump after one warning.
+   */
+  private writeDebugTrace(entry: ProtocolTraceEntry): void {
+    const dir = this.spec.debugTraceDir
+    if (dir === undefined || this.debugTraceOff) return
+    try {
+      if (this.debugTraceFile === undefined) {
+        mkdirSync(dir, { recursive: true })
+        const name = basename(this.spec.command).replace(/[^\w.-]+/g, '_')
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+        this.debugTraceFile = join(dir, `acp-${name}-${stamp}-${process.pid}.jsonl`)
+        this.spec.onWarn?.(`llm-acp: protocol dump for "${this.spec.command}" -> ${this.debugTraceFile}`)
+      }
+      appendFileSync(this.debugTraceFile, `${JSON.stringify(entry)}\n`)
+    } catch (error: unknown) {
+      this.debugTraceOff = true
+      this.spec.onWarn?.(`llm-acp: protocol dump to "${dir}" disabled: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+
   /** Append one trace entry, evicting the oldest when the buffer is full.
    * Consecutive entries sharing `collapseKey` merge into one with a `count`
    * so per-token stream chunks do not flood the buffer. */
   private traceEvent(dir: 'send' | 'recv', method: string, summary: string, collapseKey?: string, detail?: unknown): void {
+    if (this.spec.debugTraceDir !== undefined) {
+      this.writeDebugTrace({
+        time: Date.now(), dir, method, summary,
+        ...collapseKey === undefined ? {} : { collapseKey },
+        ...detail === undefined ? {} : { detail: tryStringify(detail) },
+      })
+    }
     const last = this.protocolTrace[this.protocolTrace.length - 1]
     if (collapseKey !== undefined && last !== undefined
       && last.dir === dir && last.method === method && last.collapseKey === collapseKey) {
@@ -713,7 +907,7 @@ export class AcpConnection {
 
   /**
    * The connection's single key-less `authenticate` round, started lazily by
-   * {@link withAuthRetry} when `session/new`/`session/load` fails on a server
+   * {@link withAuthRetry} when `session/new` fails on a server
    * that advertised auth methods. Servers with cached credentials (e.g.
    * codebuddy) resolve the call immediately — and only then accept
    * `session/new`. The round is bounded and best-effort: on timeout or error
@@ -921,7 +1115,12 @@ export class AcpConnection {
         || update.sessionUpdate === 'plan'
       this.traceEvent('recv', 'session/update-dropped', `${update.sessionUpdate} sessionId=${params.sessionId}`,
         contentDrop ? `drop:${update.sessionUpdate}:${params.sessionId}` : `drop:${update.sessionUpdate}`, params)
-      this.spec.onWarn?.(`llm-acp: dropped session/update ${update.sessionUpdate} for unqueued session ${params.sessionId}`)
+      // A session/load replay floods this path by design (the agent streams
+      // the whole history back); the adapter's history is authoritative, so
+      // replays drop without the per-update warning noise.
+      if (!this.loadingSessions.has(params.sessionId)) {
+        this.spec.onWarn?.(`llm-acp: dropped session/update ${update.sessionUpdate} for unqueued session ${params.sessionId}`)
+      }
       return
     }
     const isChunk = update.sessionUpdate === 'agent_thought_chunk' || update.sessionUpdate === 'agent_message_chunk'
@@ -935,13 +1134,51 @@ export class AcpConnection {
     } else if (update.sessionUpdate === 'agent_thought_chunk') {
       entry.queue.push({ kind: 'reasoning', text: acpContentText(update.content) })
     } else if (update.sessionUpdate === 'tool_call') {
-      // Tool calls are consumed but not surfaced as text; the ACP server
-      // executes its own tools internally. Surface a progress note so the
-      // user sees activity rather than a silent hang.
-      const title = update.title ?? 'tool'
-      entry.queue.push({ kind: 'progress', text: `[tool: ${title}]` })
+      // Tool calls are forwarded as structured updates; the ACP server
+      // executes its own tools internally, so they are never emitted as
+      // `tool-call` stream blocks (the agent loop would execute them again).
+      const spawn = acpSubagentSpawn(update)
+      const parent = acpSubagentParent(update)
+      if (parent !== undefined) this.subagentIds.add(parent)
+      if (spawn !== undefined) {
+        // A subagent is its own billed session with its own context window, so
+        // whether this is worth interrupting the user for is the host's call —
+        // not something `emitProgress` (a generic tool-activity switch) should
+        // decide. `notice` is therefore its own channel.
+        if (entry.subagentNotice === 'notice') {
+          entry.queue.push({ kind: 'notice', text: subagentSpawnNote(spawn) })
+        }
+      } else {
+        entry.queue.push({
+          kind: 'tool',
+          id: update.toolCallId,
+          name: update.title ?? 'tool',
+          args: update.rawInput === undefined || update.rawInput === null ? '{}' : tryStringify(update.rawInput),
+          subagent: parent !== undefined,
+          toolKind: typeof update.kind === 'string' ? update.kind : '',
+        })
+        // A server may publish a call already finished; pair the end now so
+        // consumers never see a call that stays open.
+        if (update.status === 'completed' || update.status === 'failed') {
+          entry.queue.push({ kind: 'tool-end', id: update.toolCallId, status: update.status, output: acpToolOutput(update) })
+        }
+      }
     } else if (update.sessionUpdate === 'tool_call_update') {
-      // Intermediate tool-call updates are consumed silently.
+      // A subagent's lifecycle arrives as an update for an id that never had a
+      // `tool_call`, and reporting its end is the whole point of following the
+      // spawn above.
+      const owner = acpSubagentParent(update) ?? update.toolCallId
+      if (update.status === 'completed' && this.subagentIds.has(owner) && entry.subagentNotice === 'notice') {
+        this.subagentIds.delete(owner)
+        entry.queue.push({ kind: 'notice', text: `[subagent: ${owner} finished]` })
+      }
+      // Terminal statuses close a previously announced call. Updates for ids
+      // that were never announced (the subagent lifecycle above, or chatter)
+      // are forwarded anyway — the consumer owns the open-call set and drops
+      // what it never opened.
+      if (update.status === 'completed' || update.status === 'failed') {
+        entry.queue.push({ kind: 'tool-end', id: update.toolCallId, status: update.status, output: acpToolOutput(update) })
+      }
     } else if (update.sessionUpdate === 'plan') {
       // Plan updates are consumed but not surfaced.
     } else if (update.sessionUpdate === 'user_message_chunk') {
@@ -1098,20 +1335,6 @@ export class AcpConnection {
     }
     this.traceEvent('recv', 'session/new', `sessionId=${returnedId}`, undefined, session)
     return returnedId
-  }
-
-  /**
-   * Load an existing ACP session by id (`session/load`). Only available when
-   * the agent advertises the `loadSession` capability. Returns the session's
-   * current config options (models, modes, etc.) if the server publishes them.
-   * @param sessionId - the remote session id to resume.
-   * @returns the config options published by the server, or `undefined`.
-   */
-  async loadSession(sessionId: string): Promise<SessionConfigOption[] | undefined> {
-    const session = await this.withAuthRetry('session/load', () =>
-      this.conn.loadSession({ sessionId, cwd: this.spec.cwd, mcpServers: [] }))
-    const configOptions: Array<SessionConfigOption> | null | undefined = Reflect.get(session, 'configOptions')
-    return configOptions ?? undefined
   }
 
   /**
@@ -1305,8 +1528,9 @@ export class AcpConnection {
     prompt: AcpContentBlock[],
     signal: AbortSignal,
     permissionRequester?: AcpPermissionRequester,
+    subagentNotice: AcpSubagentNotice = 'notice',
   ): AsyncGenerator<QueuedUpdate> {
-    const entry: SessionQueue = { queue: [], resolve: undefined, permissionRequester, signal }
+    const entry: SessionQueue = { queue: [], resolve: undefined, permissionRequester, subagentNotice, signal }
     this.queues.set(sessionId, entry)
     // On abort the server gets `session/cancel`; a non-cooperative server may
     // never answer it, so after CANCEL_SETTLE_GRACE_MS the pending drain is

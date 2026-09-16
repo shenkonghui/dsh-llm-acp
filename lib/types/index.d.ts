@@ -13,7 +13,7 @@ import type { Context } from '@deepseek-ai/cordis';
 import z from '@deepseek-ai/schemastery';
 import registryData from './registry.json';
 export { AcpAdapter } from './adapter.ts';
-export type { AcpAdapterOptions } from './adapter.ts';
+export type { AcpAdapterOptions, AcpToolCallRecorder } from './adapter.ts';
 export { AcpConnection, DEFAULT_AUTH_TIMEOUT_MS, DEFAULT_DISPOSE_EOF_GRACE_MS, DEFAULT_DISPOSE_GRACE_MS, DEFAULT_INIT_TIMEOUT_MS, DEFAULT_INTERACTIVE_AUTH_TIMEOUT_MS, DEFAULT_SESSION_TIMEOUT_MS, } from './connection.ts';
 export type { AcpConnectionSpec, ProtocolTraceEntry } from './connection.ts';
 export type * from './types.ts';
@@ -70,15 +70,52 @@ export interface AcpServerConfig {
      * rebuilds the server's connection, which is what actually applies it.
      */
     authMethod?: string;
+    /**
+     * Map a dsh permission preset name (or sandbox mode value) to whether this
+     * server's **subagent activity** is surfaced in the conversation, e.g.
+     * `{ "danger-full-access": "silent" }`. `notice` (the default) notes a
+     * subagent spawn and finish in the stream; `silent` consumes them. Read per
+     * update, so changing it applies immediately and — unlike `modeMap` — never
+     * rebuilds the connection.
+     *
+     * The rationale for mapping this at all: an ACP server runs its subagents
+     * inside its own process, where the harness has no approval hook and cannot
+     * intervene. A subagent is billed as its own session with its own context
+     * window, so the one thing worth doing is telling a supervised session that
+     * a fan-out happened, while leaving an already fully delegated one quiet.
+     */
+    subagentMap?: Record<string, string>;
 }
 /** Plugin config: defaults applied to every spawned ACP server. */
 export interface Config {
     /** Extra environment variables merged on top of the scrubbed parent env. */
     env?: Record<string, string>;
+    /**
+     * Whether to include the DSH harness system-prompt additions in the first
+     * prompt of each ACP session: the `system` slot plus the harness preamble
+     * user message. Default `false` — ACP agents assemble their own system
+     * prompt, so the harness copy is duplicate context that persists in the
+     * agent's history and is resent on every turn.
+     */
+    includeHarnessPrompt?: boolean;
+    /**
+     * Whether to include the DSH runtime-context snapshots and the skills
+     * `<system-reminder>` catalog in the prompt (default `false`). These are
+     * DSH-specific concepts an external ACP agent cannot act on.
+     */
+    includeRuntimeContext?: boolean;
     /** Whether to translate `agent_thought_chunk` into `reasoning-delta` chunks (default `true`). */
     emitReasoning?: boolean;
     /** Whether to surface extension progress notifications as reasoning blocks (default `false`). */
     emitProgress?: boolean;
+    /**
+     * Whether to surface which tool the ACP server ran as `[tool: …]` reasoning
+     * notes (default `true`). Distinct from {@link emitProgress}: that one
+     * carries extension log chatter (MCP server connection lines and the like),
+     * while this is the structured answer to "what is it doing". Subagent
+     * activity has its own switch, `servers.<id>.subagentMap`.
+     */
+    emitToolCalls?: boolean;
     /** Fallback model id/name when ACP model discovery returns nothing. */
     defaultModelId?: string;
     defaultModelName?: string;
@@ -93,7 +130,7 @@ export interface Config {
      */
     initTimeoutMs?: number;
     /**
-     * Bound (ms) on `session/new`, `session/load`, `session/list`, and
+     * Bound (ms) on `session/new`, `session/list`, and
      * `session/set_config_option`; must not exceed `MAX_TIMER_DELAY_MS`.
      */
     sessionTimeoutMs?: number;

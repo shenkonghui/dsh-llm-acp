@@ -14,13 +14,14 @@ import { describe, expect, it } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import Loader from '@deepseek-ai/cordis-plugin-loader'
 import { fileURLToPath } from 'node:url'
-import { existsSync, mkdtempSync, readFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readdirSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import AgentRuntime, { type Agent } from '@deepseek-ai/dsh-agent'
 import { BlockAssembler, createUserMessage, type StreamChunk } from '@deepseek-ai/dsh-llm'
 import LlmRuntime from '@deepseek-ai/dsh-llm'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
+import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import ApprovalService, { type ApprovalOutcome } from '@deepseek-ai/dsh-user-approval'
 import * as acp from '../src/index.ts'
 import LocalSubprocessRuntime from '@deepseek-ai/dsh-subprocess-local'
@@ -47,6 +48,7 @@ async function setup(mockEnv: SetupEnv = {}, opts: {
   permissionPreset?: PresetName | (() => PresetName)
   sandboxMode?: string
   modeMap?: Record<string, string>
+  subagentMap?: Record<string, string>
   authMethod?: string
   /** Collects host warnings, for asserting on diagnostics. */
   warnSink?: string[]
@@ -112,6 +114,7 @@ async function setup(mockEnv: SetupEnv = {}, opts: {
         args: server.args,
         name: 'Test ACP',
         modeMap: opts.modeMap ?? {},
+        subagentMap: opts.subagentMap ?? {},
         authMethod: opts.authMethod ?? '',
       },
     },
@@ -169,6 +172,16 @@ function assembledText(chunks: StreamChunk[]): string {
     .join('')
 }
 
+/** Assemble the reasoning text from a stream's chunks (notices and thoughts). */
+function reasoningText(chunks: StreamChunk[]): string {
+  const assembler = new BlockAssembler()
+  for (const chunk of chunks) assembler.push(chunk)
+  return assembler.blocks()
+    .filter(b => b.type === 'reasoning')
+    .map(b => (b as { type: 'reasoning'; text: string }).text)
+    .join('')
+}
+
 /** Find the terminal finish chunk. */
 function finishChunk(chunks: StreamChunk[]): Extract<StreamChunk, { type: 'finish' }> {
   const finish = chunks.find(c => c.type === 'finish')
@@ -178,10 +191,10 @@ function finishChunk(chunks: StreamChunk[]): Extract<StreamChunk, { type: 'finis
 
 /** Minimal initiating agent with an open turn for the approval service audit pair. */
 function fakeAgent(extraEvents: Array<{ type: string; data?: Record<string, unknown> }> = []): Agent {
-  const events: Array<{ type: string; data?: Record<string, unknown> }> = [
-    { type: 'turn/start' },
-    { type: 'user/message' },
-    ...extraEvents,
+  const events: Array<Record<string, unknown>> = [
+    { type: 'turn/start', seq: 0 },
+    { type: 'user/message', seq: 1 },
+    ...extraEvents.map((event, i) => ({ ...event, seq: 2 + i })),
   ]
   return {
     session: {
@@ -190,8 +203,9 @@ function fakeAgent(extraEvents: Array<{ type: string; data?: Record<string, unkn
       // an open turn; a bare `events` array is not enough for that check.
       get seq() { return events.length },
       eventAt: (seq: number) => events[seq],
-      append: (type: string, data: Record<string, unknown>) => {
-        const event = { type, data }
+      snapshotEvents: () => [...events],
+      append: (type: string, data: Record<string, unknown>, opts?: Record<string, unknown>) => {
+        const event = { type, data, seq: events.length, ...opts }
         events.push(event)
         return event as unknown as SessionEvent
       },
@@ -993,6 +1007,226 @@ describe('dsh-llm-acp', () => {
     }
   })
 
+  it('notes a subagent spawn and finish by default, independently of the progress switch', async () => {
+    // Detection keys on `_meta['cognition.ai/inferenceToolName']`, not on the
+    // human-readable title.
+    const ctx = await setup(
+      { MOCK_TEXT: 'answer', MOCK_SUBAGENT: '1' },
+      { server: { command: process.execPath, args: [authMockServer] } },
+    )
+    try {
+      const chunks = await collect(ctx.llm.stream({
+        provider: 'acp-test',
+        model: 'any',
+        messages: [createUserMessage({ content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } })],
+      }))
+      const notes = reasoningText(chunks)
+      expect(notes).toContain('[subagent: subagent_explore — Read two files and report contents]')
+      // The subagent's own lifecycle is an id that never had a `tool_call`.
+      expect(notes).toContain('[subagent: 08102184 finished]')
+      // Identity comes from `_meta`, so a tool call that merely mentions a
+      // subagent in its title is not one: it must come through as an ordinary
+      // tool, never as a spawn.
+      expect(notes).toContain('[tool: Read file subagent_notes.md]')
+      expect(notes).not.toContain('[subagent: Read file subagent_notes.md]')
+      // `emitProgress` is off and does not matter here: it carries extension
+      // log chatter, while tool activity has its own default-on switch.
+      expect(notes).toContain('[tool: Listed ./]')
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('hides tool activity on request without hiding subagent notices', async () => {
+    // The two switches are independent: turning tool chatter off must not take
+    // the subagent events with it, since those are gated by the permission map.
+    const ctx = await setup(
+      { MOCK_TEXT: 'answer', MOCK_SUBAGENT: '1' },
+      { server: { command: process.execPath, args: [authMockServer] }, config: { emitToolCalls: false } },
+    )
+    try {
+      const chunks = await collect(ctx.llm.stream({
+        provider: 'acp-test',
+        model: 'any',
+        messages: [createUserMessage({ content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } })],
+      }))
+      const notes = reasoningText(chunks)
+      expect(notes).not.toContain('[tool:')
+      expect(notes).not.toContain('[subagent tool:')
+      expect(notes).toContain('[subagent: subagent_explore — Read two files and report contents]')
+      expect(notes).toContain('[subagent: 08102184 finished]')
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('stays silent for a permission state the map marks silent', async () => {
+    const ctx = await setup(
+      { MOCK_TEXT: 'answer', MOCK_SUBAGENT: '1' },
+      {
+        server: { command: process.execPath, args: [authMockServer] },
+        permissionPreset: 'danger-full-access',
+        subagentMap: { 'danger-full-access': 'silent' },
+      },
+    )
+    try {
+      // The mapping is keyed by the CALLING session's permission state, so the
+      // stream has to run under an initiator for it to resolve at all.
+      const chunks = await ctx.agents.withInitiator(fakeAgent(), () => collect(ctx.llm.stream({
+        provider: 'acp-test',
+        model: 'any',
+        messages: [createUserMessage({ content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } })],
+      })))
+      expect(reasoningText(chunks)).not.toContain('[subagent:')
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('notes subagents for a supervised permission state in the same map', async () => {
+    // Same map, different key: a supervised session hears about a fan-out
+    // while a fully delegated one stays quiet.
+    const ctx = await setup(
+      { MOCK_TEXT: 'answer', MOCK_SUBAGENT: '1' },
+      {
+        server: { command: process.execPath, args: [authMockServer] },
+        permissionPreset: 'workspace-write',
+        subagentMap: { 'workspace-write': 'notice', 'danger-full-access': 'silent' },
+      },
+    )
+    try {
+      const chunks = await ctx.agents.withInitiator(fakeAgent(), () => collect(ctx.llm.stream({
+        provider: 'acp-test',
+        model: 'any',
+        messages: [createUserMessage({ content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } })],
+      })))
+      const notes = reasoningText(chunks)
+      expect(notes).toContain('[subagent: subagent_explore — Read two files and report contents]')
+      expect(notes).toContain('[subagent: 08102184 finished]')
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('labels the calls a subagent makes so they are not read as the main agent\'s', async () => {
+    const ctx = await setup(
+      { MOCK_TEXT: 'answer', MOCK_SUBAGENT: '1' },
+      { server: { command: process.execPath, args: [authMockServer] } },
+    )
+    try {
+      const chunks = await collect(ctx.llm.stream({
+        provider: 'acp-test',
+        model: 'any',
+        messages: [createUserMessage({ content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } })],
+      }))
+      const notes = reasoningText(chunks)
+      expect(notes).toContain('[subagent tool: Read file]')
+      // The same tool name outside a subagent keeps its plain label.
+      expect(notes).toContain('[tool: Listed ./]')
+      expect(notes).not.toContain('[tool: Read file]')
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('records ACP tool calls as session tool/call + tool/result events instead of reasoning', async () => {
+    const ctx = await setup(
+      { MOCK_TEXT: 'answer', MOCK_TOOLS: '1' },
+      { server: { command: process.execPath, args: [authMockServer] } },
+    )
+    try {
+      const agent = fakeAgent([{ type: 'step/start', data: { turn: 1, step: 1 } }])
+      const chunks = await ctx.agents.withInitiator(agent, () => collect(ctx.llm.stream({
+        provider: 'acp-test',
+        model: 'any',
+        messages: [createUserMessage({ content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } })],
+      })))
+      // Recorded calls leave the reasoning surface entirely…
+      expect(reasoningText(chunks)).not.toContain('[tool:')
+      // …and never become executable stream blocks, which the agent loop would
+      // dispatch to the harness's own registry a second time.
+      expect(chunks.some(c => c.type === 'tool-call-delta')).toBe(false)
+
+      const events = (agent.session as unknown as { events: Array<Record<string, unknown>> }).events
+      const calls = events.filter(e => e.type === 'tool/call')
+      const results = events.filter(e => e.type === 'tool/result')
+      // Names are the native row-family names the host maps each ACP tool
+      // kind onto; a call with no kind keeps the server-provided title.
+      expect(calls.map(c => (c.data as { name: string }).name)).toEqual(['read', 'bash', 'bash', 'Bare probe'])
+      for (const call of calls) {
+        expect(call.data).toMatchObject({ turn: 1, step: 1 })
+      }
+      expect((calls[0]!.data as { arguments: string }).arguments).toBe(JSON.stringify({ file_path: '/tmp/a.txt' }))
+      // A call with no rawInput records `{}`, not the empty string whose
+      // rendering falls back to the opaque callId.
+      expect((calls[3]!.data as { arguments: string }).arguments).toBe('{}')
+      // Every started call gets a result: the completed ones from their
+      // terminal updates, the failed one with an error identity, and the
+      // pending one flushed as a non-error empty result when the prompt ended.
+      expect(results).toHaveLength(4)
+      for (const result of results) {
+        const callId = (result.data as { message: { source: { callId: string } } }).message.source.callId
+        const callSeq = calls.find(c => (c.data as { callId: string }).callId === callId)!.seq
+        expect(result.sourceEventSeqs).toEqual([callSeq])
+        expect(result.surfaceOp).toBe('append')
+      }
+      const resultBlock = (id: string) => {
+        const result = results.find(r => (r.data as { message: { source: { callId: string } } }).message.source.callId === id)!
+        return result.data as {
+          message: { content: Array<{ isError: boolean; content: Array<{ text: string }> }> }
+          error?: { name: string; code: string }
+        }
+      }
+      const ok = resultBlock('tool-ok')
+      expect(ok.message.content[0]!.isError).toBe(false)
+      expect(ok.message.content[0]!.content).toEqual([{ type: 'text', text: 'file body' }])
+      expect(ok.error).toBeUndefined()
+      const fail = resultBlock('tool-fail')
+      expect(fail.message.content[0]!.isError).toBe(true)
+      expect(fail.message.content[0]!.content).toEqual([{ type: 'text', text: 'exit 1' }])
+      expect(fail.error).toEqual({ name: 'AcpToolError', code: 'ACP_TOOL_FAILED' })
+      const pending = resultBlock('tool-pending')
+      expect(pending.message.content[0]!.isError).toBe(false)
+      expect(pending.message.content[0]!.content).toEqual([])
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('records subagent-owned calls as tool events while the lifecycle stays a notice', async () => {
+    const ctx = await setup(
+      { MOCK_TEXT: 'answer', MOCK_SUBAGENT: '1' },
+      { server: { command: process.execPath, args: [authMockServer] } },
+    )
+    try {
+      const agent = fakeAgent([{ type: 'step/start', data: { turn: 1, step: 1 } }])
+      const chunks = await ctx.agents.withInitiator(agent, () => collect(ctx.llm.stream({
+        provider: 'acp-test',
+        model: 'any',
+        messages: [createUserMessage({ content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } })],
+      })))
+      const notes = reasoningText(chunks)
+      // Spawn/finish stay notices; the calls themselves become session events.
+      expect(notes).toContain('[subagent: subagent_explore — Read two files and report contents]')
+      expect(notes).toContain('[subagent: 08102184 finished]')
+      expect(notes).not.toContain('[tool:')
+      const events = (agent.session as unknown as { events: Array<Record<string, unknown>> }).events
+      const callIds = events.filter(e => e.type === 'tool/call').map(e => (e.data as { callId: string }).callId)
+      expect(callIds).toEqual([
+        'exec_0#2d03bd93760b45c5b48c85be71397a29',
+        'read_9#decoy0000000000000000000000000000',
+        'read_0#60294f38aa7448fe9392bd3b7e31d035',
+      ])
+      // Neither the spawn call nor the subagent's own lifecycle id is a tool
+      // event: one is a notice, the other an update for an id never announced.
+      const resultIds = events.filter(e => e.type === 'tool/result')
+        .map(e => (e.data as { message: { source: { callId: string } } }).message.source.callId)
+      expect(resultIds).toEqual(callIds)
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
   it('fails the stream when initialize never answers within initTimeoutMs', async () => {
     const ctx = await setup(
       { MOCK_SILENT_INIT: '1' },
@@ -1008,6 +1242,76 @@ describe('dsh-llm-acp', () => {
       expect(reason.kind).toBe('error')
       if (reason.kind === 'error') expect(reason.failure.code).toBe('ACP_INIT_FAILED')
     } finally {
+      await ctx.fiber.dispose()
+    }
+  }, 30_000)
+
+  it('dumps every protocol event to DSH_LLM_ACP_DEBUG_DIR as JSONL', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'llm-acp-dump-'))
+    process.env.DSH_LLM_ACP_DEBUG_DIR = dir
+    const ctx = await setup({ MOCK_TEXT: 'dumped' })
+    try {
+      const chunks = await collect(ctx.llm.stream({
+        provider: 'acp-test',
+        model: 'any',
+        messages: [createUserMessage({ content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } })],
+      }))
+      expect(assembledText(chunks)).toBe('dumped')
+
+      const files = readdirSync(dir).filter(name => name.endsWith('.jsonl'))
+      expect(files).toHaveLength(1)
+      const lines = readFileSync(join(dir, files[0] as string), 'utf8').trim().split('\n')
+        .map(line => JSON.parse(line) as { time: number; dir: string; method: string; summary: string; detail?: string })
+      expect(lines.some(line => line.dir === 'send' && line.method === 'initialize')).toBe(true)
+      expect(lines.some(line => line.dir === 'send' && line.method === 'session/prompt')).toBe(true)
+      expect(lines.some(line => line.dir === 'recv' && line.method === 'session/update' && line.detail !== undefined)).toBe(true)
+      // One line per event with its own arrival time: the in-memory buffer
+      // collapses consecutive same-key events, the dump must not.
+      const times = lines.map(line => line.time)
+      expect([...times].sort((a, b) => a - b)).toEqual(times)
+      const trace = JSON.parse((await ctx.llm.discoverModels('llm-acp', { provider: 'acp-trace-test' }))[0]?.name ?? '[]') as
+        Array<{ dir: string; method: string; count?: number }>
+      const buffered = trace
+        .filter(entry => entry.dir === 'recv' && entry.method === 'session/update')
+        .reduce((sum, entry) => sum + (entry.count ?? 1), 0)
+      const dumped = lines.filter(line => line.dir === 'recv' && line.method === 'session/update').length
+      expect(dumped).toBe(buffered)
+    } finally {
+      delete process.env.DSH_LLM_ACP_DEBUG_DIR
+      await ctx.fiber.dispose()
+    }
+  }, 30_000)
+
+  it('resumes a reused session with only the new user message', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'llm-acp-reuse-'))
+    process.env.DSH_LLM_ACP_DEBUG_DIR = dir
+    const ctx = await setup(
+      { MOCK_TEXT: 'resumed' },
+      { server: { command: process.execPath, args: [authMockServer] } },
+    )
+    const sessionId = 'dsh-reuse' as SessionId
+    try {
+      const first = createUserMessage({ content: [{ type: 'text', text: 'first question' }], source: { kind: 'user' } })
+      await collect(ctx.llm.stream({ provider: 'acp-test', model: 'any', sessionId, messages: [first] }))
+      const second = createUserMessage({ content: [{ type: 'text', text: 'second question' }], source: { kind: 'user' } })
+      const chunks = await collect(ctx.llm.stream({ provider: 'acp-test', model: 'any', sessionId, messages: [first, second] }))
+      expect(assembledText(chunks)).toBe('resumed')
+
+      // The dump records the round trips, which the ring buffer cannot show.
+      // The second turn resumed the first turn's ACP session — no `session/load`
+      // (the session is live on this connection) and no `session/new`: the
+      // resumed prompt carries only the new message, since the server already
+      // holds the history.
+      const lines = readFileSync(join(dir, readdirSync(dir).find(name => name.endsWith('.jsonl')) as string), 'utf8')
+        .trim().split('\n').map(line => JSON.parse(line) as { dir: string; method: string; detail?: string })
+      expect(lines.some(line => line.dir === 'send' && line.method === 'session/load')).toBe(false)
+      const prompts = lines.filter(line => line.dir === 'send' && line.method === 'session/prompt')
+      expect(prompts).toHaveLength(2)
+      expect(prompts[0]?.detail).toContain('first question')
+      expect(prompts[1]?.detail).toContain('second question')
+      expect(prompts[1]?.detail).not.toContain('first question')
+    } finally {
+      delete process.env.DSH_LLM_ACP_DEBUG_DIR
       await ctx.fiber.dispose()
     }
   }, 30_000)

@@ -10,7 +10,7 @@
  * @module @deepseek-ai/dsh-llm-acp
  */
 
-import { isAbsolute, resolve } from 'node:path'
+import { isAbsolute, join, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { accessSync, constants, statSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
@@ -20,9 +20,11 @@ import type {} from '@deepseek-ai/dsh-agent'
 import type { ApprovalRequestId } from '@deepseek-ai/dsh-user-approval'
 import { MAX_TIMER_DELAY_MS } from '@deepseek-ai/dsh-timeout'
 import type {} from '@deepseek-ai/dsh-settings'
+import { createToolResultMessage, ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { AdapterRegistrationHandle, DirectoryRegistrationHandle, LlmConfigurableProvider, LlmDiscoveredModel, LlmModelDiscoveryRequest } from '@deepseek-ai/dsh-llm'
-import type { Session } from '@deepseek-ai/dsh-session'
+import type { Session, SessionSeq } from '@deepseek-ai/dsh-session'
 import { AcpAdapter } from './adapter.ts'
+import type { AcpToolCallRecorder } from './adapter.ts'
 import {
   AcpConnection,
   DEFAULT_AUTH_TIMEOUT_MS,
@@ -35,7 +37,7 @@ import {
 import registryData from './registry.json' with { type: 'json' }
 
 export { AcpAdapter } from './adapter.ts'
-export type { AcpAdapterOptions } from './adapter.ts'
+export type { AcpAdapterOptions, AcpToolCallRecorder } from './adapter.ts'
 export {
   AcpConnection,
   DEFAULT_AUTH_TIMEOUT_MS,
@@ -117,16 +119,53 @@ export interface AcpServerConfig {
    * rebuilds the server's connection, which is what actually applies it.
    */
   authMethod?: string
+  /**
+   * Map a dsh permission preset name (or sandbox mode value) to whether this
+   * server's **subagent activity** is surfaced in the conversation, e.g.
+   * `{ "danger-full-access": "silent" }`. `notice` (the default) notes a
+   * subagent spawn and finish in the stream; `silent` consumes them. Read per
+   * update, so changing it applies immediately and — unlike `modeMap` — never
+   * rebuilds the connection.
+   *
+   * The rationale for mapping this at all: an ACP server runs its subagents
+   * inside its own process, where the harness has no approval hook and cannot
+   * intervene. A subagent is billed as its own session with its own context
+   * window, so the one thing worth doing is telling a supervised session that
+   * a fan-out happened, while leaving an already fully delegated one quiet.
+   */
+  subagentMap?: Record<string, string>
 }
 
 /** Plugin config: defaults applied to every spawned ACP server. */
 export interface Config {
   /** Extra environment variables merged on top of the scrubbed parent env. */
   env?: Record<string, string>
+  /**
+   * Whether to include the DSH harness system-prompt additions in the first
+   * prompt of each ACP session: the `system` slot plus the harness preamble
+   * user message. Default `false` — ACP agents assemble their own system
+   * prompt, so the harness copy is duplicate context that persists in the
+   * agent's history and is resent on every turn.
+   */
+  includeHarnessPrompt?: boolean
+  /**
+   * Whether to include the DSH runtime-context snapshots and the skills
+   * `<system-reminder>` catalog in the prompt (default `false`). These are
+   * DSH-specific concepts an external ACP agent cannot act on.
+   */
+  includeRuntimeContext?: boolean
   /** Whether to translate `agent_thought_chunk` into `reasoning-delta` chunks (default `true`). */
   emitReasoning?: boolean
   /** Whether to surface extension progress notifications as reasoning blocks (default `false`). */
   emitProgress?: boolean
+  /**
+   * Whether to surface which tool the ACP server ran as `[tool: …]` reasoning
+   * notes (default `true`). Distinct from {@link emitProgress}: that one
+   * carries extension log chatter (MCP server connection lines and the like),
+   * while this is the structured answer to "what is it doing". Subagent
+   * activity has its own switch, `servers.<id>.subagentMap`.
+   */
+  emitToolCalls?: boolean
   /** Fallback model id/name when ACP model discovery returns nothing. */
   defaultModelId?: string
   defaultModelName?: string
@@ -141,7 +180,7 @@ export interface Config {
    */
   initTimeoutMs?: number
   /**
-   * Bound (ms) on `session/new`, `session/load`, `session/list`, and
+   * Bound (ms) on `session/new`, `session/list`, and
    * `session/set_config_option`; must not exceed `MAX_TIMER_DELAY_MS`.
    */
   sessionTimeoutMs?: number
@@ -171,8 +210,11 @@ export interface Config {
 
 export const Config: z<Config> = z.object({
   env: z.dict(z.string()).default({}),
+  includeHarnessPrompt: z.boolean().default(false),
+  includeRuntimeContext: z.boolean().default(false),
   emitReasoning: z.boolean().default(true),
   emitProgress: z.boolean().default(false),
+  emitToolCalls: z.boolean().default(true),
   defaultModelId: z.string().default('devin'),
   defaultModelName: z.string().default('Devin (ACP)'),
   disposeEofGraceMs: z.number().default(DEFAULT_DISPOSE_EOF_GRACE_MS),
@@ -194,11 +236,14 @@ export const Config: z<Config> = z.object({
     })).default([]),
     modeMap: z.dict(z.string()).default({}),
     authMethod: z.string().default(''),
+    subagentMap: z.dict(z.string()).default({}),
   })).default({}),
 })
 
 /** Settings schema: a map of server ids to their spawn configuration. */
 const SettingsSchema = z.object({
+  includeHarnessPrompt: z.boolean().default(false),
+  includeRuntimeContext: z.boolean().default(false),
   servers: z.dict(z.object({
     command: z.string().required(),
     args: z.array(z.string()).default([]),
@@ -211,6 +256,7 @@ const SettingsSchema = z.object({
     })).default([]),
     modeMap: z.dict(z.string()).default({}),
     authMethod: z.string().default(''),
+    subagentMap: z.dict(z.string()).default({}),
   })).default({}),
 })
 
@@ -351,6 +397,107 @@ function auditAutoAllowedPermission(session: Session, serverName: string, title:
   }
 }
 
+/**
+ * ACP tool kind → native harness tool name, so the call renders with the
+ * matching row family (icon, localized title, openable file path) instead of
+ * the generic one. Kinds without a native equivalent keep the server-provided
+ * title. Targets are names the harness client's `TOOL_VARIANTS` classifies.
+ */
+const ACP_TOOL_KIND_NAMES: Record<string, string> = {
+  read: 'read',
+  edit: 'edit',
+  execute: 'bash',
+  search: 'grep',
+  fetch: 'web_fetch',
+}
+
+/** Native row-family name for a recorded call, per its ACP tool kind. */
+function acpToolName(call: { name: string; toolKind: string }): string {
+  return ACP_TOOL_KIND_NAMES[call.toolKind] ?? call.name
+}
+
+/**
+ * Build the {@link AcpToolCallRecorder} that logs ACP-observed tool calls as
+ * `tool/call` + `tool/result` session events — the same pair `executeToolCalls`
+ * writes for harness-managed tools, which is what the conversation UI renders
+ * as tool cards. The pair is tagged with the step that owns the running
+ * stream: the agent loop appends `step/start` before calling the adapter, so
+ * the latest `step/start` without a matching `step/end` is the open step.
+ * Returns `undefined` outside one (test probes, auxiliary calls), leaving the
+ * adapter's `[tool: …]` reasoning fallback.
+ *
+ * The calls already ran inside the ACP server; these events are the durable
+ * record of that remote execution, not a dispatch request — they are never
+ * emitted as `tool-call` stream blocks, which the agent loop would hand to
+ * the harness's own tool registry and execute a second time.
+ *
+ * @param session - the calling agent's session.
+ * @param onWarn - sink for append failures; a failed append disables the
+ *   recorder for the rest of the stream rather than failing the turn over a
+ *   presentational record.
+ */
+function acpToolCallRecorder(session: Session, onWarn: (message: string) => void): AcpToolCallRecorder | undefined {
+  const events = session.snapshotEvents()
+  let boundary: { turn: number; step: number } | undefined
+  for (let i = events.length - 1; i >= 0; i--) {
+    const event = events[i]!
+    if (event.type === 'step/end') break
+    if (event.type === 'step/start') {
+      boundary = { turn: event.data.turn, step: event.data.step }
+      break
+    }
+  }
+  if (boundary === undefined) return undefined
+  const { turn, step } = boundary
+  /** `tool/call` seq per call id, so its `tool/result` can cite the source event. */
+  const callSeqs = new Map<string, SessionSeq>()
+  let broken = false
+  const guard = (label: string, write: () => void): void => {
+    if (broken) return
+    try {
+      write()
+    } catch (error: unknown) {
+      broken = true
+      callSeqs.clear()
+      onWarn(`llm-acp: failed to record ACP ${label}: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+  return {
+    callStarted(call) {
+      guard('tool/call', () => {
+        const event = session.append('tool/call', {
+          turn,
+          step,
+          callId: ToolCallId(call.id),
+          name: acpToolName(call),
+          arguments: call.args,
+        })
+        callSeqs.set(call.id, event.seq)
+      })
+    },
+    callFinished(result) {
+      guard('tool/result', () => {
+        const callSeq = callSeqs.get(result.id)
+        // Never seen (or the start append failed): a `tool/result` with no
+        // in-step `tool/call` violates the session invariant, so drop it.
+        if (callSeq === undefined) return
+        callSeqs.delete(result.id)
+        const message = createToolResultMessage({
+          callId: ToolCallId(result.id),
+          content: result.output.length > 0 ? [{ type: 'text', text: result.output }] : [],
+          isError: result.isError,
+        })
+        session.append('tool/result', {
+          turn,
+          step,
+          message,
+          ...(result.isError ? { error: { name: 'AcpToolError', code: 'ACP_TOOL_FAILED' } } : {}),
+        }, { surfaceOp: 'append', sourceEventSeqs: [callSeq] })
+      })
+    },
+  }
+}
+
 /** One active ACP server: connection, adapter registration, and provider route. */
 interface ActiveServer {
   connection: AcpConnection
@@ -420,7 +567,11 @@ export function apply(ctx: Context, config: Config): void {
     : assertUsableCwd('config cwd', resolve(config.cwd))
 
   /** Current settings source; updated by `settings.installSection`. */
-  let currentSettings: () => { servers: Record<string, AcpServerConfig> } = () => ({ servers: {} })
+  let currentSettings: () => {
+    servers: Record<string, AcpServerConfig>
+    includeHarnessPrompt?: boolean
+    includeRuntimeContext?: boolean
+  } = () => ({ servers: {} })
   /** Servers from the composition entry (inline config). */
   const configServers = (): Map<string, AcpServerConfig> => {
     const result = new Map<string, AcpServerConfig>()
@@ -445,6 +596,14 @@ export function apply(ctx: Context, config: Config): void {
 
   /** Active connections keyed by server id. */
   const active = new Map<string, ActiveServer>()
+
+  // Protocol debugging switch: `DSH_LLM_ACP_DEBUG_DIR=<dir>` makes every
+  // connection append its ACP traffic to a JSONL file in that directory (see
+  // `AcpConnectionSpec.debugTraceDir`). An environment variable rather than a
+  // config field because this is a debugging aid for the current process, not
+  // a deployment choice.
+  const debugTraceDir = process.env.DSH_LLM_ACP_DEBUG_DIR
+  const protocolDumpDir = debugTraceDir === undefined || debugTraceDir === '' ? undefined : debugTraceDir
 
   /** Best-effort system-browser open for an interactive login URL; failure keeps the URL in the auth warning. */
   function openBrowser(url: string): void {
@@ -492,6 +651,7 @@ export function apply(ctx: Context, config: Config): void {
       onWarn: message => ctx.logger.warn(message),
       onAuthUrl: openBrowser,
       authMethod: server.authMethod ?? '',
+      debugTraceDir: protocolDumpDir,
       // Resolve an API key from the server's configured env. When present,
       // it is passed via _meta.api_key in an eager authenticate round so ACP
       // servers that accept direct key auth skip interactive flows. When
@@ -537,10 +697,54 @@ export function apply(ctx: Context, config: Config): void {
       provider: routeName(serverId),
       emitReasoning: resolved.emitReasoning,
       emitProgress: resolved.emitProgress,
+      emitToolCalls: resolved.emitToolCalls,
+      // Read the include switches per stream — settings first, then the
+      // composition-entry config — so a settings edit applies to the next
+      // prompt without rebuilding the connection. Default off: an ACP agent
+      // assembles its own system prompt, so the harness additions are
+      // duplicate context that persists in the agent's history.
+      includeHarnessPrompt: () =>
+        currentSettings().includeHarnessPrompt ?? resolved.includeHarnessPrompt ?? false,
+      includeRuntimeContext: () =>
+        currentSettings().includeRuntimeContext ?? resolved.includeRuntimeContext ?? false,
+      // Persist the dsh → ACP session map next to the plugin cwd so a turn
+      // after a harness restart reattaches to the agent's own session via
+      // `session/load` instead of re-sending the full history.
+      sessionStorePath: join(cwd, '.dsh-llm-acp', `${serverId}.sessions.json`),
+      // ACP-side tool calls land in the session log as `tool/call`/`tool/result`
+      // pairs (tool cards) when the stream runs inside a session step. Probes
+      // and auxiliary calls get no session here and keep the `[tool: …]`
+      // reasoning fallback.
+      toolCallRecorder: () => {
+        const agent = ctx.get('agents')?.currentInitiator()
+        const session = agent?.session as Session | undefined
+        if (session === undefined) return undefined
+        return acpToolCallRecorder(session, message => ctx.logger.warn(message))
+      },
       defaultModel: { id: resolved.defaultModelId, name: resolved.defaultModelName },
       enabledModels: server.models,
       customModels: server.customModels,
       onWarn: message => ctx.logger.warn(message),
+      // Map the calling session's permission state onto whether ACP-side
+      // subagent activity is surfaced. Read per stream from the live settings
+      // map — never from the `server` object captured here, which a later
+      // reconcile may have replaced — so an edit applies to the next prompt
+      // without rebuilding the connection (a rebuild would drop live sessions
+      // for a purely presentational change).
+      subagentNotice: () => {
+        const map = mergedServers().get(serverId)?.subagentMap
+        if (map === undefined || Object.keys(map).length === 0) return 'notice'
+        const agent = ctx.get('agents')?.currentInitiator()
+        const session = agent?.session as Session | undefined
+        if (session === undefined) return 'notice'
+        const permissionPresets = ctx.get('permissionPresets' as never) as PermissionPresetReader | undefined
+        const sandboxPolicy = ctx.get('sandboxPolicy' as never) as SandboxPolicyReader | undefined
+        const preset = permissionPresets?.current(session)
+        const sandbox = sandboxPolicy?.resolve({ session }).mode
+        const mapped = (preset !== undefined ? map[preset] : undefined)
+          ?? (sandbox !== undefined ? map[sandbox] : undefined)
+        return mapped === 'silent' ? 'silent' : 'notice'
+      },
       // Map the calling dsh session's permission state to this server's ACP
       // session mode (e.g. danger-full-access → bypass). Read per stream so a
       // preset switch applies to the next prompt; preset name is looked up
@@ -930,7 +1134,11 @@ export function apply(ctx: Context, config: Config): void {
   (ctx.settings as unknown as { installSection: InstallSectionFn }).installSection(
     ctx, NS, SettingsSchema, { servers: {} }, {
     setSource: (source) => {
-      currentSettings = source as () => { servers: Record<string, AcpServerConfig> }
+      currentSettings = source as () => {
+        servers: Record<string, AcpServerConfig>
+        includeHarnessPrompt?: boolean
+        includeRuntimeContext?: boolean
+      }
     },
     onChange: () => {
       try {

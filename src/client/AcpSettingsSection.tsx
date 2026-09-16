@@ -381,6 +381,8 @@ export function AcpSettingsSection(props: AcpSettingsSectionProps) {
   const [customDraft, setCustomDraft] = useState<CustomAgentDraft>(emptyCustomDraft())
   const [customSaving, setCustomSaving] = useState(false)
   const [customError, setCustomError] = useState<string | undefined>()
+  const [includeHarnessPrompt, setIncludeHarnessPrompt] = useState(false)
+  const [includeRuntimeContext, setIncludeRuntimeContext] = useState(false)
 
   /** Revision of the `llm-acp` namespace at the last read; sent back on writes
    * so a stale editor is refused instead of silently overwriting. */
@@ -394,9 +396,15 @@ export function AcpSettingsSection(props: AcpSettingsSectionProps) {
         const ns = response.value?.namespaces.find(v => v.ns === settingsNs)
         if (ns !== undefined) {
           revisionRef.current = ns.revision
-          const data = ns.value as { servers?: Record<string, AcpServerEntry> }
+          const data = ns.value as {
+            servers?: Record<string, AcpServerEntry>
+            includeHarnessPrompt?: boolean
+            includeRuntimeContext?: boolean
+          }
           const next = data?.servers ?? {}
           setServers(next)
+          setIncludeHarnessPrompt(data?.includeHarnessPrompt ?? false)
+          setIncludeRuntimeContext(data?.includeRuntimeContext ?? false)
           // Best-effort: refresh live server version info. The `acp-info-<id>`
           // route reads the cached `initialize` identity (no session), so the
           // parallel fetches are cheap; each resolves independently and may
@@ -425,6 +433,26 @@ export function AcpSettingsSection(props: AcpSettingsSectionProps) {
     void loadProviderModels(api, settingsNs, 'acp-dsh-presets')
       .then(list => { setDshPresets(list.map(m => m.id)) })
   }, [])
+
+  /** Persist one plugin-level include switch to the `llm-acp` namespace and
+   * reload, so the adapter's per-stream getter picks it up on the next prompt. */
+  const setIncludeFlag = async (field: 'includeHarnessPrompt' | 'includeRuntimeContext', value: boolean): Promise<void> => {
+    setError(undefined)
+    try {
+      const response = await api.mutateSettings(
+        settingsNs,
+        [{ op: 'set', path: [field], value }],
+        revisionRef.current,
+      )
+      if (!response.ok) {
+        setError(response.error?.message ?? 'unknown error')
+      } else {
+        await loadServers()
+      }
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : String(err))
+    }
+  }
 
   /** Add a registry agent as a configured server. For `npx -y <pkg>` agents,
    * probe the host PATH first and store the local bin directly when present,
@@ -949,6 +977,26 @@ export function AcpSettingsSection(props: AcpSettingsSectionProps) {
 
       {tab === 'servers' && (
         <div className={css.panel}>
+          <div className={css.detailSection}>
+            <label className={css.modelRow}>
+              <input
+                type="checkbox"
+                checked={includeHarnessPrompt}
+                onChange={() => { void setIncludeFlag('includeHarnessPrompt', !includeHarnessPrompt) }}
+              />
+              <span className={css.detailHeading}>{t('harnessPrompt')}</span>
+            </label>
+            <p className={css.detailHint}>{t('harnessPromptHint')}</p>
+            <label className={css.modelRow}>
+              <input
+                type="checkbox"
+                checked={includeRuntimeContext}
+                onChange={() => { void setIncludeFlag('includeRuntimeContext', !includeRuntimeContext) }}
+              />
+              <span className={css.detailHeading}>{t('runtimeContext')}</span>
+            </label>
+            <p className={css.detailHint}>{t('runtimeContextHint')}</p>
+          </div>
           {!loading && serverList.length === 0 ? (
             <p className={css.empty}>{t('noServers')}</p>
           ) : (

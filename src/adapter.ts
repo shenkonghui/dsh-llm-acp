@@ -1,15 +1,22 @@
 /**
  * `AcpAdapter`: an {@link LlmAdapter} that delegates each model call to a
- * long-lived external ACP server. When the agent advertises `session/load`,
- * subsequent turns within the same dsh session reuse the ACP session and send
- * only the new user message — avoiding full-history resend. Without
- * `loadSession`, each `stream()` call creates a fresh ACP session, sends the
- * full conversation as a single user message, and closes it after.
+ * long-lived external ACP server. Subsequent turns within the same dsh session
+ * reuse the live ACP session and send only the new user message — the ACP
+ * server keeps each session's context and conversation history between
+ * prompts, so resending history would duplicate what it already holds. A
+ * fresh session is created only when no reuse mapping exists (first turn,
+ * one-shot calls) or the history shrank (compaction); one-shot sessions are
+ * closed after the prompt.
  *
  * `agent_message_chunk` / `agent_thought_chunk` updates are translated into
  * harness `StreamChunk`s; `usage_update` becomes a `usage` chunk carrying the
- * server's context occupancy on the prompt side. Tool-call deltas are never
- * emitted: the ACP server executes its own tools internally.
+ * server's context occupancy on the prompt side. Tool calls are never emitted
+ * as `tool-call` stream blocks: the agent loop dispatches such blocks to the
+ * harness's own tool registry, but the ACP server already executed them — the
+ * host would run them twice or fail on an unknown tool. When the caller
+ * supplies a {@link AcpToolCallRecorder} they are logged as `tool/call` +
+ * `tool/result` session events instead, which is what renders them as tool
+ * cards; without one they degrade to `[tool: …]` reasoning notes.
  *
  * @module @deepseek-ai/dsh-llm-acp/adapter
  */
@@ -18,9 +25,30 @@ import { LlmAdapter, LlmError } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, PreparedAdapterCall, StreamChunk } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock as AcpContentBlock } from '@agentclientprotocol/sdk'
 import type { Message } from '@deepseek-ai/dsh-llm'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { dirname } from 'node:path'
 import { AcpConnection } from './connection.ts'
-import type { AcpPermissionRequester } from './connection.ts'
+import type { AcpPermissionRequester, AcpSubagentNotice } from './connection.ts'
 import { acpFinishReason } from './types.ts'
+
+/**
+ * Records ACP-observed tool activity into the calling session's durable log
+ * (`tool/call` on start, `tool/result` on terminal status). Implementations
+ * are host-owned: the adapter never sees the session itself, it only reports
+ * what the wire carried. A call that never reaches {@link callFinished} is
+ * closed by the adapter at stream end with `output: ''`.
+ */
+export interface AcpToolCallRecorder {
+  /**
+   * One tool call began on the ACP side. `subagent` marks a call made inside
+   * a subagent; `toolKind` is the ACP tool kind (`read`/`edit`/`execute`/…),
+   * `''` when the server omitted it — the host maps it onto a native tool
+   * name so the call renders with the matching row family.
+   */
+  callStarted(call: { id: string; name: string; args: string; subagent: boolean; toolKind: string }): void
+  /** A previously started call reached a terminal status. */
+  callFinished(result: { id: string; output: string; isError: boolean }): void
+}
 
 /** Constructor options for {@link AcpAdapter}. */
 export interface AcpAdapterOptions {
@@ -57,8 +85,58 @@ export interface AcpAdapterOptions {
    * Called once per stream; `undefined` leaves the server mode untouched.
    */
   resolveSessionMode?: (() => string | undefined) | undefined
+  /**
+   * Whether to surface ACP-side subagent activity for this stream. Resolved
+   * once per stream, like {@link AcpAdapterOptions.resolveSessionMode}, because
+   * it is read from the calling session's permission state — which is only
+   * reachable on the adapter's async context, not on the connection's inbound
+   * notification path. `undefined` means `notice`.
+   */
+  subagentNotice?: (() => AcpSubagentNotice) | undefined
+  /**
+   * Whether to surface which tool the ACP server ran. Defaults to on — it
+   * answers "what is it doing" — and is separate from
+   * {@link AcpAdapterOptions.emitProgress}, which carries extension log
+   * chatter rather than structured activity. With a {@link toolCallRecorder}
+   * the calls land in the session log as `tool/call`/`tool/result` pairs
+   * (tool cards); without one they degrade to `[tool: …]` reasoning notes.
+   */
+  emitToolCalls?: boolean
+  /**
+   * Whether to include the DSH harness system-prompt additions in the prompt:
+   * the `system` slot plus the harness preamble user message ("You are an AI
+   * agent powered by DeepSeek Harness. …"). Read per stream from the live
+   * settings; default `false` — ACP agents assemble their own system prompt,
+   * so the harness copy is duplicate context that would otherwise persist in
+   * the agent's history and be resent on every turn.
+   */
+  includeHarnessPrompt?: (() => boolean) | undefined
+  /**
+   * Whether to include the DSH runtime-context snapshots and the skills
+   * `<system-reminder>` catalog in the prompt (default `false`). These are
+   * DSH-specific concepts (DSH file policy, DSH skill tool) that an external
+   * ACP agent cannot act on.
+   */
+  includeRuntimeContext?: (() => boolean) | undefined
+  /**
+   * Resolve a recorder that turns ACP-observed tool calls into session
+   * `tool/call`/`tool/result` events. Called once per stream on the adapter's
+   * async context — where the calling agent's session is reachable — and
+   * returns `undefined` when the call runs outside a session step (test
+   * probes, auxiliary purposes), in which case tool activity falls back to
+   * `[tool: …]` reasoning notes.
+   */
+  toolCallRecorder?: (() => AcpToolCallRecorder | undefined) | undefined
   /** Host sink for best-effort operation failures (session mode, etc.). */
   onWarn?: (message: string) => void
+  /**
+   * Path of the JSON file persisting the `dshSessionId → acpSessionId` map
+   * across harness restarts. When set, a turn whose in-memory mapping is gone
+   * (harness restart, connection rebuild) reattaches to the persisted ACP
+   * session via `session/load` instead of creating a fresh one; the file is
+   * rewritten on every mapping change. `undefined` disables persistence.
+   */
+  sessionStorePath?: string | undefined
 }
 
 /** Extract the concatenated text of a harness message (non-text blocks contribute nothing). */
@@ -69,16 +147,48 @@ function messageText(message: Message): string {
     .join('\n')
 }
 
-/** Render the full conversation (system + all messages) into one ACP text block. */
-function renderPrompt(options: GenerateOptions): AcpContentBlock[] {
+/**
+ * Lead-in markers of the DSH-composed context messages. The harness sends its
+ * system-prompt preamble, runtime-context snapshots, and the skills catalog as
+ * non-assistant messages (observed as `system` role; `renderPrompt` renders
+ * every non-assistant role as `[user]` on the wire); an external ACP agent
+ * assembles its own equivalents, so these are stripped unless the corresponding
+ * include switch is on.
+ * ponytail: ceiling — detection is by lead-in marker, not a structured flag;
+ * if dsh rewords them or bundles the preamble into a message that also carries
+ * real user content, stripping silently stops (or must be switched off via the
+ * settings toggles). Upgrade path: a structured message flag from the harness.
+ */
+const HARNESS_PREAMBLE_RE = /^You are an AI agent powered by DeepSeek Harness\./
+const RUNTIME_CONTEXT_RE = /^Current runtime context\./
+const SKILLS_REMINDER_RE = /^<system-reminder>/
+
+/** Whether one conversation message is a DSH addition the ACP agent should not
+ * receive, given the two include switches. Assistant messages are never
+ * stripped; the preamble may arrive as either a `user` or a `system` role
+ * message (both render as `[user]` on the ACP wire). */
+export function isDshAddition(message: Message, includeHarnessPrompt: boolean, includeRuntimeContext: boolean): boolean {
+  if (message.role === 'assistant') return false
+  const text = messageText(message)
+  if (!includeHarnessPrompt && HARNESS_PREAMBLE_RE.test(text)) return true
+  if (!includeRuntimeContext && (RUNTIME_CONTEXT_RE.test(text) || SKILLS_REMINDER_RE.test(text))) return true
+  return false
+}
+
+/** Render the full conversation (system + all messages) into one ACP text block.
+ * User messages carry no marker: the whole ACP prompt IS a user message, so a
+ * `[user]` prefix would only be stored as literal text in the agent's history.
+ * Assistant turns keep a marker so multi-turn full renders stay attributable. */
+function renderPrompt(options: GenerateOptions, includeHarnessPrompt: boolean, includeRuntimeContext: boolean): AcpContentBlock[] {
   const parts: string[] = []
-  if (options.system !== undefined && options.system.length > 0) {
+  if (includeHarnessPrompt && options.system !== undefined && options.system.length > 0) {
     parts.push(`[system]\n${options.system}`)
   }
   for (const message of options.messages) {
-    const role = message.role === 'assistant' ? 'assistant' : 'user'
+    if (isDshAddition(message, includeHarnessPrompt, includeRuntimeContext)) continue
     const text = messageText(message)
-    if (text.length > 0) parts.push(`[${role}]\n${text}`)
+    if (text.length === 0) continue
+    parts.push(message.role === 'assistant' ? `[assistant]\n${text}` : text)
   }
   return [{ type: 'text', text: parts.join('\n\n') }]
 }
@@ -90,15 +200,64 @@ function renderPrompt(options: GenerateOptions): AcpContentBlock[] {
  * ponytail: ceiling — assumes messages[fromIndex:] contains at most one new
  * user turn; multiple unsent user turns would be concatenated into one prompt.
  */
-function renderPromptDelta(messages: readonly Message[], fromIndex: number): AcpContentBlock[] {
+function renderPromptDelta(
+  messages: readonly Message[],
+  fromIndex: number,
+  includeHarnessPrompt: boolean,
+  includeRuntimeContext: boolean,
+): AcpContentBlock[] {
   const parts: string[] = []
   for (const message of messages.slice(fromIndex)) {
     if (message.role === 'assistant') continue
+    if (isDshAddition(message, includeHarnessPrompt, includeRuntimeContext)) continue
     const text = messageText(message)
-    if (text.length > 0) parts.push(`[user]\n${text}`)
+    if (text.length > 0) parts.push(text)
   }
   if (parts.length === 0) return [{ type: 'text', text: '' }]
   return [{ type: 'text', text: parts.join('\n\n') }]
+}
+
+/** Lead-in of the harness's session-title prompt; see {@link sessionTitleFromMessages}. */
+const TITLE_PROMPT_MARKER = 'Generate the session title'
+/** Longest extracted title before truncation. */
+const MAX_TITLE_LENGTH = 60
+
+/**
+ * Extract the session title directly from the harness's title-generation
+ * prompt instead of spending an ACP session + model round on reformatting
+ * text the prompt already carries. The prompt embeds the human messages as a
+ * JSON array (`[{"seq":8,"text":"1 +1 =?"}]`); the first entry names the
+ * session topic. Returns `undefined` when the prompt does not match the
+ * expected shape, so the caller falls back to the normal model path rather
+ * than ever deriving a wrong title.
+ * ponytail: ceiling — couples to the harness's title-prompt wording and JSON
+ * shape; a reworded prompt degrades to the model round-trip, never to a wrong
+ * title. Upgrade path: a structured title-request field on GenerateOptions.
+ */
+export function sessionTitleFromMessages(messages: readonly Message[]): string | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i]
+    if (message === undefined || message.role !== 'user') continue
+    const text = messageText(message)
+    if (!text.includes(TITLE_PROMPT_MARKER)) continue
+    const start = text.indexOf('[')
+    const end = text.lastIndexOf(']')
+    if (start === -1 || end <= start) return undefined
+    let entries: { text?: unknown }[]
+    try {
+      entries = JSON.parse(text.slice(start, end + 1)) as { text?: unknown }[]
+    } catch {
+      return undefined
+    }
+    for (const entry of entries) {
+      if (typeof entry?.text === 'string' && entry.text.trim().length > 0) {
+        const title = entry.text.replace(/\s+/g, ' ').trim()
+        return title.length > MAX_TITLE_LENGTH ? `${title.slice(0, MAX_TITLE_LENGTH - 1)}…` : title
+      }
+    }
+    return undefined
+  }
+  return undefined
 }
 
 /** Tracks one open streaming block so `block-end` carries the assembled text. */
@@ -112,6 +271,84 @@ interface OpenBlock {
 interface ReusedSession {
   acpSessionId: string
   messagesSent: number
+}
+
+/**
+ * Durable `dshSessionId → ReusedSession` map backing the in-memory
+ * {@link AcpAdapter.sessionMap} across harness restarts. One JSON file per
+ * ACP server; every mutation rewrites the file (small, infrequent). All
+ * operations are no-ops when no path was configured, and every read failure
+ * (missing/corrupt file) degrades to an empty map — the store is an
+ * optimization over the fresh-session fallback, never a correctness source.
+ */
+export class SessionStore {
+  /** Lazily parsed file contents; `undefined` until the first access. */
+  private cache: Record<string, ReusedSession> | undefined
+
+  constructor(private readonly path: string | undefined) {}
+
+  private load(): Record<string, ReusedSession> {
+    if (this.cache === undefined) {
+      this.cache = {}
+      if (this.path !== undefined && existsSync(this.path)) {
+        try {
+          this.cache = this.parse(readFileSync(this.path, 'utf8'))
+        } catch {
+          // A corrupt file degrades to an empty map; the next successful
+          // write overwrites it.
+        }
+      }
+    }
+    return this.cache
+  }
+
+  private parse(raw: string): Record<string, ReusedSession> {
+    const parsed = JSON.parse(raw) as Record<string, ReusedSession>
+    // Shape-check every entry: a corrupt or hand-edited file degrades to a
+    // fresh session rather than feeding a malformed id into session/load.
+    for (const [key, value] of Object.entries(parsed)) {
+      if (typeof value?.acpSessionId !== 'string' || value.acpSessionId.length === 0
+        || typeof value?.messagesSent !== 'number' || !Number.isInteger(value.messagesSent)
+        || value.messagesSent < 0) {
+        delete parsed[key]
+      }
+    }
+    return parsed
+  }
+
+  get(dshSessionId: string): ReusedSession | undefined {
+    if (this.path === undefined) return undefined
+    return this.load()[dshSessionId]
+  }
+
+  set(dshSessionId: string, entry: ReusedSession): void {
+    if (this.path === undefined) return
+    this.load()[dshSessionId] = entry
+    this.flush()
+  }
+
+  delete(dshSessionId: string): void {
+    if (this.path === undefined) return
+    if (this.cache === undefined && !existsSync(this.path)) return
+    if (this.load()[dshSessionId] === undefined) return
+    delete this.load()[dshSessionId]
+    this.flush()
+  }
+
+  /** Host sink for store write failures; optional so tests can stay quiet. */
+  onWriteError?: (message: string) => void
+
+  private flush(): void {
+    if (this.path === undefined || this.cache === undefined) return
+    try {
+      mkdirSync(dirname(this.path), { recursive: true })
+      writeFileSync(this.path, JSON.stringify(this.cache, undefined, 2))
+    } catch (error: unknown) {
+      // Persistence is best-effort: a failed write degrades to in-memory-only
+      // reuse (fresh session after restart), never to a broken prompt.
+      this.onWriteError?.(`llm-acp: failed to persist the ACP session map: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
 }
 
 /** Deduplicate model entries by id, keeping the first occurrence (highest priority). */
@@ -161,13 +398,17 @@ export class AcpAdapter extends LlmAdapter {
   private models: readonly LlmModelInfo[] = []
   /** Resolves when the model discovery probe finishes (success or fallback). */
   private readonly modelsReady: Promise<void>
-  /** Reused ACP sessions keyed by dsh session id (only when `loadSession` is supported). */
+  /** Reused ACP sessions keyed by dsh session id. */
   private readonly sessionMap = new Map<string, ReusedSession>()
+  /** Durable backing of {@link AcpAdapter.sessionMap} across restarts (no-op without a path). */
+  private readonly sessionStore: SessionStore
   /** Last session-mode value applied per ACP session id, to skip redundant writes. */
   private readonly appliedMode = new Map<string, string>()
 
   constructor(private readonly config: AcpAdapterOptions) {
     super()
+    this.sessionStore = new SessionStore(config.sessionStorePath)
+    this.sessionStore.onWriteError = message => config.onWarn?.(message)
     const fallback = [{ provider: config.provider, id: config.defaultModel.id, name: config.defaultModel.name }]
     const allow = config.enabledModels
     const custom = config.customModels ?? []
@@ -242,18 +483,38 @@ export class AcpAdapter extends LlmAdapter {
   }
 
   /**
-   * Stream one model call. When the ACP agent supports `session/load` and the
-   * request carries a dsh `sessionId`, the ACP session is reused across turns:
-   * only new user messages are sent, avoiding full-history resend. Without
-   * `loadSession` or for one-shot calls, a fresh ACP session is created with
-   * the full conversation and closed after the prompt.
+   * Stream one model call. When the request carries a dsh `sessionId`, the
+   * ACP session is reused across turns: the server keeps each session's
+   * context between prompts, so only the new user message is sent. A mapping
+   * lost in memory (harness restart, connection rebuild) is restored from the
+   * durable store via `session/load` when the agent supports it. Without any
+   * mapping (first turn, one-shot calls) or when the history shrank
+   * (compaction), a fresh ACP session is created with the full conversation
+   * and closed after the prompt.
    *
    * Yields `text-delta` (and optionally `reasoning-delta`) chunks as the ACP
    * server streams assistant output, a `usage` chunk whenever the server
    * reports context occupancy, then a terminal `finish` chunk.
    */
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
+    // A session-title call is a pure string extraction: the prompt already
+    // carries the human messages as JSON, and an ACP round-trip would spend a
+    // full agent session (its own system prompt and model run) on reformatting
+    // it. Answer locally when the prompt matches the expected shape; an
+    // unmatched prompt falls through to the normal model path below.
+    if (options.purpose === 'session-title') {
+      const title = sessionTitleFromMessages(options.messages)
+      if (title !== undefined) {
+        yield { type: 'block-start', index: 0, blockType: 'text' }
+        yield { type: 'text-delta', index: 0, text: title }
+        yield { type: 'block-end', index: 0, block: { type: 'text', text: title } }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+        return
+      }
+    }
+
     const permissionRequester = this.config.permissionRequester?.()
+    const subagentNotice = this.config.subagentNotice?.() ?? 'notice'
     try {
       await this.config.connection.ready
     } catch (error: unknown) {
@@ -270,38 +531,55 @@ export class AcpAdapter extends LlmAdapter {
       return
     }
 
-    const canReuse = this.config.connection.supportsLoadSession
-      && options.sessionId !== undefined
+    const canReuse = options.sessionId !== undefined
       && options.purpose === undefined
     const dshSessionId = canReuse ? String(options.sessionId) : undefined
-    const existing = dshSessionId !== undefined ? this.sessionMap.get(dshSessionId) : undefined
+    let existing = dshSessionId !== undefined ? this.sessionMap.get(dshSessionId) : undefined
 
-    // Determine whether we can reuse an existing ACP session.
-    // Fall back to a fresh session when: compaction shrank the history, the
-    // session mapping is stale, or loadSession fails.
+    // The mapping is durable but not memory-resident: after a harness restart
+    // (or a connection rebuild) the store still knows the ACP session id, and
+    // a successful `session/load` reattaches to it — the agent restores its
+    // history and the turn continues with only the delta. A failed load
+    // (unknown/deleted session, no capability) falls through to a fresh
+    // session and the stale store entry is dropped.
+    if (existing === undefined && dshSessionId !== undefined) {
+      const stored = this.sessionStore.get(dshSessionId)
+      if (stored !== undefined && await this.config.connection.loadSession(stored.acpSessionId)) {
+        this.sessionMap.set(dshSessionId, stored)
+        existing = stored
+      } else {
+        this.sessionStore.delete(dshSessionId)
+      }
+    }
+
+    // Reuse the mapped ACP session when one exists and the history did not
+    // shrink (compaction): the server keeps the session's context between
+    // prompts, so only the delta is sent. A server that dropped the session
+    // fails the prompt; the error path deletes the mapping and the next turn
+    // rebuilds from full history.
     let sessionId: string
     let prompt: AcpContentBlock[]
     let isReused = false
 
+    // Read the include switches per stream so a settings edit applies to the
+    // next prompt without rebuilding the connection. Stripping only affects
+    // what is rendered — `messagesSent` bookkeeping stays on the raw array,
+    // and the filter is deterministic per message, so the stripped arrays
+    // keep a shared prefix across turns and delta indexing stays consistent.
+    const includeHarnessPrompt = this.config.includeHarnessPrompt?.() ?? false
+    const includeRuntimeContext = this.config.includeRuntimeContext?.() ?? false
+
     if (existing !== undefined && options.messages.length >= existing.messagesSent) {
-      try {
-        await this.config.connection.loadSession(existing.acpSessionId)
-        sessionId = existing.acpSessionId
-        prompt = renderPromptDelta(options.messages, existing.messagesSent)
-        isReused = true
-      } catch {
-        // Session gone (server restart, eviction): drop mapping, create fresh.
-        this.sessionMap.delete(dshSessionId!)
-        sessionId = await this.createSession(options)
-        prompt = renderPrompt(options)
-      }
+      sessionId = existing.acpSessionId
+      prompt = renderPromptDelta(options.messages, existing.messagesSent, includeHarnessPrompt, includeRuntimeContext)
+      isReused = true
     } else {
       // No existing mapping or history shrank (compaction): create fresh.
       if (existing !== undefined && dshSessionId !== undefined) {
         this.sessionMap.delete(dshSessionId)
       }
       sessionId = await this.createSession(options)
-      prompt = renderPrompt(options)
+      prompt = renderPrompt(options, includeHarnessPrompt, includeRuntimeContext)
     }
 
     // Set the model on the ACP session when a specific model is selected.
@@ -340,6 +618,29 @@ export class AcpAdapter extends LlmAdapter {
     // the conversation — and, being the newest sample, it would displace the
     // real one in the harness's context-pressure fold.
     const reportUsage = options.purpose === undefined
+    // Tool recording likewise belongs to conversation turns: an auxiliary
+    // call's ACP-side tool runs must not write `tool/call` pairs into the
+    // calling session's transcript. A factory failure degrades to the
+    // reasoning fallback rather than failing the stream over a
+    // presentational record.
+    let toolCallRecorder: AcpToolCallRecorder | undefined
+    if (options.purpose === undefined) {
+      try {
+        toolCallRecorder = this.config.toolCallRecorder?.()
+      } catch (error: unknown) {
+        this.config.onWarn?.(`llm-acp: tool call recorder unavailable: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
+    /** Call ids reported to the recorder but not yet finished. */
+    const pendingToolCalls = new Set<string>()
+    let streamErrored = false
+    const finishPendingToolCalls = (isError: boolean): void => {
+      if (toolCallRecorder === undefined) return
+      for (const id of pendingToolCalls) {
+        toolCallRecorder.callFinished({ id, output: '', isError })
+      }
+      pendingToolCalls.clear()
+    }
     let nextIndex = 0
     let open: OpenBlock | undefined
     const signal = options.signal ?? new AbortController().signal
@@ -355,7 +656,7 @@ export class AcpAdapter extends LlmAdapter {
     }
 
     try {
-      for await (const update of this.config.connection.promptStream(sessionId, prompt, signal, permissionRequester)) {
+      for await (const update of this.config.connection.promptStream(sessionId, prompt, signal, permissionRequester, subagentNotice)) {
         switch (update.kind) {
           case 'text': {
             if (update.text.length === 0) break
@@ -404,11 +705,59 @@ export class AcpAdapter extends LlmAdapter {
             }
             break
           }
+          case 'tool': {
+            // Which tool the ACP server ran. With a recorder it lands in the
+            // session log as `tool/call` (tool cards); without one it degrades
+            // to a reasoning note — on by default: it is the answer to "what
+            // is it doing", and unlike `progress` (extension log text such as
+            // MCP server chatter) it is low-volume and structured.
+            if (toolCallRecorder !== undefined) {
+              toolCallRecorder.callStarted({ id: update.id, name: update.name, args: update.args, subagent: update.subagent, toolKind: update.toolKind })
+              pendingToolCalls.add(update.id)
+            } else if (this.config.emitToolCalls !== false) {
+              if (open === undefined || open.type !== 'reasoning') {
+                yield* closeOpen()
+                open = { type: 'reasoning', index: nextIndex++, text: '' }
+                yield { type: 'block-start', index: open.index, blockType: 'reasoning' }
+              }
+              const note = `[${update.subagent ? 'subagent tool' : 'tool'}: ${update.name}]\n`
+              open.text += note
+              yield { type: 'reasoning-delta', index: open.index, text: note }
+            }
+            break
+          }
+          case 'tool-end': {
+            // `tool-end` for an id never seen is dropped — the consumer owns
+            // the open-call set. A call the stream abandons is closed by
+            // `finishPendingToolCalls` instead of staying open in the log.
+            if (pendingToolCalls.delete(update.id)) {
+              toolCallRecorder?.callFinished({ id: update.id, output: update.output, isError: update.status === 'failed' })
+            }
+            break
+          }
+          case 'notice': {
+            // Agent-side events the connection already decided are worth
+            // surfacing (subagent spawn/finish, mapped from the session's
+            // permission state). Unlike `progress` these are not gated by
+            // `emitProgress`: the mapping is the gate, and a subagent fan-out
+            // is a cost event rather than ordinary tool chatter.
+            if (update.text.length === 0) break
+            if (open === undefined || open.type !== 'reasoning') {
+              yield* closeOpen()
+              open = { type: 'reasoning', index: nextIndex++, text: '' }
+              yield { type: 'block-start', index: open.index, blockType: 'reasoning' }
+            }
+            open.text += update.text + '\n'
+            yield { type: 'reasoning-delta', index: open.index, text: update.text + '\n' }
+            break
+          }
           case 'done': {
             yield* closeOpen()
             // Track the session for reuse after a successful prompt.
             if (canReuse) {
-              this.sessionMap.set(dshSessionId!, { acpSessionId: sessionId, messagesSent: options.messages.length })
+              const entry = { acpSessionId: sessionId, messagesSent: options.messages.length }
+              this.sessionMap.set(dshSessionId!, entry)
+              this.sessionStore.set(dshSessionId!, entry)
             }
             yield {
               type: 'finish',
@@ -418,9 +767,11 @@ export class AcpAdapter extends LlmAdapter {
           }
           case 'error': {
             yield* closeOpen()
+            streamErrored = true
             // Drop the mapping on error so the next turn creates a fresh session.
             if (isReused && dshSessionId !== undefined) {
               this.sessionMap.delete(dshSessionId)
+              this.sessionStore.delete(dshSessionId)
             }
             yield {
               type: 'finish',
@@ -432,14 +783,20 @@ export class AcpAdapter extends LlmAdapter {
       }
     } catch (error: unknown) {
       yield* closeOpen()
+      streamErrored = true
       if (isReused && dshSessionId !== undefined) {
         this.sessionMap.delete(dshSessionId)
+        this.sessionStore.delete(dshSessionId)
       }
       throw new LlmError(
         `llm-acp: stream failed: ${error instanceof Error ? error.message : String(error)}`,
         'SERVER',
       )
     } finally {
+      // Calls still open when the stream ends (prompt finished mid-call, abort,
+      // failure) get a `tool/result` so the log never holds a dangling
+      // `tool/call`; errored streams mark them failed, clean ends completed.
+      finishPendingToolCalls(streamErrored)
       // Close one-shot sessions (no reuse mapping). Reused sessions stay alive
       // for subsequent turns; they are cleaned up by {@link disposeSessions}.
       if (!isReused && !canReuse) {
@@ -450,6 +807,7 @@ export class AcpAdapter extends LlmAdapter {
     yield* closeOpen()
     if (isReused && dshSessionId !== undefined) {
       this.sessionMap.delete(dshSessionId)
+      this.sessionStore.delete(dshSessionId)
     }
     yield {
       type: 'finish',
@@ -469,11 +827,14 @@ export class AcpAdapter extends LlmAdapter {
     }
   }
 
-  /** Close all reused ACP sessions. Called when the adapter's connection is disposed. */
+  /**
+   * Drop the in-memory reuse mappings. The ACP sessions themselves are left
+   * alive: the durable store keeps their ids, so a later turn (same run after
+   * a connection rebuild, or a future harness run) reattaches via
+   * `session/load` instead of starting over. Called when the adapter's
+   * connection is disposed.
+   */
   disposeSessions(): void {
-    for (const { acpSessionId } of this.sessionMap.values()) {
-      this.config.connection.closeSession(acpSessionId)
-    }
     this.sessionMap.clear()
   }
 }

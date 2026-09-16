@@ -5,7 +5,7 @@
  * streamed assistant text/reasoning chunks plus a terminal stop reason.
  *
  * Authentication is lazy: `authenticate` runs eagerly only when a configured
- * API key resolves, and otherwise only after a `session/new`/`session/load`
+ * API key resolves, and otherwise only after a `session/new`
  * failure — servers that accept env credentials or a cached login never see
  * an `authenticate` call, so a healthy server never triggers a browser login
  * it did not need. When a server advertises several auth methods, the round
@@ -25,7 +25,7 @@ export declare const DEFAULT_DISPOSE_EOF_GRACE_MS = 6000;
 export declare const DEFAULT_DISPOSE_GRACE_MS = 3000;
 /** Default bound on the `initialize` handshake plus any keyed `authenticate` round. */
 export declare const DEFAULT_INIT_TIMEOUT_MS = 120000;
-/** Default bound on `session/new`, `session/load`, and `session/set_config_option`. */
+/** Default bound on `session/new`, `session/list`, and `session/set_config_option`. */
 export declare const DEFAULT_SESSION_TIMEOUT_MS = 60000;
 /** Default bound on one `authenticate` round, keyed or key-less. */
 export declare const DEFAULT_AUTH_TIMEOUT_MS = 15000;
@@ -33,7 +33,8 @@ export declare const DEFAULT_AUTH_TIMEOUT_MS = 15000;
  * enough for the user to finish a browser login before the failed session
  * call retries. */
 export declare const DEFAULT_INTERACTIVE_AUTH_TIMEOUT_MS = 300000;
-/** One queued update delivered to a {@link AcpConnection.promptStream} consumer. */ type QueuedUpdate = {
+/** One queued update delivered to a {@link AcpConnection.promptStream} consumer. */
+type QueuedUpdate = {
     kind: 'text';
     text: string;
 } | {
@@ -41,6 +42,35 @@ export declare const DEFAULT_INTERACTIVE_AUTH_TIMEOUT_MS = 300000;
     text: string;
 } | {
     kind: 'progress';
+    text: string;
+}
+/**
+ * A tool call the ACP server started: `id` correlates with a later
+ * `tool-end`, `name` is the server-provided display title, `args` is the
+ * serialized `rawInput` (`{}` when the server sent none), `subagent` marks a
+ * call made inside a subagent, and `toolKind` is the ACP tool kind
+ * (read/edit/execute/…) — `''` when the server omitted it. The host maps
+ * `toolKind` onto a native harness tool name so the call renders with the
+ * matching row family instead of the generic one.
+ */
+ | {
+    kind: 'tool';
+    id: string;
+    name: string;
+    args: string;
+    subagent: boolean;
+    toolKind: string;
+}
+/** A tool call reached a terminal status (`completed`/`failed`). */
+ | {
+    kind: 'tool-end';
+    id: string;
+    status: 'completed' | 'failed';
+    output: string;
+}
+/** Agent-side event the caller chose to surface (see `AcpSubagentNotice`). */
+ | {
+    kind: 'notice';
     text: string;
 } | {
     kind: 'usage';
@@ -54,6 +84,11 @@ export declare const DEFAULT_INTERACTIVE_AUTH_TIMEOUT_MS = 300000;
 };
 /** Decision returned by an interactive ACP permission requester. */
 export type AcpPermissionDecision = 'allow' | 'reject' | 'cancel';
+/**
+ * Whether ACP-side subagent activity is surfaced for the calling session.
+ * `notice` notes it in the stream, `silent` consumes it.
+ */
+export type AcpSubagentNotice = 'notice' | 'silent';
 /**
  * Auth-method picker state: what the server advertises, what the operator
  * selected, and whether a blocked attempt has made a choice necessary.
@@ -122,7 +157,7 @@ export interface AcpConnectionSpec {
     disposeGraceMs: number;
     /** Bound (ms) on the `initialize` handshake plus any keyed `authenticate` round. */
     initTimeoutMs: number;
-    /** Bound (ms) on `session/new`, `session/load`, and `session/set_config_option`. */
+    /** Bound (ms) on `session/new`, `session/list`, and `session/set_config_option`. */
     sessionTimeoutMs: number;
     /** Bound (ms) on one `authenticate` round, keyed or key-less. */
     authTimeoutMs: number;
@@ -164,6 +199,14 @@ export interface AcpConnectionSpec {
      * read per round — see the fingerprint in the owning plugin.
      */
     authMethod?: string;
+    /**
+     * Directory receiving a JSONL dump of every protocol trace event, one line
+     * per event, written before the in-memory buffer's collapsing and eviction
+     * (so per-chunk arrival times survive). Unset disables the dump. Intended
+     * for offline protocol debugging; a write failure warns once and turns the
+     * dump off without affecting the connection.
+     */
+    debugTraceDir?: string | undefined;
 }
 /**
  * One long-lived ACP client connection backed by a single child server
@@ -178,10 +221,12 @@ export declare class AcpConnection {
     private readonly readyPromise;
     private disposed;
     private disposal;
-    /** Capabilities advertised by the agent in its `initialize` response. */
-    private agentCapabilities;
     /** Session lifecycle capabilities advertised by the agent. */
     private sessionCapabilities;
+    /** Whether the agent advertised the `loadSession` capability at initialize. */
+    private loadSessionAdvertised;
+    /** Sessions with a `session/load` in flight; their replayed history updates are dropped silently. */
+    private readonly loadingSessions;
     /** Agent name/version published in the `initialize` response (`agentInfo`). */
     private agentInfo;
     /** Negotiated ACP protocol version from the `initialize` response. */
@@ -191,7 +236,7 @@ export declare class AcpConnection {
     /**
      * The connection's single `authenticate` round — the eager keyed attempt
      * during `initialize`, or the lazy key-less attempt started on the first
-     * `session/new`/`session/load` failure. Set at most once; a second round
+     * `session/new` failure. Set at most once; a second round
      * cannot succeed where the first did not.
      */
     private authRound;
@@ -218,6 +263,14 @@ export declare class AcpConnection {
      * the condition changes (a different selection, or a different method list).
      */
     private authChoiceWarnedKey;
+    /**
+     * Agent ids of subagents seen on this connection, learned from the
+     * `subagent_context` marker on the calls they make. A subagent's own
+     * lifecycle arrives as bare `tool_call_update`s naming that id with no
+     * preceding `tool_call`, so this set is what tells such an update apart from
+     * one for a tool call that was never announced.
+     */
+    private readonly subagentIds;
     private cachedConfigOptions;
     private configOptionsProbe;
     /**
@@ -230,16 +283,32 @@ export declare class AcpConnection {
     private reportedContextWindow;
     /** Ring buffer of recent ACP protocol interactions (max {@link MAX_PROTOCOL_TRACE}). */
     private readonly protocolTrace;
+    /** Dump file resolved on the first trace event when {@link AcpConnectionSpec.debugTraceDir} is set. */
+    private debugTraceFile;
+    /** Set once the dump is unusable, so a failed directory or write is not retried per event. */
+    private debugTraceOff;
     constructor(spec: AcpConnectionSpec);
     /** Resolves when the ACP server has completed `initialize`. */
     get ready(): Promise<void>;
     private initialize;
-    /** Whether the agent advertises `session/load` (session reuse). */
-    get supportsLoadSession(): boolean;
     /** Whether the agent advertises `session/list` via sessionCapabilities. */
     get supportsListSessions(): boolean;
     /** Whether the agent advertises `session/delete` via sessionCapabilities. */
     get supportsDeleteSession(): boolean;
+    /** Whether the agent advertises the `loadSession` capability. */
+    get canLoadSession(): boolean;
+    /**
+     * Attach this connection to a session created by an earlier connection
+     * (typically a previous harness run whose child process is gone). The agent
+     * restores its conversation history and replays it as `session/update`
+     * notifications; while the load is in flight those replays are dropped
+     * silently — the adapter's own history is authoritative and the next prompt
+     * sends only the delta. Returns `false` when the agent does not advertise
+     * `loadSession` or the load fails (unknown/deleted session), so the caller
+     * falls back to a fresh session.
+     * @param sessionId - the remote session id to reattach to.
+     */
+    loadSession(sessionId: string): Promise<boolean>;
     /**
      * Server identity published in the `initialize` response: the agent's
      * reported name/version and the negotiated ACP protocol version. Returns
@@ -300,6 +369,16 @@ export declare class AcpConnection {
      * @returns a snapshot copy of the trace buffer.
      */
     getProtocolTrace(): readonly ProtocolTraceEntry[];
+    /**
+     * Append one event to the debug dump ({@link AcpConnectionSpec.debugTraceDir}),
+     * opening the file on first use so an idle connection creates nothing. The
+     * line carries the untruncated detail because the dump exists to be read
+     * offline, where the in-memory buffer's caps only get in the way. Writes are
+     * synchronous so a line is on disk even if the process dies mid-stream — a
+     * cost accepted only because the dump is opt-in. A failed open or write
+     * disables the dump after one warning.
+     */
+    private writeDebugTrace;
     /** Append one trace entry, evicting the oldest when the buffer is full.
      * Consecutive entries sharing `collapseKey` merge into one with a `count`
      * so per-token stream chunks do not flood the buffer. */
@@ -322,7 +401,7 @@ export declare class AcpConnection {
     private authenticateWithKey;
     /**
      * The connection's single key-less `authenticate` round, started lazily by
-     * {@link withAuthRetry} when `session/new`/`session/load` fails on a server
+     * {@link withAuthRetry} when `session/new` fails on a server
      * that advertised auth methods. Servers with cached credentials (e.g.
      * codebuddy) resolve the call immediately — and only then accept
      * `session/new`. The round is bounded and best-effort: on timeout or error
@@ -392,14 +471,6 @@ export declare class AcpConnection {
      * @returns the remote session id.
      */
     newSession(): Promise<string>;
-    /**
-     * Load an existing ACP session by id (`session/load`). Only available when
-     * the agent advertises the `loadSession` capability. Returns the session's
-     * current config options (models, modes, etc.) if the server publishes them.
-     * @param sessionId - the remote session id to resume.
-     * @returns the config options published by the server, or `undefined`.
-     */
-    loadSession(sessionId: string): Promise<SessionConfigOption[] | undefined>;
     /**
      * List existing ACP sessions (`session/list`). Only available when the agent
      * advertises the `session/list` capability. Returns `undefined` when the
@@ -489,7 +560,7 @@ export declare class AcpConnection {
      * @param signal - cancellation; abort triggers a best-effort ACP cancel.
      * @param permissionRequester - interactive requester captured for this prompt.
      */
-    promptStream(sessionId: string, prompt: AcpContentBlock[], signal: AbortSignal, permissionRequester?: AcpPermissionRequester): AsyncGenerator<QueuedUpdate>;
+    promptStream(sessionId: string, prompt: AcpContentBlock[], signal: AbortSignal, permissionRequester?: AcpPermissionRequester, subagentNotice?: AcpSubagentNotice): AsyncGenerator<QueuedUpdate>;
     /**
      * Close one ACP session after a prompt completes. Best-effort: errors are
      * swallowed because the session may already be gone.

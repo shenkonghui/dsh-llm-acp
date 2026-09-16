@@ -1,22 +1,58 @@
 /**
  * `AcpAdapter`: an {@link LlmAdapter} that delegates each model call to a
- * long-lived external ACP server. When the agent advertises `session/load`,
- * subsequent turns within the same dsh session reuse the ACP session and send
- * only the new user message — avoiding full-history resend. Without
- * `loadSession`, each `stream()` call creates a fresh ACP session, sends the
- * full conversation as a single user message, and closes it after.
+ * long-lived external ACP server. Subsequent turns within the same dsh session
+ * reuse the live ACP session and send only the new user message — the ACP
+ * server keeps each session's context and conversation history between
+ * prompts, so resending history would duplicate what it already holds. A
+ * fresh session is created only when no reuse mapping exists (first turn,
+ * one-shot calls) or the history shrank (compaction); one-shot sessions are
+ * closed after the prompt.
  *
  * `agent_message_chunk` / `agent_thought_chunk` updates are translated into
  * harness `StreamChunk`s; `usage_update` becomes a `usage` chunk carrying the
- * server's context occupancy on the prompt side. Tool-call deltas are never
- * emitted: the ACP server executes its own tools internally.
+ * server's context occupancy on the prompt side. Tool calls are never emitted
+ * as `tool-call` stream blocks: the agent loop dispatches such blocks to the
+ * harness's own tool registry, but the ACP server already executed them — the
+ * host would run them twice or fail on an unknown tool. When the caller
+ * supplies a {@link AcpToolCallRecorder} they are logged as `tool/call` +
+ * `tool/result` session events instead, which is what renders them as tool
+ * cards; without one they degrade to `[tool: …]` reasoning notes.
  *
  * @module @deepseek-ai/dsh-llm-acp/adapter
  */
 import { LlmAdapter } from '@deepseek-ai/dsh-llm';
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, PreparedAdapterCall, StreamChunk } from '@deepseek-ai/dsh-llm';
+import type { Message } from '@deepseek-ai/dsh-llm';
 import { AcpConnection } from './connection.ts';
-import type { AcpPermissionRequester } from './connection.ts';
+import type { AcpPermissionRequester, AcpSubagentNotice } from './connection.ts';
+/**
+ * Records ACP-observed tool activity into the calling session's durable log
+ * (`tool/call` on start, `tool/result` on terminal status). Implementations
+ * are host-owned: the adapter never sees the session itself, it only reports
+ * what the wire carried. A call that never reaches {@link callFinished} is
+ * closed by the adapter at stream end with `output: ''`.
+ */
+export interface AcpToolCallRecorder {
+    /**
+     * One tool call began on the ACP side. `subagent` marks a call made inside
+     * a subagent; `toolKind` is the ACP tool kind (`read`/`edit`/`execute`/…),
+     * `''` when the server omitted it — the host maps it onto a native tool
+     * name so the call renders with the matching row family.
+     */
+    callStarted(call: {
+        id: string;
+        name: string;
+        args: string;
+        subagent: boolean;
+        toolKind: string;
+    }): void;
+    /** A previously started call reached a terminal status. */
+    callFinished(result: {
+        id: string;
+        output: string;
+        isError: boolean;
+    }): void;
+}
 /** Constructor options for {@link AcpAdapter}. */
 export interface AcpAdapterOptions {
     /** The long-lived ACP client connection; ready after `connection.ready` resolves. */
@@ -58,8 +94,103 @@ export interface AcpAdapterOptions {
      * Called once per stream; `undefined` leaves the server mode untouched.
      */
     resolveSessionMode?: (() => string | undefined) | undefined;
+    /**
+     * Whether to surface ACP-side subagent activity for this stream. Resolved
+     * once per stream, like {@link AcpAdapterOptions.resolveSessionMode}, because
+     * it is read from the calling session's permission state — which is only
+     * reachable on the adapter's async context, not on the connection's inbound
+     * notification path. `undefined` means `notice`.
+     */
+    subagentNotice?: (() => AcpSubagentNotice) | undefined;
+    /**
+     * Whether to surface which tool the ACP server ran. Defaults to on — it
+     * answers "what is it doing" — and is separate from
+     * {@link AcpAdapterOptions.emitProgress}, which carries extension log
+     * chatter rather than structured activity. With a {@link toolCallRecorder}
+     * the calls land in the session log as `tool/call`/`tool/result` pairs
+     * (tool cards); without one they degrade to `[tool: …]` reasoning notes.
+     */
+    emitToolCalls?: boolean;
+    /**
+     * Whether to include the DSH harness system-prompt additions in the prompt:
+     * the `system` slot plus the harness preamble user message ("You are an AI
+     * agent powered by DeepSeek Harness. …"). Read per stream from the live
+     * settings; default `false` — ACP agents assemble their own system prompt,
+     * so the harness copy is duplicate context that would otherwise persist in
+     * the agent's history and be resent on every turn.
+     */
+    includeHarnessPrompt?: (() => boolean) | undefined;
+    /**
+     * Whether to include the DSH runtime-context snapshots and the skills
+     * `<system-reminder>` catalog in the prompt (default `false`). These are
+     * DSH-specific concepts (DSH file policy, DSH skill tool) that an external
+     * ACP agent cannot act on.
+     */
+    includeRuntimeContext?: (() => boolean) | undefined;
+    /**
+     * Resolve a recorder that turns ACP-observed tool calls into session
+     * `tool/call`/`tool/result` events. Called once per stream on the adapter's
+     * async context — where the calling agent's session is reachable — and
+     * returns `undefined` when the call runs outside a session step (test
+     * probes, auxiliary purposes), in which case tool activity falls back to
+     * `[tool: …]` reasoning notes.
+     */
+    toolCallRecorder?: (() => AcpToolCallRecorder | undefined) | undefined;
     /** Host sink for best-effort operation failures (session mode, etc.). */
     onWarn?: (message: string) => void;
+    /**
+     * Path of the JSON file persisting the `dshSessionId → acpSessionId` map
+     * across harness restarts. When set, a turn whose in-memory mapping is gone
+     * (harness restart, connection rebuild) reattaches to the persisted ACP
+     * session via `session/load` instead of creating a fresh one; the file is
+     * rewritten on every mapping change. `undefined` disables persistence.
+     */
+    sessionStorePath?: string | undefined;
+}
+/** Whether one conversation message is a DSH addition the ACP agent should not
+ * receive, given the two include switches. Assistant messages are never
+ * stripped; the preamble may arrive as either a `user` or a `system` role
+ * message (both render as `[user]` on the ACP wire). */
+export declare function isDshAddition(message: Message, includeHarnessPrompt: boolean, includeRuntimeContext: boolean): boolean;
+/**
+ * Extract the session title directly from the harness's title-generation
+ * prompt instead of spending an ACP session + model round on reformatting
+ * text the prompt already carries. The prompt embeds the human messages as a
+ * JSON array (`[{"seq":8,"text":"1 +1 =?"}]`); the first entry names the
+ * session topic. Returns `undefined` when the prompt does not match the
+ * expected shape, so the caller falls back to the normal model path rather
+ * than ever deriving a wrong title.
+ * ponytail: ceiling — couples to the harness's title-prompt wording and JSON
+ * shape; a reworded prompt degrades to the model round-trip, never to a wrong
+ * title. Upgrade path: a structured title-request field on GenerateOptions.
+ */
+export declare function sessionTitleFromMessages(messages: readonly Message[]): string | undefined;
+/** One reused ACP session: remote id + how many dsh messages have been sent. */
+interface ReusedSession {
+    acpSessionId: string;
+    messagesSent: number;
+}
+/**
+ * Durable `dshSessionId → ReusedSession` map backing the in-memory
+ * {@link AcpAdapter.sessionMap} across harness restarts. One JSON file per
+ * ACP server; every mutation rewrites the file (small, infrequent). All
+ * operations are no-ops when no path was configured, and every read failure
+ * (missing/corrupt file) degrades to an empty map — the store is an
+ * optimization over the fresh-session fallback, never a correctness source.
+ */
+export declare class SessionStore {
+    private readonly path;
+    /** Lazily parsed file contents; `undefined` until the first access. */
+    private cache;
+    constructor(path: string | undefined);
+    private load;
+    private parse;
+    get(dshSessionId: string): ReusedSession | undefined;
+    set(dshSessionId: string, entry: ReusedSession): void;
+    delete(dshSessionId: string): void;
+    /** Host sink for store write failures; optional so tests can stay quiet. */
+    onWriteError?: (message: string) => void;
+    private flush;
 }
 /**
  * The ACP-backed LLM adapter. One instance serves every model name under its
@@ -74,8 +205,10 @@ export declare class AcpAdapter extends LlmAdapter {
     private models;
     /** Resolves when the model discovery probe finishes (success or fallback). */
     private readonly modelsReady;
-    /** Reused ACP sessions keyed by dsh session id (only when `loadSession` is supported). */
+    /** Reused ACP sessions keyed by dsh session id. */
     private readonly sessionMap;
+    /** Durable backing of {@link AcpAdapter.sessionMap} across restarts (no-op without a path). */
+    private readonly sessionStore;
     /** Last session-mode value applied per ACP session id, to skip redundant writes. */
     private readonly appliedMode;
     constructor(config: AcpAdapterOptions);
@@ -91,11 +224,14 @@ export declare class AcpAdapter extends LlmAdapter {
     resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo>;
     prepareCall(provider: string, model: string, _signal?: AbortSignal): Promise<PreparedAdapterCall>;
     /**
-     * Stream one model call. When the ACP agent supports `session/load` and the
-     * request carries a dsh `sessionId`, the ACP session is reused across turns:
-     * only new user messages are sent, avoiding full-history resend. Without
-     * `loadSession` or for one-shot calls, a fresh ACP session is created with
-     * the full conversation and closed after the prompt.
+     * Stream one model call. When the request carries a dsh `sessionId`, the
+     * ACP session is reused across turns: the server keeps each session's
+     * context between prompts, so only the new user message is sent. A mapping
+     * lost in memory (harness restart, connection rebuild) is restored from the
+     * durable store via `session/load` when the agent supports it. Without any
+     * mapping (first turn, one-shot calls) or when the history shrank
+     * (compaction), a fresh ACP session is created with the full conversation
+     * and closed after the prompt.
      *
      * Yields `text-delta` (and optionally `reasoning-delta`) chunks as the ACP
      * server streams assistant output, a `usage` chunk whenever the server
@@ -104,7 +240,14 @@ export declare class AcpAdapter extends LlmAdapter {
     stream(options: GenerateOptions): AsyncIterable<StreamChunk>;
     /** Create a fresh ACP session, throwing `LlmError` on failure. */
     private createSession;
-    /** Close all reused ACP sessions. Called when the adapter's connection is disposed. */
+    /**
+     * Drop the in-memory reuse mappings. The ACP sessions themselves are left
+     * alive: the durable store keeps their ids, so a later turn (same run after
+     * a connection rebuild, or a future harness run) reattaches via
+     * `session/load` instead of starting over. Called when the adapter's
+     * connection is disposed.
+     */
     disposeSessions(): void;
 }
+export {};
 //# sourceMappingURL=adapter.d.ts.map
