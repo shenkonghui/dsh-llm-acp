@@ -190,7 +190,7 @@ function finishChunk(chunks: StreamChunk[]): Extract<StreamChunk, { type: 'finis
 }
 
 /** Minimal initiating agent with an open turn for the approval service audit pair. */
-function fakeAgent(extraEvents: Array<{ type: string; data?: Record<string, unknown> }> = []): Agent {
+function fakeAgent(extraEvents: Array<{ type: string; data?: Record<string, unknown> }> = [], sessionCwd?: string): Agent {
   const events: Array<Record<string, unknown>> = [
     { type: 'turn/start', seq: 0 },
     { type: 'user/message', seq: 1 },
@@ -199,6 +199,7 @@ function fakeAgent(extraEvents: Array<{ type: string; data?: Record<string, unkn
   return {
     session: {
       events,
+      header: sessionCwd === undefined ? {} : { cwd: sessionCwd },
       // `approval.request` walks the log backwards via `seq`/`eventAt` to prove
       // an open turn; a bare `events` array is not enough for that check.
       get seq() { return events.length },
@@ -226,6 +227,23 @@ describe('dsh-llm-acp', () => {
       const text = assembledText(chunks)
       expect(text).toBe('hello from acp')
       expect(finishChunk(chunks).reason.kind).toBe('stop')
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('sends the calling session workspace as the session/new cwd', async () => {
+    const workspace = mkdtempSync(join(tmpdir(), 'llm-acp-cwd-'))
+    const ctx = await setup({ MOCK_ECHO_CWD: '1' })
+    try {
+      const chunks = await ctx.agents.withInitiator(fakeAgent([], workspace), () => collect(ctx.llm.stream({
+        provider: 'acp-test',
+        model: 'any',
+        messages: [createUserMessage({ content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } })],
+      })))
+      // MOCK_ECHO_CWD streams "<process cwd>\n<session/new cwd>"; the second
+      // line is the cwd announced to the agent.
+      expect(assembledText(chunks).split('\n')[1]).toBe(workspace)
     } finally {
       await ctx.fiber.dispose()
     }

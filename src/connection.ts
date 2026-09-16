@@ -704,13 +704,15 @@ export class AcpConnection {
    * `loadSession` or the load fails (unknown/deleted session), so the caller
    * falls back to a fresh session.
    * @param sessionId - the remote session id to reattach to.
+   * @param cwd - working directory sent in `session/load`; defaults to the
+   *   connection's spawn cwd.
    */
-  async loadSession(sessionId: string): Promise<boolean> {
+  async loadSession(sessionId: string, cwd?: string): Promise<boolean> {
     if (!this.loadSessionAdvertised) return false
     this.loadingSessions.add(sessionId)
     try {
       await withTimeout(
-        this.conn.loadSession({ sessionId, cwd: this.spec.cwd, mcpServers: [] }),
+        this.conn.loadSession({ sessionId, cwd: cwd ?? this.spec.cwd, mcpServers: [] }),
         this.spec.sessionTimeoutMs,
         'session/load',
       )
@@ -1314,14 +1316,17 @@ export class AcpConnection {
   /**
    * Create a fresh ACP session for one prompt. The session is removed from the
    * connection's queue map after the generator completes or is abandoned.
+   * @param cwd - working directory sent in `session/new`; defaults to the
+   *   connection's spawn cwd.
    * @returns the remote session id.
    */
-  async newSession(): Promise<string> {
-    this.traceEvent('send', 'session/new', `cwd=${this.spec.cwd}`, undefined, { cwd: this.spec.cwd, mcpServers: [] })
+  async newSession(cwd?: string): Promise<string> {
+    const sessionCwd = cwd ?? this.spec.cwd
+    this.traceEvent('send', 'session/new', `cwd=${sessionCwd}`, undefined, { cwd: sessionCwd, mcpServers: [] })
     let session: NewSessionResponse
     try {
       session = await this.withAuthRetry('session/new', () =>
-        this.conn.newSession({ cwd: this.spec.cwd, mcpServers: [] }))
+        this.conn.newSession({ cwd: sessionCwd, mcpServers: [] }))
     } catch (error: unknown) {
       // A timed-out session/new on a serial server means its request queue is
       // wedged behind a dead prompt — tell the owner to rebuild instead of

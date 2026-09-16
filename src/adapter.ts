@@ -86,6 +86,14 @@ export interface AcpAdapterOptions {
    */
   resolveSessionMode?: (() => string | undefined) | undefined
   /**
+   * Resolve the working directory sent in this stream's `session/new` (and
+   * `session/load`) — the calling session's workspace. Called once per
+   * stream, like {@link resolveSessionMode}, because the calling session is
+   * only reachable on the adapter's async context, not at connection
+   * construction. `undefined` falls back to the connection's spawn cwd.
+   */
+  resolveSessionCwd?: (() => string | undefined) | undefined
+  /**
    * Whether to surface ACP-side subagent activity for this stream. Resolved
    * once per stream, like {@link AcpAdapterOptions.resolveSessionMode}, because
    * it is read from the calling session's permission state — which is only
@@ -515,6 +523,9 @@ export class AcpAdapter extends LlmAdapter {
 
     const permissionRequester = this.config.permissionRequester?.()
     const subagentNotice = this.config.subagentNotice?.() ?? 'notice'
+    // The calling session's workspace becomes the ACP session's cwd; without
+    // an initiator (probes, one-shot calls) the connection's spawn cwd stands.
+    const sessionCwd = this.config.resolveSessionCwd?.()
     try {
       await this.config.connection.ready
     } catch (error: unknown) {
@@ -544,7 +555,7 @@ export class AcpAdapter extends LlmAdapter {
     // session and the stale store entry is dropped.
     if (existing === undefined && dshSessionId !== undefined) {
       const stored = this.sessionStore.get(dshSessionId)
-      if (stored !== undefined && await this.config.connection.loadSession(stored.acpSessionId)) {
+      if (stored !== undefined && await this.config.connection.loadSession(stored.acpSessionId, sessionCwd)) {
         this.sessionMap.set(dshSessionId, stored)
         existing = stored
       } else {
@@ -578,7 +589,7 @@ export class AcpAdapter extends LlmAdapter {
       if (existing !== undefined && dshSessionId !== undefined) {
         this.sessionMap.delete(dshSessionId)
       }
-      sessionId = await this.createSession(options)
+      sessionId = await this.createSession(options, sessionCwd)
       prompt = renderPrompt(options, includeHarnessPrompt, includeRuntimeContext)
     }
 
@@ -816,9 +827,9 @@ export class AcpAdapter extends LlmAdapter {
   }
 
   /** Create a fresh ACP session, throwing `LlmError` on failure. */
-  private async createSession(_options: GenerateOptions): Promise<string> {
+  private async createSession(_options: GenerateOptions, cwd?: string): Promise<string> {
     try {
-      return await this.config.connection.newSession()
+      return await this.config.connection.newSession(cwd)
     } catch (error: unknown) {
       throw new LlmError(
         `llm-acp: failed to create ACP session: ${error instanceof Error ? error.message : String(error)}`,

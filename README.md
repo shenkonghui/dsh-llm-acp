@@ -164,7 +164,7 @@ binary 类型使用可执行文件的 basename，这样已安装到 PATH 的二�
 
 每次 `stream()` 调用：
 
-1. **Session 获取**：请求携带 dsh `sessionId` 且已有复用映射（历史未变短）时，复用同一 ACP session；否则创建新的 ACP `session/new`（使用配置的 `cwd`）。历史变短（compaction）也走新建。
+1. **Session 获取**：请求携带 dsh `sessionId` 且已有复用映射（历史未变短）时，复用同一 ACP session；否则创建新的 ACP `session/new`，`cwd` 取调用会话的工作目录（无会话上下文时用连接的启动 `cwd`）。历史变短（compaction）也走新建。
 2. **消息发送**：复用 session 时仅发送增量用户消息（跳过已发送的历史和 assistant 响应）；新建 session 时将 harness 的 `messages` 和 `system` prompt 渲染为一条 ACP 文本块。
 3. 发送 `session/prompt`，将流式 `agent_message_chunk` 更新作为 `text-delta` chunk 传输。
 4. 当 `emitReasoning` 开启时，`agent_thought_chunk` 更新转换为 `reasoning-delta` chunk。

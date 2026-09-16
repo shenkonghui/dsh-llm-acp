@@ -763,6 +763,17 @@ export function apply(ctx: Context, config: Config): void {
         return (preset !== undefined ? modeMap[preset] : undefined)
           ?? (sandbox !== undefined ? modeMap[sandbox] : undefined)
       },
+      // The calling session's workspace is the ACP session's working
+      // directory, not the harness launch directory — a host whose own cwd is
+      // unrelated (desktop app, service) would otherwise run every agent
+      // session in the wrong place. Read per stream from the live session;
+      // an absent or deleted directory falls back to the connection cwd.
+      resolveSessionCwd: () => {
+        const agent = ctx.get('agents')?.currentInitiator()
+        const session = agent?.session as Session | undefined
+        const sessionCwd = session?.header?.cwd
+        return sessionCwd !== undefined && isDirectory(sessionCwd) ? sessionCwd : undefined
+      },
       permissionRequester: () => {
         const agents = ctx.get('agents')
         const agent = agents?.currentInitiator()

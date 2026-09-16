@@ -95,6 +95,14 @@ export interface AcpAdapterOptions {
      */
     resolveSessionMode?: (() => string | undefined) | undefined;
     /**
+     * Resolve the working directory sent in this stream's `session/new` (and
+     * `session/load`) — the calling session's workspace. Called once per
+     * stream, like {@link resolveSessionMode}, because the calling session is
+     * only reachable on the adapter's async context, not at connection
+     * construction. `undefined` falls back to the connection's spawn cwd.
+     */
+    resolveSessionCwd?: (() => string | undefined) | undefined;
+    /**
      * Whether to surface ACP-side subagent activity for this stream. Resolved
      * once per stream, like {@link AcpAdapterOptions.resolveSessionMode}, because
      * it is read from the calling session's permission state — which is only

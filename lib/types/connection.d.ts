@@ -307,8 +307,10 @@ export declare class AcpConnection {
      * `loadSession` or the load fails (unknown/deleted session), so the caller
      * falls back to a fresh session.
      * @param sessionId - the remote session id to reattach to.
+     * @param cwd - working directory sent in `session/load`; defaults to the
+     *   connection's spawn cwd.
      */
-    loadSession(sessionId: string): Promise<boolean>;
+    loadSession(sessionId: string, cwd?: string): Promise<boolean>;
     /**
      * Server identity published in the `initialize` response: the agent's
      * reported name/version and the negotiated ACP protocol version. Returns
@@ -468,9 +470,11 @@ export declare class AcpConnection {
     /**
      * Create a fresh ACP session for one prompt. The session is removed from the
      * connection's queue map after the generator completes or is abandoned.
+     * @param cwd - working directory sent in `session/new`; defaults to the
+     *   connection's spawn cwd.
      * @returns the remote session id.
      */
-    newSession(): Promise<string>;
+    newSession(cwd?: string): Promise<string>;
     /**
      * List existing ACP sessions (`session/list`). Only available when the agent
      * advertises the `session/list` capability. Returns `undefined` when the

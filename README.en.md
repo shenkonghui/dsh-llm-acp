@@ -96,7 +96,7 @@ Binary entries use the executable basename so a PATH-installed binary is found d
 
 Each `stream()` call:
 
-1. **Session acquisition**: when the request carries a dsh `sessionId` and a reuse mapping exists (history not shrunken), the same ACP session is reused; otherwise a fresh ACP `session/new` is created with the configured `cwd`. A shrunken history (compaction) also creates fresh.
+1. **Session acquisition**: when the request carries a dsh `sessionId` and a reuse mapping exists (history not shrunken), the same ACP session is reused; otherwise a fresh ACP `session/new` is created with the calling session's workspace as `cwd` (the connection's spawn `cwd` when there is no session context). A shrunken history (compaction) also creates fresh.
 2. **Message sending**: on a reused session only the new user messages are sent (already-sent history and assistant responses are skipped); on a fresh session the harness `messages` plus `system` prompt are rendered into one ACP text block.
 3. Sends `session/prompt` and streams `agent_message_chunk` updates as `text-delta` chunks.
 4. When `emitReasoning` is on, `agent_thought_chunk` updates become `reasoning-delta` chunks.
