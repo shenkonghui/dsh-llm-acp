@@ -1,0 +1,48 @@
+# Build the npm tarball from the committed lib/ artifacts and publish a
+# GitHub release for the tag. No dependency install: `@deepseek-ai/dsh-*`
+# deps resolve through a local link (see pnpm-workspace.yaml) that only
+# exists on a dev checkout, while lib/ is committed — `npm pack` needs only
+# package.json + the built files.
+#
+# Triggers:
+# - pushing a new `v*` tag (the normal release flow)
+# - workflow_dispatch with a tag name, to (re)build a release for a tag that
+#   predates this workflow (e.g. v0.1.3)
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to release (e.g. v0.1.3)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Pack the npm tarball
+        run: npm pack
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --generate-notes \
+            *.tgz
