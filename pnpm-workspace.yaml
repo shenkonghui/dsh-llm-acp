@@ -1,2 +1,4 @@
+packages:
+  - .
 overrides:
   '@deepseek-ai/dsh-credentials': link:../deepseek-harness/packages/credentials/credentials

@@ -22,7 +22,7 @@
  */
 import { LlmAdapter } from '@deepseek-ai/dsh-llm';
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, PreparedAdapterCall, StreamChunk } from '@deepseek-ai/dsh-llm';
-import type { Message } from '@deepseek-ai/dsh-llm';
+import type { RequestMessage } from '@deepseek-ai/dsh-llm';
 import { AcpConnection } from './connection.ts';
 import type { AcpPermissionRequester, AcpPlanItem, AcpSubagentNotice } from './connection.ts';
 /**
@@ -167,7 +167,7 @@ export interface AcpAdapterOptions {
  * receive, given the two include switches. Assistant messages are never
  * stripped; the preamble may arrive as either a `user` or a `system` role
  * message (both render as `[user]` on the ACP wire). */
-export declare function isDshAddition(message: Message, includeHarnessPrompt: boolean, includeRuntimeContext: boolean): boolean;
+export declare function isDshAddition(message: RequestMessage, includeHarnessPrompt: boolean, includeRuntimeContext: boolean): boolean;
 /**
  * Extract the session title directly from the harness's title-generation
  * prompt instead of spending an ACP session + model round on reformatting
@@ -180,7 +180,7 @@ export declare function isDshAddition(message: Message, includeHarnessPrompt: bo
  * shape; a reworded prompt degrades to the model round-trip, never to a wrong
  * title. Upgrade path: a structured title-request field on GenerateOptions.
  */
-export declare function sessionTitleFromMessages(messages: readonly Message[]): string | undefined;
+export declare function sessionTitleFromMessages(messages: readonly RequestMessage[]): string | undefined;
 /** One reused ACP session: remote id + how many dsh messages have been sent. */
 interface ReusedSession {
     acpSessionId: string;

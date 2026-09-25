@@ -166,7 +166,7 @@ interface DiscoveredModel {
   id: string
   name: string
   /** Carries the ACP protocol version on the `acp-info-<id>` route. */
-  contextWindow?: number
+  contextWindow?: number | undefined
 }
 
 /** Live server identity published by the ACP `initialize` response. */

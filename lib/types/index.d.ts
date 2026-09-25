@@ -1,7 +1,8 @@
 /**
  * Register {@link AcpAdapter} instances on `ctx.llm` that delegate model calls
  * to external ACP servers over JSON-RPC stdio. The plugin reads configured
- * servers from the `llm-acp` settings namespace; each server spawns one
+ * servers from the volatile `servers` config field (the `llm-acp` settings
+ * namespace); each server spawns one
  * long-lived child process and becomes a provider route `acp-<id>`. Servers
  * can be added or removed dynamically through the settings UI without restart.
  *
@@ -9,7 +10,7 @@
  * metadata (see `docs/postmortem/0001-acp-default-export-drops-inject.md`).
  * @module @deepseek-ai/dsh-llm-acp
  */
-import type { Context } from '@deepseek-ai/cordis';
+import type { Context, Volatile } from '@deepseek-ai/cordis';
 import z from '@deepseek-ai/schemastery';
 import registryData from './registry.json';
 export { AcpAdapter } from './adapter.ts';
@@ -96,14 +97,19 @@ export interface Config {
      * user message. Default `false` — ACP agents assemble their own system
      * prompt, so the harness copy is duplicate context that persists in the
      * agent's history and is resent on every turn.
+     *
+     * Volatile: the ACP Servers settings page edits this field live through
+     * `remote.settings.mutate('llm-acp', …)` without remounting the plugin.
      */
-    includeHarnessPrompt?: boolean;
+    includeHarnessPrompt: Volatile<boolean>;
     /**
      * Whether to include the DSH runtime-context snapshots and the skills
      * `<system-reminder>` catalog in the prompt (default `false`). These are
      * DSH-specific concepts an external ACP agent cannot act on.
+     *
+     * Volatile, like {@link Config.includeHarnessPrompt}.
      */
-    includeRuntimeContext?: boolean;
+    includeRuntimeContext: Volatile<boolean>;
     /** Whether to translate `agent_thought_chunk` into `reasoning-delta` chunks (default `true`). */
     emitReasoning?: boolean;
     /** Whether to surface extension progress notifications as reasoning blocks (default `false`). */
@@ -152,11 +158,15 @@ export interface Config {
      */
     cwd?: string;
     /**
-     * Inline server entries composed at load time (in addition to settings).
-     * Each entry becomes a provider route `acp-<id>`.
+     * Server entries keyed by id; each becomes a provider route `acp-<id>`.
+     *
+     * Volatile: initial entries come from the composition `config`, and the ACP
+     * Servers settings page later edits the same cell through
+     * `remote.settings.mutate('llm-acp', …)` — `loader/volatile-update` triggers
+     * a reconcile, adding or removing servers without a restart.
      */
-    servers?: Record<string, AcpServerConfig>;
+    servers: Volatile<Record<string, AcpServerConfig>>;
 }
-export declare const Config: z<Config>;
+export declare const Config: z;
 export declare function apply(ctx: Context, config: Config): void;
 //# sourceMappingURL=index.d.ts.map

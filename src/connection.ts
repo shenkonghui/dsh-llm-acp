@@ -254,14 +254,15 @@ async function treeExitsWithin(child: SubprocessHandle, ms: number): Promise<boo
  * @param eofGraceMs - tier-1 window after stdin EOF.
  */
 export async function disposeAcpChild(child: SubprocessHandle, eofGraceMs: number): Promise<void> {
-  if (child.pid <= 0) {
-    await child.done.catch(() => {})
-    return
+  try {
+    if (child.stdin !== undefined && !child.stdin.destroyed) child.stdin.end()
+    if (await treeExitsWithin(child, eofGraceMs)) return
+    child.terminate()
+    await child.waitForExit()
+  } finally {
+    // Observe a spawn/transport failure so `done` never goes unhandled.
+    void child.done.catch(() => {})
   }
-  child.stdin?.end()
-  if (await treeExitsWithin(child, eofGraceMs)) return
-  child.terminate()
-  await child.waitForExit()
 }
 
 /** Whether an RPC failure is the ACP `authRequired` error (code -32000) — the

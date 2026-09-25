@@ -11,7 +11,8 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import { Context } from '@deepseek-ai/cordis'
+import { Context, type Volatile } from '@deepseek-ai/cordis'
+import { createVolatile, updateVolatile } from '@deepseek-ai/cosmokit'
 import Loader from '@deepseek-ai/cordis-plugin-loader'
 import { fileURLToPath } from 'node:url'
 import { existsSync, mkdtempSync, readdirSync, readFileSync } from 'node:fs'
@@ -77,24 +78,13 @@ async function setup(mockEnv: SetupEnv = {}, opts: {
   }
   await ctx.plugin(LlmRuntime)
   await ctx.plugin(LocalSubprocessRuntime)
-  // Minimal `settings` seam stub: the plugin's `installSection` call fails on
-  // `ctx.settings === undefined`, which aborts `apply` and rolls back every
-  // registered adapter. The holder stays mutable so a test can act as the
-  // settings UI and drive a reconcile.
-  let holder: { servers: Record<string, unknown> } = { servers: {} }
-  let notifyChange: (() => void) | undefined
+  // Minimal `settings` seam stub: the plugin's `settings.configure` call fails
+  // on `ctx.settings === undefined`, which aborts `apply` and rolls back every
+  // registered adapter. Server updates instead go through the volatile
+  // `servers` cell plus a `loader/volatile-update` emit — the same commit the
+  // loader performs after a real `remote.settings.mutate` write.
   ctx.provide('settings' as never, {
-    installSection(
-      _owner: unknown,
-      _ns: string,
-      _schema: unknown,
-      entry: unknown,
-      hooks: { setSource: (source: () => unknown) => void; onChange: () => void },
-    ) {
-      holder = entry as { servers: Record<string, unknown> }
-      notifyChange = hooks.onChange
-      hooks.setSource(() => holder)
-    },
+    configure: () => () => {},
   } as never)
   const server = opts.server ?? { command: process.execPath, args: [mockServer] }
   if (opts.warnSink !== undefined) {
@@ -105,7 +95,7 @@ async function setup(mockEnv: SetupEnv = {}, opts: {
       original(...(args as [unknown]))
     }
   }
-  await ctx.plugin(acp, {
+  const fiber = await ctx.plugin(acp, {
     emitReasoning: opts.emitReasoning ?? false,
     env: mockEnv,
     ...opts.config,
@@ -120,11 +110,12 @@ async function setup(mockEnv: SetupEnv = {}, opts: {
       },
     },
   })
-  // Act as the settings UI: replace the stored server map and notify, so the
-  // plugin reconciles exactly as it would after a real write.
+  // Act as the settings UI: swap the volatile `servers` cell and emit the
+  // loader event, so the plugin reconciles exactly as after a real write.
   const applyServers = (servers: Record<string, unknown>): void => {
-    holder.servers = servers
-    notifyChange?.()
+    const cell = (fiber.config as { servers: Volatile<unknown> }).servers
+    updateVolatile(cell, createVolatile(servers))
+    fiber.ctx.emit(fiber.ctx, 'loader/volatile-update', [['servers']])
   }
   return Object.assign(ctx, { applyServers })
 }
@@ -1200,21 +1191,21 @@ describe('dsh-llm-acp', () => {
       const resultBlock = (id: string) => {
         const result = results.find(r => (r.data as { message: { source: { callId: string } } }).message.source.callId === id)!
         return result.data as {
-          message: { content: Array<{ isError: boolean; content: Array<{ text: string }> }> }
+          message: { isError?: boolean; content: Array<{ type: string; text: string }> }
           error?: { name: string; code: string }
         }
       }
       const ok = resultBlock('tool-ok')
-      expect(ok.message.content[0]!.isError).toBe(false)
-      expect(ok.message.content[0]!.content).toEqual([{ type: 'text', text: 'file body' }])
+      expect(ok.message.isError).toBe(false)
+      expect(ok.message.content).toEqual([{ type: 'text', text: 'file body' }])
       expect(ok.error).toBeUndefined()
       const fail = resultBlock('tool-fail')
-      expect(fail.message.content[0]!.isError).toBe(true)
-      expect(fail.message.content[0]!.content).toEqual([{ type: 'text', text: 'exit 1' }])
+      expect(fail.message.isError).toBe(true)
+      expect(fail.message.content).toEqual([{ type: 'text', text: 'exit 1' }])
       expect(fail.error).toEqual({ name: 'AcpToolError', code: 'ACP_TOOL_FAILED' })
       const pending = resultBlock('tool-pending')
-      expect(pending.message.content[0]!.isError).toBe(false)
-      expect(pending.message.content[0]!.content).toEqual([])
+      expect(pending.message.isError).toBe(false)
+      expect(pending.message.content).toEqual([])
     } finally {
       await ctx.fiber.dispose()
     }
@@ -1293,7 +1284,9 @@ describe('dsh-llm-acp', () => {
         messages: [message],
       })))
       expect(finishChunk(chunks).reason.kind).toBe('stop')
-      expect(warnings).toEqual([])
+      // Ignore the platform containment warning subprocess-local logs on
+      // hosts without a user-systemd scope; only plugin diagnostics count.
+      expect(warnings.filter(w => !w.startsWith('subprocess-local is using weaker process-tree containment'))).toEqual([])
       const assembler = new BlockAssembler()
       for (const chunk of chunks) assembler.push(chunk)
       expect(assembler.blocks().some(block => block.type === 'tool-call')).toBe(false)
