@@ -2,25 +2,29 @@
  * ACP Servers settings surface, browser half. Registers one settings section
  * that lets the user browse the ACP registry and add/remove ACP agent servers,
  * plus a conversation view tab that inspects recent ACP protocol interactions.
- * Servers are stored in the `llm-acp` settings namespace and picked up by the
- * host-side `@deepseek-ai/dsh-llm-acp` plugin.
+ * Servers are stored in the `llm-acp` settings namespace (the host plugin's
+ * volatile config fields) of the host-side `@deepseek-ai/dsh-llm-acp` plugin.
  */
 
-import type {} from '@deepseek-ai/dsh-client-connection/client'
+// Type-only: the remote service merge (ctx.remote).
+import type {} from '@deepseek-ai/dsh-api-gateway/client'
 // Type-only: pulls the locale plugin's Context merge (ctx.locale).
 import type {} from '@deepseek-ai/dsh-client-locale/client'
-// Type-only: the slots service merge (ctx.slots) and props-share types.
-import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
+// Type-only: the slots service merge (ctx.slots).
+import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
+// The client context is the cordis Context with the above service merges.
+import type { Context as ClientContext } from '@deepseek-ai/cordis'
 // Type-only: the settings shell's SlotMap merge (the 'settings.section' entry).
 import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
 // Type-only: the sidebar shell's SlotMap merge (sidebar.footer.action entry).
 import type {} from '@deepseek-ai/dsh-client-ui-sidebar/client'
 // Type-only: the conversation shell's SlotMap merge (conversation.view entry).
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
-// Type-only: the ctx.remote merge and forwarded-event key face.
+// Type-only: the remote.settings / remote.llm namespace merges and wire types.
 import type {} from '@deepseek-ai/dsh-api-remotes/client'
 import { AcpSettingsSection } from './AcpSettingsSection.tsx'
-import type { AcpSettingsPathOp, AcpSettingsSectionApi, AcpSettingsSectionInjected } from './AcpSettingsSection.tsx'
+import type { AcpSettingsSectionApi, AcpSettingsSectionInjected } from './AcpSettingsSection.tsx'
+import type { SettingsPathOpView } from '@deepseek-ai/dsh-api-remotes/client'
 import { AcpProtocolView } from './AcpProtocolView.tsx'
 import type { AcpProtocolViewInjected } from './AcpProtocolView.tsx'
 import { AcpAuthBanner } from './AcpAuthBanner.tsx'
@@ -54,24 +58,21 @@ export function apply(ctx: ClientContext): void {
   ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'ui-settings-acp: copy dictionaries')
 
   const t = ctx.locale.bind(NS) as (key: AcpSettingsLocaleKey) => string
-  // `TypertClientRemote` does not declare the settings/llm remote faces at this
-  // dsh version; both exist at runtime, so narrow through the section's api face.
-  const remote = ctx.remote as ClientContext['remote'] & {
-    settings: {
-      describe: AcpSettingsSectionApi['describeSettings']
-      mutate: AcpSettingsSectionApi['mutateSettings']
-    }
-    llm: {
-      discoverModels: (settingsNs: string, request: { provider: string }) => ReturnType<AcpSettingsSectionApi['discoverModels']>
-    }
+  const remote = ctx.remote
+  // The llm discovery wire type makes `name` optional; the section's face
+  // requires it, so the id stands in at the seam.
+  const discoverModels: AcpSettingsSectionApi['discoverModels'] = async (settingsNs, provider) => {
+    const result = await remote.llm.discoverModels(settingsNs, { provider })
+    if (!result.ok) return result
+    return { ok: true, value: result.value.map(m => ({ id: m.id, name: m.name ?? m.id, contextWindow: m.contextWindow })) }
   }
   const injected = (): AcpSettingsSectionInjected => ({
     registry: registryData as { version: string; agents: AcpSettingsSectionInjected['registry']['agents'] },
     api: {
       describeSettings: () => remote.settings.describe(),
       mutateSettings: (ns, ops, expectedRevision) =>
-        remote.settings.mutate(ns, ops as AcpSettingsPathOp[], expectedRevision),
-      discoverModels: (settingsNs, provider) => remote.llm.discoverModels(settingsNs, { provider }),
+        remote.settings.mutate(ns, ops as SettingsPathOpView[], expectedRevision),
+      discoverModels,
     },
     settingsNs: LLM_ACP_NS,
   })
@@ -89,8 +90,8 @@ export function apply(ctx: ClientContext): void {
   const footerApi: AcpSettingsSectionApi = {
     describeSettings: () => remote.settings.describe(),
     mutateSettings: (ns, ops, expectedRevision) =>
-      remote.settings.mutate(ns, ops as AcpSettingsPathOp[], expectedRevision),
-    discoverModels: (settingsNs, provider) => remote.llm.discoverModels(settingsNs, { provider }),
+      remote.settings.mutate(ns, ops as SettingsPathOpView[], expectedRevision),
+    discoverModels,
   }
   ctx.slots.inject('sidebar.footer.action', () => ctx.slots.register({
     name: 'sidebar.footer.action',

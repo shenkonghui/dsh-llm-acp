@@ -51,21 +51,23 @@ dsh plugin --profile my-acp remove @deepseek-ai/dsh-llm-acp
 
 ACP server 不单独保存权限策略。它复用会话输入框中的权限列表：`read-only` 和 `workspace-write` 将敏感操作转发到 harness 审批界面，`danger-full-access` 自动允许。
 
-也可以直接在 `settings.yaml` 中配置：
+也可以直接在 cordis patch 的插件 `config` 中预置服务器（`servers` 是 volatile 字段，设置页的写入与这里的初值都会落在同一个 cell 上）：
 
 ```yaml
-llm-acp:
-  servers:
-    devin:
-      command: devin
-      args:
-        - acp
-      name: Devin
-      env:
-        DEEPSEEK_API_KEY: sk-xxx
-      models:
-        - deepseek-chat
-        - deepseek-reasoner
+- id: llm-acp
+  name: '@deepseek-ai/dsh-llm-acp'
+  config:
+    servers:
+      devin:
+        command: devin
+        args:
+          - acp
+        name: Devin
+        env:
+          DEEPSEEK_API_KEY: sk-xxx
+        models:
+          - deepseek-chat
+          - deepseek-reasoner
 ```
 
 ## 工作原理
@@ -77,7 +79,7 @@ llm-acp:
 ```
 dsh harness 启动
   └─ apply(ctx, config)
-       ├─ 读取 llm-acp 设置命名空间 + 内联 config.servers，合并成服务器列表
+       ├─ 读取 config.servers volatile cell（cordis 初值 + 设置页写入）得到服务器列表
        ├─ 对每个服务器 createServer()：
        │    ├─ resolveNpxShortcut()：npx -y <pkg> 若 bin 已在 PATH 则直接用 bin
        │    ├─ new AcpConnection()：spawn 长生命周期子进程（stdin/stdout JSON-RPC）
@@ -117,7 +119,7 @@ harness 请求模型
 ```
 Web UI「设置 → ACP 服务」
   ├─ 浏览内置 ACP 注册表（registry.json）→ 点「添加」写入 llm-acp.servers
-  ├─ 宿主端监听 settings 变更 → reconcileServers() 增删/重建连接（指纹比对）
+  ├─ 宿主端监听 loader/volatile-update → reconcileServers() 增删/重建连接（指纹比对）
   ├─ 模型发现：registerModelDiscovery 路由 acp-<id> → 临时 session/new 读 configOptions
   ├─ acp-info-<id>：只读 initialize 身份（agent 名/版本），不建 session
   └─ acp-resolve-<bin>：探测 PATH，把 npx 形式改存本地 bin 路径
@@ -127,11 +129,11 @@ Web UI「设置 → ACP 服务」
 
 ### 宿主端 — LLM 适配器
 
-`apply(ctx, config)` 从 `llm-acp` 设置命名空间读取已配置的服务器列表。对每个服务器，启动一个长生命周期的子进程，通过 stdin/stdout 建立 ACP `ClientSideConnection`，并在 `ctx.llm` 上注册路由为 `acp-<server-id>` 的 `AcpAdapter`。每次模型调用会创建新的 ACP session，将完整对话作为一条用户消息发送，并将流式 `agent_message_chunk` 更新转换为 harness 的 `StreamChunk`。
+`apply(ctx, config)` 从 `llm-acp` 的 volatile `servers` 字段读取已配置的服务器列表。对每个服务器，启动一个长生命周期的子进程，通过 stdin/stdout 建立 ACP `ClientSideConnection`，并在 `ctx.llm` 上注册路由为 `acp-<server-id>` 的 `AcpAdapter`。每次模型调用会创建新的 ACP session，将完整对话作为一条用户消息发送，并将流式 `agent_message_chunk` 更新转换为 harness 的 `StreamChunk`。
 
 ### 客户端 — 设置界面
 
-浏览器端注册一个 `settings.section` slot，渲染 ACP 注册表浏览器和"我的服务"列表。添加服务器时会将其持久化到 `llm-acp` 设置命名空间；宿主端监听变更并同步更新 provider 目录。
+浏览器端注册一个 `settings.section` slot，渲染 ACP 注册表浏览器和"我的服务"列表。添加服务器时通过 `remote.settings.mutate('llm-acp', …)` 写入插件的 volatile `servers` 字段；宿主端监听 `loader/volatile-update` 并同步更新 provider 目录。
 
 ### 注册表命令推导
 

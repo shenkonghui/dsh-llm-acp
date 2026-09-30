@@ -2,10 +2,10 @@
  * ACP Servers settings surface, browser half. Registers one settings section
  * that lets the user browse the ACP registry and add/remove ACP agent servers,
  * plus a conversation view tab that inspects recent ACP protocol interactions.
- * Servers are stored in the `llm-acp` settings namespace and picked up by the
- * host-side `@deepseek-ai/dsh-llm-acp` plugin.
+ * Servers are stored in the `llm-acp` settings namespace (the host plugin's
+ * volatile config fields) of the host-side `@deepseek-ai/dsh-llm-acp` plugin.
  */
-import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client';
+import type { Context as ClientContext } from '@deepseek-ai/cordis';
 export type { AcpSettingsSectionInjected, AcpSettingsSectionProps } from './AcpSettingsSection.tsx';
 export type { AcpRegistryAgent, AcpServerEntry } from './AcpSettingsSection.tsx';
 export type { AcpProtocolViewInjected, AcpProtocolViewProps } from './AcpProtocolView.tsx';

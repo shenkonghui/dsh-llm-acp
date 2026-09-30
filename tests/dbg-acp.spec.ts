@@ -24,7 +24,7 @@ it('debug', async () => {
   await ctx.plugin(LlmRuntime)
   await ctx.plugin(LocalSubprocessRuntime)
   ctx.provide('settings' as never, {
-    installSection(_o: unknown, _n: string, _s: unknown, entry: unknown, hooks: any) { hooks.setSource(() => entry) },
+    configure: () => () => {},
   } as never)
   await ctx.plugin(acp, {
     emitReasoning: false,

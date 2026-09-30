@@ -96,7 +96,7 @@ interface DiscoveredModel {
     id: string;
     name: string;
     /** Carries the ACP protocol version on the `acp-info-<id>` route. */
-    contextWindow?: number;
+    contextWindow?: number | undefined;
 }
 /** Render the ACP Servers settings section. */
 export declare function AcpSettingsSection(props: AcpSettingsSectionProps): import("react").JSX.Element;
