@@ -24,7 +24,7 @@
 import { LlmAdapter, LlmError } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, PreparedAdapterCall, StreamChunk } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock as AcpContentBlock } from '@agentclientprotocol/sdk'
-import type { Message } from '@deepseek-ai/dsh-llm'
+import type { RequestMessage } from '@deepseek-ai/dsh-llm'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { AcpConnection } from './connection.ts'
@@ -161,8 +161,10 @@ export interface AcpAdapterOptions {
   sessionStorePath?: string | undefined
 }
 
-/** Extract the concatenated text of a harness message (non-text blocks contribute nothing). */
-function messageText(message: Message): string {
+/** Extract the concatenated text of a request message (non-text blocks contribute nothing).
+ * Identity-free `RequestUserInput` entries carry the same `content` shape as a
+ * durable `UserMessage`, so both are read the same way. */
+function messageText(message: RequestMessage): string {
   return message.content
     .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
     .map(block => block.text)
@@ -189,7 +191,7 @@ const SKILLS_REMINDER_RE = /^<system-reminder>/
  * receive, given the two include switches. Assistant messages are never
  * stripped; the preamble may arrive as either a `user` or a `system` role
  * message (both render as `[user]` on the ACP wire). */
-export function isDshAddition(message: Message, includeHarnessPrompt: boolean, includeRuntimeContext: boolean): boolean {
+export function isDshAddition(message: RequestMessage, includeHarnessPrompt: boolean, includeRuntimeContext: boolean): boolean {
   if (message.role === 'assistant') return false
   const text = messageText(message)
   if (!includeHarnessPrompt && HARNESS_PREAMBLE_RE.test(text)) return true
@@ -223,7 +225,7 @@ function renderPrompt(options: GenerateOptions, includeHarnessPrompt: boolean, i
  * user turn; multiple unsent user turns would be concatenated into one prompt.
  */
 function renderPromptDelta(
-  messages: readonly Message[],
+  messages: readonly RequestMessage[],
   fromIndex: number,
   includeHarnessPrompt: boolean,
   includeRuntimeContext: boolean,
@@ -256,7 +258,7 @@ const MAX_TITLE_LENGTH = 60
  * shape; a reworded prompt degrades to the model round-trip, never to a wrong
  * title. Upgrade path: a structured title-request field on GenerateOptions.
  */
-export function sessionTitleFromMessages(messages: readonly Message[]): string | undefined {
+export function sessionTitleFromMessages(messages: readonly RequestMessage[]): string | undefined {
   for (let i = messages.length - 1; i >= 0; i--) {
     const message = messages[i]
     if (message === undefined || message.role !== 'user') continue

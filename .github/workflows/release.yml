@@ -1,8 +1,8 @@
 # Build the npm tarball from the committed lib/ artifacts and publish a
-# GitHub release for the tag. No dependency install: `@deepseek-ai/dsh-*`
-# deps resolve through a local link (see pnpm-workspace.yaml) that only
-# exists on a dev checkout, while lib/ is committed — `npm pack` needs only
-# package.json + the built files.
+# GitHub release for the tag. No dependency install: lib/ is committed, and
+# `npm pack` needs only package.json + the built files, so the workspace
+# resolves nothing here. (The peer/dev `@deepseek-ai/dsh-*` versions are
+# pinned to the dsh release this plugin was built against.)
 #
 # Triggers:
 # - pushing a new `v*` tag (the normal release flow)

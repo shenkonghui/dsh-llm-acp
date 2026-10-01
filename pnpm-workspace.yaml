@@ -1,2 +1,10 @@
-overrides:
-  '@deepseek-ai/dsh-credentials': link:../deepseek-harness/packages/credentials/credentials
+# pnpm >=10 refuses to run a dependency's install script until it is listed
+# here. These ship the native binaries the host-side test suite needs: esbuild
+# (vitest), koffi and node-pty (dsh-subprocess-local's PTY backend), and the
+# reviewed subprocess-local postinstall that restores the macOS spawn helper's
+# executable bit.
+allowBuilds:
+  '@deepseek-ai/dsh-subprocess-local': true
+  esbuild: true
+  koffi: true
+  node-pty: true

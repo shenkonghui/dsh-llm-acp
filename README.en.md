@@ -20,6 +20,8 @@ dsh plugin --profile my-acp add ./dsh-llm-acp
 
 Built artifacts (`lib/`) are committed to the repository, so no build scripts run during install.
 
+> Compatibility: this release targets **dsh 0.2.0** (`0.2.0-rc.2`). It uses that release's configuration model — the plugin's own Config is its settings namespace, live-editable fields are declared volatile, and reconciliation follows `loader/volatile-update`. On dsh 0.1.x use `@deepseek-ai/dsh-llm-acp@0.1.6`.
+
 ## Uninstall
 
 ```sh
@@ -38,32 +40,33 @@ In the **My Servers** tab, click **Edit** on any configured server to:
 
 ACP servers do not store separate permission policies. They use the existing session permission list: `read-only` and `workspace-write` forward sensitive operations to the harness approval UI, while `danger-full-access` allows them automatically.
 
-Alternatively, configure servers directly in `settings.yaml`:
+Alternatively, configure servers directly in the profile's `cordis.patch.yml`, overriding the `config` of this plugin's own row (since 0.2.0 the plugin's Config *is* the settings namespace, and the settings page writes there too):
 
 ```yaml
-llm-acp:
-  servers:
-    devin:
-      command: devin
-      args:
-        - acp
-      name: Devin
-      env:
-        DEEPSEEK_API_KEY: sk-xxx
-      models:
-        - deepseek-chat
-        - deepseek-reasoner
+- id: llm-acp
+  config:
+    servers:
+      devin:
+        command: devin
+        args:
+          - acp
+        name: Devin
+        env:
+          DEEPSEEK_API_KEY: sk-xxx
+        models:
+          - deepseek-chat
+          - deepseek-reasoner
 ```
 
 ## How it works
 
 ### Host half — LLM adapter
 
-`apply(ctx, config)` reads the `llm-acp` settings namespace for configured servers. For each server, it spawns a long-lived child process, opens an ACP `ClientSideConnection` over stdin/stdout, and registers an `AcpAdapter` on `ctx.llm` under route `acp-<server-id>`. Each model call opens a fresh ACP session, sends the full conversation as one user message, and translates streamed `agent_message_chunk` updates into harness `StreamChunk`s.
+`apply(ctx, config)` reads the configured servers from its own Config's `servers` reference. For each server, it spawns a long-lived child process, opens an ACP `ClientSideConnection` over stdin/stdout, and registers an `AcpAdapter` on `ctx.llm` under route `acp-<server-id>`. Each model call opens a fresh ACP session, sends the full conversation as one user message, and translates streamed `agent_message_chunk` updates into harness `StreamChunk`s.
 
 ### Client half — Settings UI
 
-The browser half registers a `settings.section` slot that renders the ACP registry browser and a "My Servers" list. Adding a server persists it to the `llm-acp` settings namespace; the host half observes the change and reconciles its provider directory.
+The browser half registers a `settings.section` slot that renders the ACP registry browser and a "My Servers" list. Adding a server writes it into the plugin Config's `servers` through the settings service; the host half receives `loader/volatile-update` and reconciles its provider directory without remounting the plugin row.
 
 ### Registry command derivation
 

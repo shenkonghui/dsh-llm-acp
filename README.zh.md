@@ -19,6 +19,8 @@ dsh plugin --profile my-acp add ./dsh-llm-acp
 ```
 
 构建产物（`lib/`）已提交到仓库，安装时无需运行任何构建脚本。
+> 兼容性：本版本面向 **dsh 0.2.0**（`0.2.0-rc.2`）。它使用该版本的配置模型——插件自身的 Config 即设置命名空间，可实时编辑的字段声明为 volatile，并在 `loader/volatile-update` 时做增量同步。dsh 0.1.x 请使用 `@deepseek-ai/dsh-llm-acp@0.1.6`。
+
 
 ## 卸载
 
@@ -36,34 +38,35 @@ dsh plugin --profile my-acp remove @deepseek-ai/dsh-llm-acp
 - 设置**环境变量**用于认证（如 `DEEPSEEK_API_KEY`、`OPENAI_API_KEY`）。每个服务器的环境变量会与插件级 `env` 合并，服务级优先。
 - 选择要**启用的模型**。从服务器发现的模型目录中多选要暴露的模型，不选则启用全部已发现的模型。
 
-也可以直接在 `settings.yaml` 中配置：
+也可以直接写在 profile 的 `cordis.patch.yml` 中，覆盖本插件那一行的 `config`（0.2.0 起插件自身的 Config 就是设置命名空间，设置页的写入同样落到这里）：
 
 ```yaml
-llm-acp:
-  servers:
-    devin:
-      command: devin
-      args:
-        - acp
-      name: Devin
-      env:
-        DEEPSEEK_API_KEY: sk-xxx
-      models:
-        - deepseek-chat
-        - deepseek-reasoner
+- id: llm-acp
+  config:
+    servers:
+      devin:
+        command: devin
+        args:
+          - acp
+        name: Devin
+        env:
+          DEEPSEEK_API_KEY: sk-xxx
+        models:
+          - deepseek-chat
+          - deepseek-reasoner
 ```
 
 ## 工作原理
 
 ### 宿主端 — LLM 适配器
 
-`apply(ctx, config)` 从 `llm-acp` 设置命名空间读取已配置的服务器列表。对每个服务器，启动一个长生命周期的子进程，通过 stdin/stdout 建立 ACP `ClientSideConnection`，并在 `ctx.llm` 上注册路由为 `acp-<server-id>` 的 `AcpAdapter`。
+`apply(ctx, config)` 从本插件 Config 的 `servers` 引用读取已配置的服务器列表。对每个服务器，启动一个长生命周期的子进程，通过 stdin/stdout 建立 ACP `ClientSideConnection`，并在 `ctx.llm` 上注册路由为 `acp-<server-id>` 的 `AcpAdapter`。
 
 适配器自动启用 session 复用：同一 dsh 会话的后续轮次复用连接上仍然活跃的 ACP session，仅发送增量用户消息而非全量历史（ACP agent 为每个 session 维护自己的上下文与对话历史，`session/load` 仅用于跨客户端重启的恢复）。无复用映射（首轮、一次性调用）或历史变短（compaction）时新建 session 并全量发送。模型调用通过 ACP `session/prompt` 发送，流式 `agent_message_chunk` 更新转换为 harness 的 `StreamChunk`。
 
 ### 客户端 — 设置界面
 
-浏览器端注册一个 `settings.section` slot，渲染 ACP 注册表浏览器和"我的服务"列表。添加服务器时会将其持久化到 `llm-acp` 设置命名空间；宿主端监听变更并同步更新 provider 目录。
+浏览器端注册一个 `settings.section` slot，渲染 ACP 注册表浏览器和"我的服务"列表。添加服务器时通过设置服务写入插件 Config 的 `servers`；宿主端收到 `loader/volatile-update` 后同步更新 provider 目录，无需重挂载插件行。
 
 ### 注册表命令推导
 

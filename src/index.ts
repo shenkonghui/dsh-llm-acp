@@ -1,9 +1,12 @@
 /**
  * Register {@link AcpAdapter} instances on `ctx.llm` that delegate model calls
  * to external ACP servers over JSON-RPC stdio. The plugin reads configured
- * servers from the `llm-acp` settings namespace; each server spawns one
- * long-lived child process and becomes a provider route `acp-<id>`. Servers
- * can be added or removed dynamically through the settings UI without restart.
+ * servers from its own Config (`servers`); each server spawns one long-lived
+ * child process and becomes a provider route `acp-<id>`. Servers can be added
+ * or removed through the ACP Servers settings page without a restart: that
+ * page edits the same Config through the settings service, the Loader commits
+ * the volatile reference in place, and `loader/volatile-update` triggers the
+ * reconcile.
  *
  * This plugin uses named exports only; a default would hide its loader
  * metadata (see `docs/postmortem/0001-acp-default-export-drops-inject.md`).
@@ -14,14 +17,17 @@ import { isAbsolute, join, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { accessSync, constants, statSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
-import type { Context } from '@deepseek-ai/cordis'
+import type { Context, Volatile } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type {} from '@deepseek-ai/dsh-agent'
 import type { ApprovalRequestId } from '@deepseek-ai/dsh-user-approval'
 import { MAX_TIMER_DELAY_MS } from '@deepseek-ai/dsh-timeout'
 import type {} from '@deepseek-ai/dsh-settings'
+// Type-only: the loader's `loader/volatile-update` Events merge, the trigger
+// that reconciles servers after a settings-driven config edit.
+import type {} from '@deepseek-ai/cordis-plugin-loader'
 import { createAssistantMessage, createToolResultMessage, ToolCallId } from '@deepseek-ai/dsh-llm'
-import type { AdapterRegistrationHandle, AssistantProvenance, DirectoryRegistrationHandle, LlmConfigurableProvider, LlmDiscoveredModel, LlmModelDiscoveryRequest } from '@deepseek-ai/dsh-llm'
+import type { AdapterRegistrationHandle, AssistantProviderMetadata, DirectoryRegistrationHandle, LlmConfigurableProvider, LlmDiscoveredModel, LlmModelDiscoveryRequest } from '@deepseek-ai/dsh-llm'
 import type { Session, SessionSeq } from '@deepseek-ai/dsh-session'
 import { AcpAdapter } from './adapter.ts'
 import type { AcpToolCallRecorder } from './adapter.ts'
@@ -53,9 +59,19 @@ export type * from './types.ts'
 export { registryData as acpRegistry }
 
 export const name = 'llm-acp'
-export const inject = ['llm', 'subprocess', 'settings']
+/**
+ * Required services. `settings` is deliberately absent: the configuration
+ * surface is optional (a deployment without it simply keeps the composition
+ * value), so the presentation policy is registered through an optional
+ * `ctx.inject` in {@link apply}.
+ */
+export const inject = ['llm', 'subprocess']
 
-/** Settings namespace owned by this plugin. */
+/**
+ * Settings namespace owned by this plugin: the Loader row id its bundle patch
+ * inserts. The ACP Servers page and the model-discovery routes address the
+ * plugin by this name, so it must match `cordis.patch.yml`.
+ */
 const NS = 'llm-acp'
 
 /** Structural deep equality over JSON-compatible data (objects, arrays, primitives). */
@@ -73,33 +89,39 @@ function deepEqualJson(a: unknown, b: unknown): boolean {
   return keys.every(key => key in right && deepEqualJson(left[key], right[key]))
 }
 
-/** One configured ACP server entry in settings. */
+/**
+ * One configured ACP server entry in settings.
+ *
+ * Every member is readonly: the value a running plugin reads comes from the
+ * volatile `servers` reference, whose snapshot is deeply frozen, so a mutable
+ * declaration here would not describe what the plugin actually receives.
+ */
 export interface AcpServerConfig {
   /** The executable to spawn (the external ACP agent server). */
-  command: string
+  readonly command: string
   /** Arguments passed to {@link command}. */
-  args: string[]
+  readonly args: readonly string[]
   /** Human-readable display name for the provider. */
-  name: string
+  readonly name: string
   /**
    * Per-server environment variables merged on top of the plugin-level `env`.
    * Use this for credentials the ACP server needs (e.g. `DEEPSEEK_API_KEY`,
    * `OPENAI_API_KEY`). Per-server values override plugin-level ones.
    */
-  env?: Record<string, string>
+  readonly env?: Record<string, string>
   /**
    * Model ids to expose from this server's discovered catalog. When omitted or
    * empty, every discovered model is exposed. When non-empty, only the listed
    * models (intersected with the discovered set) appear in `listModels`.
    */
-  models?: string[]
+  readonly models?: readonly string[]
   /**
    * User-defined models to expose in addition to (or instead of) the discovered
    * catalog. Each entry has an `id` (sent to the ACP server as the model name)
    * and a `name` (display label). Custom models with the same id as a discovered
    * model override its display name; custom models with unique ids are added.
    */
-  customModels?: { id: string; name: string }[]
+  readonly customModels?: readonly { readonly id: string; readonly name: string }[]
   /**
    * Map a dsh permission preset name (or sandbox mode value) to the ACP
    * session mode applied to this server's sessions, e.g.
@@ -108,7 +130,7 @@ export interface AcpServerConfig {
    * server's mode untouched; servers without a `mode` config option keep
    * their own default.
    */
-  modeMap?: Record<string, string>
+  readonly modeMap?: Record<string, string>
   /**
    * Which advertised ACP auth method to log in with, e.g. `external`. Only
    * needed when the server offers a choice: a single advertised method is
@@ -119,7 +141,7 @@ export interface AcpServerConfig {
    * blocked (and the ACP Servers UI asks) rather than guessing. Changing this
    * rebuilds the server's connection, which is what actually applies it.
    */
-  authMethod?: string
+  readonly authMethod?: string
   /**
    * Map a dsh permission preset name (or sandbox mode value) to whether this
    * server's **subagent activity** is surfaced in the conversation, e.g.
@@ -134,10 +156,19 @@ export interface AcpServerConfig {
    * window, so the one thing worth doing is telling a supervised session that
    * a fan-out happened, while leaving an already fully delegated one quiet.
    */
-  subagentMap?: Record<string, string>
+  readonly subagentMap?: Record<string, string>
 }
 
-/** Plugin config: defaults applied to every spawned ACP server. */
+/**
+ * Plugin config: defaults applied to every spawned ACP server.
+ *
+ * A `Volatile` field is one the profile's configuration layer may edit without
+ * remounting the plugin: the Loader commits the new snapshot into the running
+ * fiber's reference and emits `loader/volatile-update`, which is what lets the
+ * ACP Servers page add or remove a server (and flip an include switch) while
+ * live connections keep running. Every other field is composition-time: a
+ * change to it remounts the row.
+ */
 export interface Config {
   /** Extra environment variables merged on top of the scrubbed parent env. */
   env?: Record<string, string>
@@ -148,13 +179,13 @@ export interface Config {
    * prompt, so the harness copy is duplicate context that persists in the
    * agent's history and is resent on every turn.
    */
-  includeHarnessPrompt?: boolean
+  includeHarnessPrompt: Volatile<boolean>
   /**
    * Whether to include the DSH runtime-context snapshots and the skills
    * `<system-reminder>` catalog in the prompt (default `false`). These are
    * DSH-specific concepts an external ACP agent cannot act on.
    */
-  includeRuntimeContext?: boolean
+  includeRuntimeContext: Volatile<boolean>
   /** Whether to translate `agent_thought_chunk` into `reasoning-delta` chunks (default `true`). */
   emitReasoning?: boolean
   /** Whether to surface extension progress notifications as reasoning blocks (default `false`). */
@@ -203,16 +234,35 @@ export interface Config {
    */
   cwd?: string
   /**
-   * Inline server entries composed at load time (in addition to settings).
-   * Each entry becomes a provider route `acp-<id>`.
+   * Configured server entries keyed by server id; each becomes a provider
+   * route `acp-<id>`. One map, written by whichever layer owns it: the
+   * composition (bundle or profile patch) supplies the base, and the ACP
+   * Servers page edits the live value through the settings service, which
+   * persists it as this row's `config` in the profile patch.
    */
-  servers?: Record<string, AcpServerConfig>
+  servers: Volatile<Record<string, AcpServerConfig>>
 }
 
-export const Config: z<Config> = z.object({
+/** One configured server entry as stored in configuration. */
+const ServerSchema = z.object({
+  command: z.string().required(),
+  args: z.array(z.string()).default([]),
+  name: z.string().required(),
   env: z.dict(z.string()).default({}),
-  includeHarnessPrompt: z.boolean().default(false),
-  includeRuntimeContext: z.boolean().default(false),
+  models: z.array(z.string()).default([]),
+  customModels: z.array(z.object({
+    id: z.string().required(),
+    name: z.string().default(''),
+  })).default([]),
+  modeMap: z.dict(z.string()).default({}),
+  authMethod: z.string().default(''),
+  subagentMap: z.dict(z.string()).default({}),
+})
+
+export const Config = z.object({
+  env: z.dict(z.string()).default({}),
+  includeHarnessPrompt: z.boolean().default(false).volatile(),
+  includeRuntimeContext: z.boolean().default(false).volatile(),
   emitReasoning: z.boolean().default(true),
   emitProgress: z.boolean().default(false),
   emitToolCalls: z.boolean().default(true),
@@ -225,40 +275,7 @@ export const Config: z<Config> = z.object({
   authTimeoutMs: z.number().default(DEFAULT_AUTH_TIMEOUT_MS),
   interactiveAuthTimeoutMs: z.number().default(DEFAULT_INTERACTIVE_AUTH_TIMEOUT_MS),
   cwd: z.string(),
-  servers: z.dict(z.object({
-    command: z.string().required(),
-    args: z.array(z.string()).default([]),
-    name: z.string().required(),
-    env: z.dict(z.string()).default({}),
-    models: z.array(z.string()).default([]),
-    customModels: z.array(z.object({
-      id: z.string().required(),
-      name: z.string().default(''),
-    })).default([]),
-    modeMap: z.dict(z.string()).default({}),
-    authMethod: z.string().default(''),
-    subagentMap: z.dict(z.string()).default({}),
-  })).default({}),
-})
-
-/** Settings schema: a map of server ids to their spawn configuration. */
-const SettingsSchema = z.object({
-  includeHarnessPrompt: z.boolean().default(false),
-  includeRuntimeContext: z.boolean().default(false),
-  servers: z.dict(z.object({
-    command: z.string().required(),
-    args: z.array(z.string()).default([]),
-    name: z.string().required(),
-    env: z.dict(z.string()).default({}),
-    models: z.array(z.string()).default([]),
-    customModels: z.array(z.object({
-      id: z.string().required(),
-      name: z.string().default(''),
-    })).default([]),
-    modeMap: z.dict(z.string()).default({}),
-    authMethod: z.string().default(''),
-    subagentMap: z.dict(z.string()).default({}),
-  })).default({}),
+  servers: z.dict(ServerSchema).default({}).volatile(),
 })
 
 /** A dispose grace must fit the single Node timer that owns its teardown tier. */
@@ -364,8 +381,9 @@ function resolveNpxShortcut(
   return { command: resolved, args: rest }
 }
 
-/** The shape after schemastery applied the defaults. */
-type ResolvedConfig = Required<Omit<Config, 'cwd' | 'servers'>> & Pick<Config, 'cwd' | 'servers'>
+/** The shape after schemastery applied the defaults: every ordinary field is
+ * present, and the two live fields are their stable config references. */
+type ResolvedConfig = Required<Omit<Config, 'cwd'>> & Pick<Config, 'cwd'>
 
 /** Session permission fields used to route ACP permission requests. */
 interface PermissionPresetReader {
@@ -481,7 +499,7 @@ interface TodoWriteSession {
  *   recorder for the rest of the stream rather than failing the turn over a
  *   presentational record.
  */
-function acpToolCallRecorder(session: Session, source: AssistantProvenance, onWarn: (message: string) => void): AcpToolCallRecorder | undefined {
+function acpToolCallRecorder(session: Session, source: AssistantProviderMetadata, onWarn: (message: string) => void): AcpToolCallRecorder | undefined {
   const events = session.snapshotEvents()
   let boundary: { turn: number; step: number } | undefined
   for (let i = events.length - 1; i >= 0; i--) {
@@ -597,11 +615,12 @@ function serverFingerprint(server: AcpServerConfig): string {
 }
 
 /** Directory entries for the configurable-provider directory.
- * Always includes at least one entry so the `llm-acp` settings namespace is
- * exposed to configuration clients (the web API only serves namespaces that
- * appear in `listConfigurableProviders()`). A dormant entry has no
- * `settingsPath`, so the Models settings page renders it as a declared route
- * the user cannot edit — the ACP Servers page is the intended editor. */
+ * Always includes at least one entry so the `llm-acp` settings namespace
+ * (this plugin's own configuration entry) is exposed to configuration clients
+ * (the web API only serves namespaces that appear in
+ * `listConfigurableProviders()`). A dormant entry has no `settingsPath`, so the
+ * Models settings page renders it as a declared route the user cannot edit —
+ * the ACP Servers page is the intended editor. */
 function directoryEntries(servers: ReadonlyMap<string, AcpServerConfig>): LlmConfigurableProvider[] {
   const entries: LlmConfigurableProvider[] = [...servers.entries()].map(([id, server]) => ({
     provider: routeName(id),
@@ -633,32 +652,23 @@ export function apply(ctx: Context, config: Config): void {
     ? process.cwd()
     : assertUsableCwd('config cwd', resolve(config.cwd))
 
-  /** Current settings source; updated by `settings.installSection`. */
-  let currentSettings: () => {
-    servers: Record<string, AcpServerConfig>
-    includeHarnessPrompt?: boolean
-    includeRuntimeContext?: boolean
-  } = () => ({ servers: {} })
-  /** Servers from the composition entry (inline config). */
-  const configServers = (): Map<string, AcpServerConfig> => {
-    const result = new Map<string, AcpServerConfig>()
-    if (resolved.servers !== undefined) {
-      for (const [id, server] of Object.entries(resolved.servers)) {
-        result.set(id, server)
-      }
-    }
-    return result
-  }
-  /** Merged servers from both config and settings. */
-  const mergedServers = (): Map<string, AcpServerConfig> => {
-    const result = configServers()
-    const settings = currentSettings()
-    if (settings?.servers !== undefined) {
-      for (const [id, server] of Object.entries(settings.servers)) {
-        result.set(id, server)
-      }
-    }
-    return result
+  // Keep this plugin's generated settings page off the generic configuration
+  // surface: the ACP Servers page is the editor for `servers` (the only
+  // volatile field), and an auto-generated duplicate form would race it.
+  // Optional — a deployment that mounts no settings service keeps the
+  // composition value and never sees a page at all.
+  ctx.inject(['settings'], (child) => {
+    child.effect(() => child.settings.configure({ auto: false }, ctx.fiber))
+  })
+
+  /**
+   * Configured servers, read live from the volatile config reference: the
+   * Loader commits a settings-driven edit into this same reference and then
+   * emits `loader/volatile-update`, so a read always sees the newest snapshot
+   * and the reconciliation below is the only thing that has to run.
+   */
+  const servers = (): Map<string, AcpServerConfig> => {
+    return new Map(Object.entries(config.servers.get() ?? {}))
   }
 
   /** Active connections keyed by server id. */
@@ -765,15 +775,13 @@ export function apply(ctx: Context, config: Config): void {
       emitReasoning: resolved.emitReasoning,
       emitProgress: resolved.emitProgress,
       emitToolCalls: resolved.emitToolCalls,
-      // Read the include switches per stream — settings first, then the
-      // composition-entry config — so a settings edit applies to the next
-      // prompt without rebuilding the connection. Default off: an ACP agent
-      // assembles its own system prompt, so the harness additions are
+      // Read the include switches per stream from their live config
+      // references, so flipping one on the ACP Servers page applies to the
+      // next prompt without rebuilding the connection. Default off: an ACP
+      // agent assembles its own system prompt, so the harness additions are
       // duplicate context that persists in the agent's history.
-      includeHarnessPrompt: () =>
-        currentSettings().includeHarnessPrompt ?? resolved.includeHarnessPrompt ?? false,
-      includeRuntimeContext: () =>
-        currentSettings().includeRuntimeContext ?? resolved.includeRuntimeContext ?? false,
+      includeHarnessPrompt: () => config.includeHarnessPrompt.get() ?? false,
+      includeRuntimeContext: () => config.includeRuntimeContext.get() ?? false,
       // Persist the dsh → ACP session map next to the plugin cwd so a turn
       // after a harness restart reattaches to the agent's own session via
       // `session/load` instead of re-sending the full history.
@@ -799,7 +807,7 @@ export function apply(ctx: Context, config: Config): void {
       // without rebuilding the connection (a rebuild would drop live sessions
       // for a purely presentational change).
       subagentNotice: () => {
-        const map = mergedServers().get(serverId)?.subagentMap
+        const map = servers().get(serverId)?.subagentMap
         if (map === undefined || Object.keys(map).length === 0) return 'notice'
         const agent = ctx.get('agents')?.currentInitiator()
         const session = agent?.session as Session | undefined
@@ -899,7 +907,7 @@ export function apply(ctx: Context, config: Config): void {
 
   /** Reconcile active connections with the current server set. */
   function reconcileServers(): void {
-    const desired = mergedServers()
+    const desired = servers()
     const desiredIds = new Set(desired.keys())
 
     // Remove servers that are no longer configured.
@@ -946,7 +954,7 @@ export function apply(ctx: Context, config: Config): void {
   let directory: DirectoryRegistrationHandle | undefined
   let lastDirectoryFacts: unknown
   function reconcileDirectory(): void {
-    const entries = directoryEntries(mergedServers())
+    const entries = directoryEntries(servers())
     if (deepEqualJson(entries, lastDirectoryFacts)) return
     if (directory === undefined) {
       directory = ctx.llm.registerConfigurableProviders(entries)
@@ -956,9 +964,29 @@ export function apply(ctx: Context, config: Config): void {
     lastDirectoryFacts = entries
   }
 
-  // Initial registration from config servers.
+  // Initial registration from the composed server map.
   reconcileServers()
   reconcileDirectory()
+
+  // A settings-driven edit commits into the live `servers` reference and emits
+  // this event instead of remounting the row, so it is the reconcile trigger
+  // for the ACP Servers page — the 0.2.0 replacement for the old
+  // `settings.installSection` `onChange` hook. The try/catch keeps a refused
+  // update from tearing the plugin down: the previous connections stay up.
+  ctx.on('loader/volatile-update', () => {
+    try {
+      reconcileServers()
+    } catch (error: unknown) {
+      ctx.logger.error('llm-acp: keeping previously registered servers after a refused update')
+      ctx.logger.error(error)
+    }
+    try {
+      reconcileDirectory()
+    } catch (error: unknown) {
+      ctx.logger.error('llm-acp: keeping previous configurable-provider directory after a refused update')
+      ctx.logger.error(error)
+    }
+  })
 
   // Register model discovery so the settings UI can query each ACP server's
   // model catalog via `remote.llm.discoverModels(settingsNs, { provider })`.
@@ -1198,41 +1226,6 @@ export function apply(ctx: Context, config: Config): void {
       return []
     }
   }), 'llm-acp.modelDiscovery()')
-
-  // Install the settings section for dynamic server management.
-  // `installSection` is on SettingsProvider in dsh-settings ≥0.1.2-rc.1; the
-  // local 0.1.0-rc.5 type lacks it, so cast to the minimal call signature.
-  type InstallSectionFn = <T>(
-    owner: Context,
-    ns: string,
-    schema: z<T>,
-    entry: T,
-    hooks: { setSource: (source: () => T) => void; onChange: () => void; validate?: (value: T) => void },
-  ) => void
-  (ctx.settings as unknown as { installSection: InstallSectionFn }).installSection(
-    ctx, NS, SettingsSchema, { servers: {} }, {
-    setSource: (source) => {
-      currentSettings = source as () => {
-        servers: Record<string, AcpServerConfig>
-        includeHarnessPrompt?: boolean
-        includeRuntimeContext?: boolean
-      }
-    },
-    onChange: () => {
-      try {
-        reconcileServers()
-      } catch (error: unknown) {
-        ctx.logger.error('llm-acp: keeping previously registered servers after a refused update')
-        ctx.logger.error(error)
-      }
-      try {
-        reconcileDirectory()
-      } catch (error: unknown) {
-        ctx.logger.error('llm-acp: keeping previous configurable-provider directory after a refused update')
-        ctx.logger.error(error)
-      }
-    },
-  })
 
   // Dispose all connections when this plugin's fiber ends.
   ctx.effect(() => {

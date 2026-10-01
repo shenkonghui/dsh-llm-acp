@@ -77,25 +77,6 @@ async function setup(mockEnv: SetupEnv = {}, opts: {
   }
   await ctx.plugin(LlmRuntime)
   await ctx.plugin(LocalSubprocessRuntime)
-  // Minimal `settings` seam stub: the plugin's `installSection` call fails on
-  // `ctx.settings === undefined`, which aborts `apply` and rolls back every
-  // registered adapter. The holder stays mutable so a test can act as the
-  // settings UI and drive a reconcile.
-  let holder: { servers: Record<string, unknown> } = { servers: {} }
-  let notifyChange: (() => void) | undefined
-  ctx.provide('settings' as never, {
-    installSection(
-      _owner: unknown,
-      _ns: string,
-      _schema: unknown,
-      entry: unknown,
-      hooks: { setSource: (source: () => unknown) => void; onChange: () => void },
-    ) {
-      holder = entry as { servers: Record<string, unknown> }
-      notifyChange = hooks.onChange
-      hooks.setSource(() => holder)
-    },
-  } as never)
   const server = opts.server ?? { command: process.execPath, args: [mockServer] }
   if (opts.warnSink !== undefined) {
     const sink = opts.warnSink
@@ -105,26 +86,40 @@ async function setup(mockEnv: SetupEnv = {}, opts: {
       original(...(args as [unknown]))
     }
   }
-  await ctx.plugin(acp, {
-    emitReasoning: opts.emitReasoning ?? false,
-    env: mockEnv,
-    ...opts.config,
-    servers: {
-      test: {
-        command: server.command,
-        args: server.args,
-        name: 'Test ACP',
-        modeMap: opts.modeMap ?? {},
-        subagentMap: opts.subagentMap ?? {},
-        authMethod: opts.authMethod ?? '',
+  // Mount the plugin the way the launcher does — as an ordinary Loader entry —
+  // so a settings-driven server edit travels the real 0.2.0 path: the Loader
+  // commits the volatile `servers` reference into the running fiber and emits
+  // `loader/volatile-update`, which is what the plugin reconciles on. No
+  // settings service is mounted: it is optional, and its absence must leave
+  // the composition value serving requests.
+  ctx.loader.builtins['llm-acp'] = acp
+  const entryId = await ctx.loader.create({
+    id: 'llm-acp',
+    name: 'cordis:llm-acp',
+    config: {
+      emitReasoning: opts.emitReasoning ?? false,
+      env: mockEnv,
+      ...opts.config,
+      servers: {
+        test: {
+          command: server.command,
+          args: server.args,
+          name: 'Test ACP',
+          modeMap: opts.modeMap ?? {},
+          subagentMap: opts.subagentMap ?? {},
+          authMethod: opts.authMethod ?? '',
+        },
       },
     },
   })
-  // Act as the settings UI: replace the stored server map and notify, so the
-  // plugin reconciles exactly as it would after a real write.
-  const applyServers = (servers: Record<string, unknown>): void => {
-    holder.servers = servers
-    notifyChange?.()
+  const entry = ctx.loader.resolve(entryId)
+  await entry.fiber?.await()
+  // Act as the ACP Servers page: replace the stored server map through the
+  // Loader, exactly as a settings write persists it into the profile patch.
+  const applyServers = async (servers: Record<string, unknown>): Promise<void> => {
+    const current = (entry.options.config ?? {}) as Record<string, unknown>
+    await entry.update({ config: { ...current, servers } })
+    await entry.fiber?.await()
   }
   return Object.assign(ctx, { applyServers })
 }
@@ -1002,7 +997,7 @@ describe('dsh-llm-acp', () => {
       expect(finishChunk(blocked).reason.kind).toBe('error')
       expect(authCalls(file)).toEqual([])
 
-      ctx.applyServers({
+      await ctx.applyServers({
         test: {
           command: process.execPath,
           args: [authMockServer],
@@ -1200,21 +1195,24 @@ describe('dsh-llm-acp', () => {
       const resultBlock = (id: string) => {
         const result = results.find(r => (r.data as { message: { source: { callId: string } } }).message.source.callId === id)!
         return result.data as {
-          message: { content: Array<{ isError: boolean; content: Array<{ text: string }> }> }
+          // 0.2.0 moved the outcome onto the tool-role message itself: `content`
+          // holds the raw result blocks and `isError` a message-level flag,
+          // instead of the old single tool-result block wrapping both.
+          message: { isError?: boolean; content: Array<{ type: string; text?: string }> }
           error?: { name: string; code: string }
         }
       }
       const ok = resultBlock('tool-ok')
-      expect(ok.message.content[0]!.isError).toBe(false)
-      expect(ok.message.content[0]!.content).toEqual([{ type: 'text', text: 'file body' }])
+      expect(ok.message.isError).toBe(false)
+      expect(ok.message.content).toEqual([{ type: 'text', text: 'file body' }])
       expect(ok.error).toBeUndefined()
       const fail = resultBlock('tool-fail')
-      expect(fail.message.content[0]!.isError).toBe(true)
-      expect(fail.message.content[0]!.content).toEqual([{ type: 'text', text: 'exit 1' }])
+      expect(fail.message.isError).toBe(true)
+      expect(fail.message.content).toEqual([{ type: 'text', text: 'exit 1' }])
       expect(fail.error).toEqual({ name: 'AcpToolError', code: 'ACP_TOOL_FAILED' })
       const pending = resultBlock('tool-pending')
-      expect(pending.message.content[0]!.isError).toBe(false)
-      expect(pending.message.content[0]!.content).toEqual([])
+      expect(pending.message.isError).toBe(false)
+      expect(pending.message.content).toEqual([])
     } finally {
       await ctx.fiber.dispose()
     }
@@ -1293,7 +1291,10 @@ describe('dsh-llm-acp', () => {
         messages: [message],
       })))
       expect(finishChunk(chunks).reason.kind).toBe('stop')
-      expect(warnings).toEqual([])
+      // The 0.2.0 local subprocess provider reports a degraded containment mode
+      // once per process on hosts without a user-systemd scope; that is
+      // environmental, so only this plugin's own diagnostics are asserted.
+      expect(warnings.filter(w => !w.includes('process-tree containment'))).toEqual([])
       const assembler = new BlockAssembler()
       for (const chunk of chunks) assembler.push(chunk)
       expect(assembler.blocks().some(block => block.type === 'tool-call')).toBe(false)

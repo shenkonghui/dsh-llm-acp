@@ -149,6 +149,12 @@ export type AcpPermissionRequester = (request: AcpPermissionRequest) => Promise<
  * EOF (the child's window to flush and reap descendants), then the
  * `terminate()` escalation (SIGTERM → grace → SIGKILL) and its whole-tree exit
  * proof. Resolves only at whole-tree quiescence.
+ *
+ * A handle whose spawn already failed needs no special case: `spawn` now
+ * refuses invalid specs by throwing before a handle exists, and a handle whose
+ * target never started reports an empty managed range — `terminate()` is a
+ * documented no-op and `waitForExit()` resolves immediately — while `done`
+ * carries the spawn failure to its observers.
  * @param child - the spawned ACP child's handle.
  * @param eofGraceMs - tier-1 window after stdin EOF.
  */

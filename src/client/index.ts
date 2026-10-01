@@ -2,15 +2,19 @@
  * ACP Servers settings surface, browser half. Registers one settings section
  * that lets the user browse the ACP registry and add/remove ACP agent servers,
  * plus a conversation view tab that inspects recent ACP protocol interactions.
- * Servers are stored in the `llm-acp` settings namespace and picked up by the
- * host-side `@deepseek-ai/dsh-llm-acp` plugin.
+ * Servers are stored in the host plugin's own configuration entry (`llm-acp`)
+ * and picked up by the host-side `@deepseek-ai/dsh-llm-acp` plugin.
  */
 
 import type {} from '@deepseek-ai/dsh-client-connection/client'
 // Type-only: pulls the locale plugin's Context merge (ctx.locale).
 import type {} from '@deepseek-ai/dsh-client-locale/client'
-// Type-only: the slots service merge (ctx.slots) and props-share types.
-import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
+// Type-only: the slots service merge (ctx.slots) and props-share types. The
+// renderer owns the SlotRegistry service and the client root context is
+// cordis's own Context: 0.2.0 retired `@deepseek-ai/dsh-client-runtime`, which
+// used to re-export both.
+import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
+import type { Context as ClientContext } from '@deepseek-ai/cordis'
 // Type-only: the settings shell's SlotMap merge (the 'settings.section' entry).
 import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
 // Type-only: the sidebar shell's SlotMap merge (sidebar.footer.action entry).

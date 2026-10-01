@@ -32,6 +32,8 @@ dsh plugin --profile my-acp add ./dsh-llm-acp
 ```
 
 构建产物（`lib/`）已提交到仓库，安装时无需运行任何构建脚本。
+> 兼容性：本版本面向 **dsh 0.2.0**（`0.2.0-rc.2`）。它使用该版本的配置模型——插件自身的 Config 即设置命名空间，可实时编辑的字段声明为 volatile，并在 `loader/volatile-update` 时做增量同步。dsh 0.1.x 请使用 `@deepseek-ai/dsh-llm-acp@0.1.6`。
+
 
 ## 卸载
 
@@ -51,21 +53,22 @@ dsh plugin --profile my-acp remove @deepseek-ai/dsh-llm-acp
 
 ACP server 不单独保存权限策略。它复用会话输入框中的权限列表：`read-only` 和 `workspace-write` 将敏感操作转发到 harness 审批界面，`danger-full-access` 自动允许。
 
-也可以直接在 `settings.yaml` 中配置：
+也可以直接写在 profile 的 `cordis.patch.yml` 中，覆盖本插件那一行的 `config`（0.2.0 起插件自身的 Config 就是设置命名空间，设置页的写入同样落到这里）：
 
 ```yaml
-llm-acp:
-  servers:
-    devin:
-      command: devin
-      args:
-        - acp
-      name: Devin
-      env:
-        DEEPSEEK_API_KEY: sk-xxx
-      models:
-        - deepseek-chat
-        - deepseek-reasoner
+- id: llm-acp
+  config:
+    servers:
+      devin:
+        command: devin
+        args:
+          - acp
+        name: Devin
+        env:
+          DEEPSEEK_API_KEY: sk-xxx
+        models:
+          - deepseek-chat
+          - deepseek-reasoner
 ```
 
 ## 工作原理
@@ -77,7 +80,7 @@ llm-acp:
 ```
 dsh harness 启动
   └─ apply(ctx, config)
-       ├─ 读取 llm-acp 设置命名空间 + 内联 config.servers，合并成服务器列表
+       ├─ 读取本插件 Config 的 servers 引用（volatile，设置页的写入会就地提交到同一引用）
        ├─ 对每个服务器 createServer()：
        │    ├─ resolveNpxShortcut()：npx -y <pkg> 若 bin 已在 PATH 则直接用 bin
        │    ├─ new AcpConnection()：spawn 长生命周期子进程（stdin/stdout JSON-RPC）
@@ -116,8 +119,9 @@ harness 请求模型
 
 ```
 Web UI「设置 → ACP 服务」
-  ├─ 浏览内置 ACP 注册表（registry.json）→ 点「添加」写入 llm-acp.servers
-  ├─ 宿主端监听 settings 变更 → reconcileServers() 增删/重建连接（指纹比对）
+  ├─ 浏览内置 ACP 注册表（registry.json）→ 点「添加」调用 remote.settings.mutate 写入 servers
+  ├─ 宿主端 settings 写入 → Loader 就地提交 volatile servers 引用 → 发 loader/volatile-update
+  │    └─ 插件监听该事件 → reconcileServers() 增删/重建连接（指纹比对）
   ├─ 模型发现：registerModelDiscovery 路由 acp-<id> → 临时 session/new 读 configOptions
   ├─ acp-info-<id>：只读 initialize 身份（agent 名/版本），不建 session
   └─ acp-resolve-<bin>：探测 PATH，把 npx 形式改存本地 bin 路径
@@ -127,11 +131,11 @@ Web UI「设置 → ACP 服务」
 
 ### 宿主端 — LLM 适配器
 
-`apply(ctx, config)` 从 `llm-acp` 设置命名空间读取已配置的服务器列表。对每个服务器，启动一个长生命周期的子进程，通过 stdin/stdout 建立 ACP `ClientSideConnection`，并在 `ctx.llm` 上注册路由为 `acp-<server-id>` 的 `AcpAdapter`。每次模型调用会创建新的 ACP session，将完整对话作为一条用户消息发送，并将流式 `agent_message_chunk` 更新转换为 harness 的 `StreamChunk`。
+`apply(ctx, config)` 从本插件 Config 的 `servers` 引用读取已配置的服务器列表。对每个服务器，启动一个长生命周期的子进程，通过 stdin/stdout 建立 ACP `ClientSideConnection`，并在 `ctx.llm` 上注册路由为 `acp-<server-id>` 的 `AcpAdapter`。每次模型调用会创建新的 ACP session，将完整对话作为一条用户消息发送，并将流式 `agent_message_chunk` 更新转换为 harness 的 `StreamChunk`。
 
 ### 客户端 — 设置界面
 
-浏览器端注册一个 `settings.section` slot，渲染 ACP 注册表浏览器和"我的服务"列表。添加服务器时会将其持久化到 `llm-acp` 设置命名空间；宿主端监听变更并同步更新 provider 目录。
+浏览器端注册一个 `settings.section` slot，渲染 ACP 注册表浏览器和"我的服务"列表。添加服务器时通过设置服务写入插件 Config 的 `servers`；宿主端收到 `loader/volatile-update` 后同步更新 provider 目录，无需重挂载插件行。
 
 ### 注册表命令推导
 

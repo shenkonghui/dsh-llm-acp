@@ -2,6 +2,12 @@ node_modules/
 *.tsbuildinfo
 .DS_Store
 
+# Local package stores (a sandboxed dev checkout cannot write the shared one,
+# so `pnpm install --store-dir .pnpm-store` keeps it inside the repository).
+.pnpm-store/
+.npm-cache/
+.pnpm-cache/
+
 # Local scratch/probe files and backups
 *-scratch.ts
 *-scratch.ts.bak
